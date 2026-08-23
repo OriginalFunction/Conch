@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use tokio::{
     io::{duplex, split, AsyncWriteExt},
     net::TcpListener,
+    sync::mpsc,
     task::{self, JoinHandle},
 };
 use tokio_tungstenite::{
@@ -221,90 +222,151 @@ async fn ws_client(
 }
 
 async fn websocket_bridge(
-    mut socket: WebSocket,
+    socket: WebSocket,
     daemon: Daemon,
     protocol: ConnectionProtocol,
     allowed_room: Option<RoomId>,
 ) {
     let (bridge, daemon_stream) = duplex(BRIDGE_CAPACITY);
     let (mut bridge_reader, mut bridge_writer) = split(bridge);
+    let (mut socket_writer, mut socket_reader) = socket.split();
+    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
     let daemon_task = tokio::spawn(async move {
         let _ = daemon.handle_transport(daemon_stream, protocol).await;
     });
-
-    loop {
-        tokio::select! {
-            incoming = socket.next() => {
-                let Some(Ok(message)) = incoming else { break };
-                match message {
-                    Message::Text(text) => {
-                        let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else { break };
-                        if let Some(room) = allowed_room {
-                            let expected = room.to_string();
-                            if value.get("typ").and_then(Value::as_str) != Some("attach")
-                                && value.get("room").and_then(Value::as_str)
-                                    != Some(expected.as_str())
-                            {
-                                let error = ClientReply::failure(
-                                    "unauthorized",
-                                    "WebSocket is authorized for a different room",
-                                );
-                                let Ok(text) = serde_json::to_string(&error) else { break };
-                                if socket.send(Message::Text(text.into())).await.is_err() { break; }
-                                continue;
+    let control_tx = outgoing_tx.clone();
+    let mut ingress = tokio::spawn(async move {
+        while let Some(Ok(message)) = socket_reader.next().await {
+            match message {
+                Message::Text(text) => {
+                    let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else {
+                        break;
+                    };
+                    if let Some(room) = allowed_room {
+                        let expected = room.to_string();
+                        if value.get("typ").and_then(Value::as_str) != Some("attach")
+                            && value.get("room").and_then(Value::as_str) != Some(expected.as_str())
+                        {
+                            let error = ClientReply::failure(
+                                "unauthorized",
+                                "WebSocket is authorized for a different room",
+                            );
+                            let Ok(text) = serde_json::to_string(&error) else {
+                                break;
+                            };
+                            if control_tx.send(Message::Text(text.into())).is_err() {
+                                break;
                             }
+                            continue;
                         }
-                        let Ok(encoded) = frame::encode(&value) else { break };
-                        if bridge_writer.write_all(&encoded).await.is_err() { break; }
                     }
-                    Message::Ping(bytes) => {
-                        if socket.send(Message::Pong(bytes)).await.is_err() { break; }
+                    let Ok(encoded) = frame::encode(&value) else {
+                        break;
+                    };
+                    if bridge_writer.write_all(&encoded).await.is_err() {
+                        break;
                     }
-                    Message::Close(_) => break,
-                    Message::Binary(_) | Message::Pong(_) => {}
                 }
-            }
-            outgoing = read_frame::<_, Value>(&mut bridge_reader) => {
-                let Ok(Some(value)) = outgoing else { break };
-                let Ok(text) = serde_json::to_string(&value) else { break };
-                if socket.send(Message::Text(text.into())).await.is_err() { break; }
+                Message::Ping(bytes) => {
+                    if control_tx.send(Message::Pong(bytes)).is_err() {
+                        break;
+                    }
+                }
+                Message::Close(_) => break,
+                Message::Binary(_) | Message::Pong(_) => {}
             }
         }
+    });
+    let mut egress = tokio::spawn(async move {
+        while let Ok(Some(value)) = read_frame::<_, Value>(&mut bridge_reader).await {
+            let Ok(text) = serde_json::to_string(&value) else {
+                break;
+            };
+            if outgoing_tx.send(Message::Text(text.into())).is_err() {
+                break;
+            }
+        }
+    });
+    let mut sender = tokio::spawn(async move {
+        while let Some(message) = outgoing_rx.recv().await {
+            if socket_writer.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
+    tokio::select! {
+        _ = &mut ingress => {},
+        _ = &mut egress => {},
+        _ = &mut sender => {},
     }
+    ingress.abort();
+    egress.abort();
+    sender.abort();
     daemon_task.abort();
 }
 
 async fn tungstenite_bridge(
-    mut socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     bridge: tokio::io::DuplexStream,
 ) {
     let (mut bridge_reader, mut bridge_writer) = split(bridge);
-    loop {
-        tokio::select! {
-            incoming = socket.next() => {
-                let Some(Ok(message)) = incoming else { break };
-                match message {
-                    TungsteniteMessage::Text(text) => {
-                        let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else { break };
-                        let Ok(encoded) = frame::encode(&value) else { break };
-                        if bridge_writer.write_all(&encoded).await.is_err() { break; }
+    let (mut socket_writer, mut socket_reader) = socket.split();
+    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+    let control_tx = outgoing_tx.clone();
+    let mut ingress = tokio::spawn(async move {
+        while let Some(Ok(message)) = socket_reader.next().await {
+            match message {
+                TungsteniteMessage::Text(text) => {
+                    let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else {
+                        break;
+                    };
+                    let Ok(encoded) = frame::encode(&value) else {
+                        break;
+                    };
+                    if bridge_writer.write_all(&encoded).await.is_err() {
+                        break;
                     }
-                    TungsteniteMessage::Ping(bytes) => {
-                        if socket.send(TungsteniteMessage::Pong(bytes)).await.is_err() { break; }
-                    }
-                    TungsteniteMessage::Close(_) => break,
-                    TungsteniteMessage::Binary(_)
-                    | TungsteniteMessage::Pong(_)
-                    | TungsteniteMessage::Frame(_) => {}
                 }
-            }
-            outgoing = read_frame::<_, Value>(&mut bridge_reader) => {
-                let Ok(Some(value)) = outgoing else { break };
-                let Ok(text) = serde_json::to_string(&value) else { break };
-                if socket.send(TungsteniteMessage::Text(text.into())).await.is_err() { break; }
+                TungsteniteMessage::Ping(bytes) => {
+                    if control_tx.send(TungsteniteMessage::Pong(bytes)).is_err() {
+                        break;
+                    }
+                }
+                TungsteniteMessage::Close(_) => break,
+                TungsteniteMessage::Binary(_)
+                | TungsteniteMessage::Pong(_)
+                | TungsteniteMessage::Frame(_) => {}
             }
         }
+    });
+    let mut egress = tokio::spawn(async move {
+        while let Ok(Some(value)) = read_frame::<_, Value>(&mut bridge_reader).await {
+            let Ok(text) = serde_json::to_string(&value) else {
+                break;
+            };
+            if outgoing_tx
+                .send(TungsteniteMessage::Text(text.into()))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let mut sender = tokio::spawn(async move {
+        while let Some(message) = outgoing_rx.recv().await {
+            if socket_writer.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
+    tokio::select! {
+        _ = &mut ingress => {},
+        _ = &mut egress => {},
+        _ = &mut sender => {},
     }
+    ingress.abort();
+    egress.abort();
+    sender.abort();
 }
 
 fn parse_room(id: &str) -> Result<RoomId, HttpError> {

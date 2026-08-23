@@ -394,6 +394,56 @@ fn staged_allows_missing_blobs_commit_does_not() {
 }
 
 #[test]
+fn blob_missing_no_cert() {
+    // The missing-blob half of `staged_allows_missing_blobs_commit_does_not`
+    // is the certification gate: a holder can stage metadata during catch-up,
+    // but a signer cannot precert a speech until the bytes are local.
+    let fixture = Fixture::new();
+    let genesis = committed_genesis(&fixture);
+    let intent = fixture.signed_intent(9, 1_766_700_010);
+    let grant = grant_scene(&fixture, &genesis, &intent);
+    let grant_proof = fixture.proof(&grant, fixture.creator(), &[&fixture.creator_key]);
+    let granted = apply(
+        &genesis,
+        &grant,
+        Some(&grant_proof),
+        ApplyMode::Commit(&ApplyResources::default()),
+    )
+    .unwrap();
+    let missing = Hash32::from_bytes([0x5a; 32]);
+    let speech = Scene {
+        v: 1,
+        room: fixture.room(),
+        n: 2,
+        term: 1,
+        parent: granted.head_hash,
+        roster: granted.roster.clone(),
+        leader: fixture.creator(),
+        ts: 1_766_700_020,
+        body: Body::Speech {
+            closes_grant: granted.live_grant.as_ref().unwrap().hash,
+            text: "blob first".into(),
+            blobs: vec![BlobRef {
+                name: "missing.bin".into(),
+                sha256: missing,
+                bytes: 12,
+            }],
+        },
+        certs: Vec::new(),
+    };
+
+    assert!(matches!(
+        apply(
+            &granted,
+            &speech,
+            None,
+            ApplyMode::Precert(&ApplyResources::default())
+        ),
+        Err(ApplyError::MissingBlob(hash)) if hash == missing
+    ));
+}
+
+#[test]
 fn grant_while_another_grant_is_live_is_rejected() {
     let fixture = Fixture::new();
     let genesis = committed_genesis(&fixture);

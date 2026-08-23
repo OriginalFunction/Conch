@@ -159,3 +159,110 @@ async fn join_http_ticket_uses_the_same_parser_and_fetches_genesis() {
         source.replay(ticket.id).unwrap().history
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn magnet_fallback_still_joins() {
+    let source_data = TempDir::new().unwrap();
+    let follower_data = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+    let source = Daemon::open(source_data.path()).unwrap();
+    let follower = Daemon::open(follower_data.path()).unwrap();
+    let source_tcp = source.start(loopback()).await.unwrap();
+    let follower_tcp = follower.start(loopback()).await.unwrap();
+    let ticket = source
+        .create_ticket(
+            "Magnet Join",
+            conch_core::types::StakePolicy::default(),
+            conch_core::types::FloorConfig::stick(30),
+        )
+        .unwrap();
+    assert_eq!(ticket.peers, vec![format!("tcp://{}", source_tcp.addr())]);
+
+    let joined = Command::new(env!("CARGO_BIN_EXE_conch"))
+        .args([
+            "--node",
+            &format!("tcp://{}", follower_tcp.addr()),
+            "join",
+            &ticket.to_magnet(),
+            "--observe",
+        ])
+        .current_dir(output_dir.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        joined.status.success(),
+        "{}",
+        String::from_utf8_lossy(&joined.stderr)
+    );
+    let reply: Value = serde_json::from_slice(&joined.stdout).unwrap();
+    assert_eq!(reply["id"], ticket.id.to_string());
+    assert_eq!(reply["role"], "observe");
+    assert_eq!(
+        follower.replay(ticket.id).unwrap().history,
+        source.replay(ticket.id).unwrap().history
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tokened_http_ticket_join_sends_bearer_and_authenticates_swarm() {
+    let source_data = TempDir::new().unwrap();
+    let follower_data = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+    let source = Daemon::open(source_data.path()).unwrap();
+    let follower = Daemon::open(follower_data.path()).unwrap();
+    let source_tcp = source.start(loopback()).await.unwrap();
+    let source_http = source.start_http(loopback()).await.unwrap();
+    let follower_tcp = follower.start(loopback()).await.unwrap();
+    let token = "4242424242424242424242424242424242424242424242424242424242424242";
+    let binary = env!("CARGO_BIN_EXE_conch");
+
+    let created = Command::new(binary)
+        .args([
+            "--node",
+            &format!("tcp://{}", source_tcp.addr()),
+            "create",
+            "--name",
+            "Private Room",
+            "--token",
+            token,
+        ])
+        .current_dir(output_dir.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created: Value = serde_json::from_slice(&created.stdout).unwrap();
+    let room = created["id"].as_str().unwrap();
+    let local_ticket =
+        Ticket::from_json_slice(&fs::read(output_dir.path().join("private-room.conch")).unwrap())
+            .unwrap();
+    assert_eq!(local_ticket.token.unwrap().to_string(), token);
+
+    let joined = Command::new(binary)
+        .args([
+            "--node",
+            &format!("tcp://{}", follower_tcp.addr()),
+            "--token",
+            token,
+            "join",
+            &format!("http://{}/ticket/{room}", source_http.addr()),
+        ])
+        .current_dir(output_dir.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        joined.status.success(),
+        "{}",
+        String::from_utf8_lossy(&joined.stderr)
+    );
+    assert_eq!(
+        follower.replay(local_ticket.id).unwrap().history,
+        source.replay(local_ticket.id).unwrap().history
+    );
+}

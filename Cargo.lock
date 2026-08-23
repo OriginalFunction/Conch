@@ -140,6 +140,7 @@ name = "conch"
 version = "0.1.0"
 dependencies = [
  "conch-core",
+ "conch-mcp",
  "conchd",
  "rand 0.8.7",
  "reqwest",
@@ -162,6 +163,20 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "conch-mcp"
+version = "0.1.0"
+dependencies = [
+ "conch-core",
+ "conchd",
+ "rand 0.8.7",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

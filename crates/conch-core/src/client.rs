@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    ticket::{JoinRole, Ticket},
-    types::{AgentId, FloorConfig, RoomId, StakePolicy},
+    ticket::{JoinRole, Ticket, TicketError},
+    types::{AgentId, FloorConfig, Hash32, Mouth, NodeId, RoomId, StakePolicy},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,9 +16,11 @@ pub enum ClientRequest {
         name: String,
         stake: StakePolicy,
         floor: FloorConfig,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<Hash32>,
     },
     Join {
-        ticket: Ticket,
+        ticket: ClientTicket,
         #[serde(default)]
         role: JoinRole,
     },
@@ -38,6 +40,35 @@ pub enum ClientRequest {
     RaiseHand {
         room: RoomId,
     },
+    Grant {
+        room: RoomId,
+        to: Mouth,
+    },
+    Yank {
+        room: RoomId,
+    },
+    Breakout {
+        room: RoomId,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        members: Option<Vec<NodeId>>,
+    },
+    Membership {
+        room: RoomId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stake: Option<StakePolicy>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        floor: Option<FloorConfig>,
+    },
+    PutBlob {
+        room: RoomId,
+        name: String,
+        bytes: u64,
+    },
+    Leave {
+        room: RoomId,
+        vacate: bool,
+    },
     History {
         room: RoomId,
         from_n: u64,
@@ -46,6 +77,28 @@ pub enum ClientRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         room: Option<RoomId>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ClientTicket {
+    Ticket(Box<Ticket>),
+    Magnet(String),
+}
+
+impl ClientTicket {
+    pub fn resolve(self) -> Result<Ticket, TicketError> {
+        match self {
+            Self::Ticket(ticket) => Ok(*ticket),
+            Self::Magnet(magnet) => Ticket::from_magnet(&magnet),
+        }
+    }
+}
+
+impl From<Ticket> for ClientTicket {
+    fn from(ticket: Ticket) -> Self {
+        Self::Ticket(Box::new(ticket))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

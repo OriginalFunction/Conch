@@ -26,6 +26,7 @@ use crate::{
 };
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+const MAX_BLOB_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -45,6 +46,8 @@ pub enum StoreError {
     ConflictingScenes(u64),
     #[error("committed prefix has a hole at height {0}")]
     SickHole(u64),
+    #[error("blob exceeds the 32 MiB limit")]
+    BlobTooLarge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +120,30 @@ impl Store {
             Err(error) => return Err(error.into()),
         }
         Ok(())
+    }
+
+    pub fn put_blob(&self, bytes: &[u8]) -> Result<VerifiedBlob, StoreError> {
+        if bytes.len() > MAX_BLOB_BYTES {
+            return Err(StoreError::BlobTooLarge);
+        }
+        let verified = VerifiedBlob::from_bytes(bytes);
+        let path = self.root.join("blobs").join(verified.sha256.to_string());
+        if !path.exists() {
+            write_bytes_atomic(&path, bytes)?;
+        }
+        if let Some(inventory) = self
+            .blob_inventory
+            .lock()
+            .expect("blob inventory lock is not poisoned")
+            .as_mut()
+        {
+            inventory.insert(verified.sha256, verified);
+        }
+        Ok(verified)
+    }
+
+    pub fn read_blob(&self, hash: Hash32) -> Result<Vec<u8>, StoreError> {
+        Ok(fs::read(self.root.join("blobs").join(hash.to_string()))?)
     }
 
     pub fn load_intents(&self) -> Result<Vec<Intent>, StoreError> {
@@ -345,7 +372,7 @@ impl Store {
         Ok(())
     }
 
-    fn load_blob_inventory(&self) -> Result<ApplyResources, StoreError> {
+    pub fn load_blob_inventory(&self) -> Result<ApplyResources, StoreError> {
         if let Some(blobs) = self
             .blob_inventory
             .lock()
@@ -458,6 +485,10 @@ fn read_optional_json_lossy<T: DeserializeOwned>(path: &Path) -> Option<T> {
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {
+    write_bytes_atomic(path, &serde_json::to_vec(value)?)
+}
+
+fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "persistent path has no parent")
     })?;
@@ -473,14 +504,12 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreEr
             )
         })?;
     let temporary = parent.join(format!(".{filename}.tmp-{}-{suffix}", std::process::id()));
-    let bytes = serde_json::to_vec(value)?;
-
     let result = (|| -> Result<(), StoreError> {
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&temporary)?;
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
         fs::rename(&temporary, path)?;

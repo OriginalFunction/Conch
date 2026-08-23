@@ -235,6 +235,17 @@ impl FloorEngine {
         Ok(response)
     }
 
+    pub fn attach_blob(&mut self, mouth: &Mouth, blob: BlobRef) -> Result<(), FloorError> {
+        let take = self.take.as_mut().ok_or(FloorError::NoGrant)?;
+        if take.phase != TakePhase::Open || &take.holder != mouth {
+            return Err(FloorError::NoGrant);
+        }
+        if !take.blobs.iter().any(|known| known.sha256 == blob.sha256) {
+            take.blobs.push(blob);
+        }
+        Ok(())
+    }
+
     pub fn freeze(&mut self, room: RoomId, grant_hash: Hash32) -> Result<FrozenTake, FloorError> {
         let take = self.take.as_mut().ok_or(FloorError::NoGrant)?;
         if take.room != room || take.grant_hash != grant_hash {

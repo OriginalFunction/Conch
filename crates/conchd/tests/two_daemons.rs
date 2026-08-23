@@ -4,7 +4,7 @@ use conch_core::{
     client::ClientReply,
     frame,
     ticket::JoinRole,
-    types::{AgentId, FloorConfig, StakePolicy},
+    types::{AgentId, FloorConfig, Hash32, StakePolicy},
 };
 use conchd::tcp::{read_frame, Daemon};
 use tempfile::TempDir;
@@ -37,7 +37,7 @@ async fn two_daemons_replicate_genesis() {
 }
 
 #[tokio::test]
-async fn observer_role_disables_certification_even_for_a_roster_key() {
+async fn roster_member_cannot_rejoin_as_observer_before_removal() {
     let data = TempDir::new().unwrap();
     let daemon = Daemon::open(data.path()).unwrap();
     let ticket = daemon
@@ -49,11 +49,44 @@ async fn observer_role_disables_certification_even_for_a_roster_key() {
         .unwrap();
     assert!(daemon.can_certify(ticket.id).unwrap());
 
-    daemon
+    let error = daemon
         .join_ticket(ticket.clone(), JoinRole::Observe)
         .await
+        .unwrap_err();
+    assert!(matches!(error, conchd::tcp::DaemonError::InvalidJoinRole));
+    assert!(daemon.can_certify(ticket.id).unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wrong_genesis_pin_is_bad_ticket_and_leaves_no_half_room() {
+    let source_dir = TempDir::new().unwrap();
+    let follower_dir = TempDir::new().unwrap();
+    let source = Daemon::open(source_dir.path()).unwrap();
+    let follower = Daemon::open(follower_dir.path()).unwrap();
+    let source_server = source.start(loopback()).await.unwrap();
+    let mut ticket = source
+        .create_ticket("bad pin", StakePolicy::default(), FloorConfig::stick(30))
         .unwrap();
-    assert!(!daemon.can_certify(ticket.id).unwrap());
+    ticket.genesis = Hash32::from_bytes([0x99; 32]);
+    assert_eq!(
+        ticket.peers,
+        vec![format!("tcp://{}", source_server.addr())]
+    );
+
+    let error = follower
+        .join_ticket(ticket.clone(), JoinRole::Stake)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, conchd::tcp::DaemonError::BadTicket(_)));
+    assert!(!follower_dir
+        .path()
+        .join("rooms")
+        .join(ticket.id.to_string())
+        .exists());
+    assert!(matches!(
+        follower.replay(ticket.id),
+        Err(conchd::tcp::DaemonError::UnknownRoom(_))
+    ));
 }
 
 #[tokio::test]

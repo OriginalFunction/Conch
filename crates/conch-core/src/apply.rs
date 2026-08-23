@@ -8,8 +8,8 @@ use crate::{
     encoding::{cert_digest, scene_hash, signed_object_digest, verify},
     floor::intent_supersedes,
     types::{
-        Body, CertSigner, ChainState, CommitProof, FloorConfig, FloorMode, Hash32, Intent,
-        LiveGrant, Mouth, NodeId, Scene,
+        Body, CertSigner, ChainState, CommitProof, FloorConfig, FloorMode, GrantReason, Hash32,
+        Intent, LiveGrant, Mouth, NodeId, Scene,
     },
 };
 
@@ -374,6 +374,10 @@ fn validate_grant_intent(
     resources: &ApplyResources,
 ) -> Result<(), ApplyError> {
     let (to, intent_id) = match &scene.body {
+        Body::Grant {
+            reason: GrantReason::Moderator,
+            ..
+        } => return Ok(()),
         Body::Grant { to, intent_id, .. } => (to, intent_id),
         _ => return Ok(()),
     };

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/conch-core", "crates/conchd", "crates/conch"]
+members = ["crates/conch-core", "crates/conchd", "crates/conch", "crates/conch-mcp"]
 
 [workspace.package]
 edition = "2021"
@@ -17,7 +17,7 @@ sha2 = "0.10.9"
 thiserror = "2.0.18"
 tempfile = "3.23.0"
 rand = "0.8.5"
-tokio = { version = "1.48.0", features = ["macros", "net", "process", "rt-multi-thread", "sync", "time", "io-util"] }
+tokio = { version = "1.48.0", features = ["macros", "net", "process", "rt-multi-thread", "sync", "time", "io-util", "io-std"] }
 form_urlencoded = "1.2.2"
 axum = { version = "0.8.7", features = ["ws"] }
 futures-util = "0.3.31"

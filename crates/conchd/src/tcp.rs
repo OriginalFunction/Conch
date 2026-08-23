@@ -9,7 +9,7 @@ use std::{
 };
 
 use conch_core::{
-    apply::{apply, ApplyMode, ApplyResources},
+    apply::{apply, ApplyMode},
     client::{ClientReply, ClientRequest},
     consensus::{
         advance_term, begin_campaign, tail, AdvanceSource, CloseTake, ConsensusError, GetScenes,
@@ -21,9 +21,9 @@ use conch_core::{
     frame::{self, FrameError, MAX_FRAME_BYTES},
     ticket::{Declaration, JoinRole, Ticket, TicketError},
     types::{
-        AgentId, Body, Cert, ChainState, CommitProof, CommittedScene, ConsensusRole,
-        ConsensusState, FloorConfig, GrantReason, Hash32, Intent, IntentKind, Mouth, NodeId,
-        RoomId, Scene, SignatureBytes, StakePolicy,
+        AgentId, BlobRef, Body, Cert, ChainState, CommitProof, CommittedScene, ConsensusRole,
+        ConsensusState, FloorConfig, FloorMode, GrantReason, Hash32, Intent, IntentKind, Mouth,
+        NodeId, RoomId, Scene, SignatureBytes, StakePolicy,
     },
 };
 use ed25519_dalek::SigningKey;
@@ -41,6 +41,7 @@ use tokio::{
 };
 
 const SYNC_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_BLOB_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
@@ -78,6 +79,10 @@ pub enum DaemonError {
     MutationUnavailable,
     #[error("WebSocket transport failed: {0}")]
     WebSocket(String),
+    #[error("request did not come from the configured moderator mouth")]
+    NotModerator,
+    #[error("a roster member cannot join as an observer before it is removed")]
+    InvalidJoinRole,
 }
 
 #[derive(Clone)]
@@ -288,6 +293,17 @@ impl Daemon {
         floor: FloorConfig,
         token: Option<Hash32>,
     ) -> Result<Ticket, DaemonError> {
+        self.create_ticket_inner(name, stake, floor, token, None)
+    }
+
+    fn create_ticket_inner(
+        &self,
+        name: &str,
+        stake: StakePolicy,
+        floor: FloorConfig,
+        token: Option<Hash32>,
+        parent: Option<RoomId>,
+    ) -> Result<Ticket, DaemonError> {
         let room_key = SigningKey::from_bytes(&random::<[u8; 32]>());
         let room = RoomId::from_bytes(room_key.verifying_key().to_bytes());
         let node = self.node_id();
@@ -305,7 +321,7 @@ impl Daemon {
                 stake: stake.clone(),
                 floor: floor.clone(),
                 creator_node: node,
-                parent_room: None,
+                parent_room: parent,
                 token_sha256: token
                     .map(|token| Hash32::from_bytes(Sha256::digest(token.as_bytes()).into())),
             },
@@ -343,7 +359,7 @@ impl Daemon {
             token,
             stake,
             floor,
-            parent: None,
+            parent,
             genesis: hash,
         };
         ticket.validate()?;
@@ -538,7 +554,14 @@ impl Daemon {
                 {
                     return Err(DaemonError::BadTicket("genesis hash does not match g"));
                 }
-                self.install_record(room, record).await?;
+                if let Err(error) = self.install_record(room, record).await {
+                    if expected_n == 0 && expected_genesis.is_some() {
+                        return Err(DaemonError::BadTicket(
+                            "genesis failed signature or ledger validation",
+                        ));
+                    }
+                    return Err(error);
+                }
             }
             let replay = self.replay(room)?;
             if replay.chain.head_n == Some(have.n) && replay.chain.head_hash == Some(have.hash) {
@@ -562,6 +585,7 @@ impl Daemon {
     ) -> Result<ChainState, DaemonError> {
         ticket.validate()?;
         let room = ticket.id;
+        let room_existed = self.store(room).is_ok();
         let daemon = self.clone();
         let prepared_ticket = ticket.clone();
         if let Some(chain) =
@@ -576,6 +600,7 @@ impl Daemon {
             .chain(&ticket.peers)
             .cloned()
             .collect::<Vec<_>>();
+        let mut pinned_failure = None;
         for endpoint in endpoints {
             if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
                 let attempt = timeout(
@@ -583,13 +608,30 @@ impl Daemon {
                     self.sync_room_from_ws(&endpoint, room, ticket.token, Some(ticket.genesis)),
                 )
                 .await;
-                if let Ok(Ok(chain)) = attempt {
-                    let replay = self.replay(room)?;
-                    verify_ticket_replay(&ticket, &replay)?;
-                    let store = self.store(room)?;
-                    let canonical = canonical_ticket(&ticket, &replay)?;
-                    task::spawn_blocking(move || write_ticket(&store, &canonical)).await??;
-                    return Ok(chain);
+                match attempt {
+                    Ok(Ok(chain)) => {
+                        let replay = self.replay(room)?;
+                        if let Err(error) = verify_ticket_replay(&ticket, &replay) {
+                            if !room_existed {
+                                self.discard_room(room)?;
+                            }
+                            return Err(error);
+                        }
+                        if role == JoinRole::Observe
+                            && replay.chain.roster.contains(&self.node_id())
+                        {
+                            if !room_existed {
+                                self.discard_room(room)?;
+                            }
+                            return Err(DaemonError::InvalidJoinRole);
+                        }
+                        let store = self.store(room)?;
+                        let canonical = canonical_ticket(&ticket, &replay)?;
+                        task::spawn_blocking(move || write_ticket(&store, &canonical)).await??;
+                        return Ok(chain);
+                    }
+                    Ok(Err(error @ DaemonError::BadTicket(_))) => pinned_failure = Some(error),
+                    _ => {}
                 }
                 continue;
             }
@@ -605,18 +647,37 @@ impl Daemon {
                     self.sync_room_from_inner(addr, room, ticket.token, Some(ticket.genesis)),
                 )
                 .await;
-                let Ok(Ok(chain)) = attempt else {
-                    continue;
+                let chain = match attempt {
+                    Ok(Ok(chain)) => chain,
+                    Ok(Err(error @ DaemonError::BadTicket(_))) => {
+                        pinned_failure = Some(error);
+                        continue;
+                    }
+                    _ => continue,
                 };
                 let replay = self.replay(room)?;
-                verify_ticket_replay(&ticket, &replay)?;
+                if let Err(error) = verify_ticket_replay(&ticket, &replay) {
+                    if !room_existed {
+                        self.discard_room(room)?;
+                    }
+                    return Err(error);
+                }
+                if role == JoinRole::Observe && replay.chain.roster.contains(&self.node_id()) {
+                    if !room_existed {
+                        self.discard_room(room)?;
+                    }
+                    return Err(DaemonError::InvalidJoinRole);
+                }
                 let store = self.store(room)?;
                 let canonical = canonical_ticket(&ticket, &replay)?;
                 task::spawn_blocking(move || write_ticket(&store, &canonical)).await??;
                 return Ok(chain);
             }
         }
-        Err(DaemonError::JoinUnavailable)
+        if !room_existed {
+            self.discard_room(room)?;
+        }
+        Err(pinned_failure.unwrap_or(DaemonError::JoinUnavailable))
     }
 
     fn prepare_join(
@@ -628,6 +689,9 @@ impl Daemon {
         if let Ok(replay) = self.replay(room) {
             if replay.chain.head_n.is_some() {
                 verify_ticket_replay(ticket, &replay)?;
+                if role == JoinRole::Observe && replay.chain.roster.contains(&self.node_id()) {
+                    return Err(DaemonError::InvalidJoinRole);
+                }
                 let store = self.store(room)?;
                 write_ticket(&store, &canonical_ticket(ticket, &replay)?)?;
                 let local_join = LocalJoin {
@@ -652,6 +716,36 @@ impl Daemon {
         write_local_join(&store, &local_join)?;
         self.track_room(room)?;
         Ok(None)
+    }
+
+    fn discard_room(&self, room: RoomId) -> Result<(), DaemonError> {
+        self.inner
+            .rooms
+            .write()
+            .expect("room registry lock is not poisoned")
+            .remove(&room);
+        self.inner
+            .replays
+            .write()
+            .expect("replay registry lock is not poisoned")
+            .remove(&room);
+        self.inner
+            .floors
+            .write()
+            .expect("floor registry lock is not poisoned")
+            .remove(&room);
+        self.inner
+            .joins
+            .write()
+            .expect("join registry lock is not poisoned")
+            .remove(&room);
+        let path = self.room_path(room);
+        match fs::remove_dir_all(path) {
+            Ok(()) => sync_dir(&self.inner.data_dir.join("rooms"))?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
     }
 
     async fn serve_listener(self, listener: TcpListener) -> Result<(), DaemonError> {
@@ -777,14 +871,20 @@ impl Daemon {
                     if !self.room_authorized(freeze.room, &authed)? {
                         continue;
                     }
-                    let leader_is_peer = self.replay(freeze.room).is_ok_and(|replay| {
-                        replay.chain.roster.contains(&peer.node)
-                            && replay.consensus.leader_id == Some(peer.node)
-                    });
+                    let declared_for_room = peer
+                        .decl
+                        .iter()
+                        .any(|declaration| declaration.room == freeze.room);
+                    let leader_is_peer = declared_for_room
+                        && self.replay(freeze.room).is_ok_and(|replay| {
+                            replay.chain.roster.contains(&peer.node)
+                                && replay.consensus.leader_id == Some(peer.node)
+                        });
                     if !leader_is_peer {
                         continue;
                     }
-                    if let Some(close) = self.receive_freeze(freeze.room, freeze.grant_hash).await?
+                    if let Ok(Some(close)) =
+                        self.receive_freeze(freeze.room, freeze.grant_hash).await
                     {
                         write_message(&mut stream, &SwarmMsg::CloseTake(close)).await?;
                     }
@@ -828,7 +928,28 @@ impl Daemon {
                     continue;
                 }
             };
-            let reply = self.execute_client(agent.clone(), request).await;
+            let reply = if let ClientRequest::PutBlob { room, name, bytes } = request {
+                if bytes > MAX_BLOB_BYTES {
+                    ClientReply::failure("invalid", "blob exceeds the 32 MiB limit")
+                } else {
+                    let raw_length = stream.read_u32().await? as u64;
+                    if raw_length != bytes {
+                        ClientReply::failure(
+                            "invalid",
+                            "blob length prefix does not match metadata",
+                        )
+                    } else {
+                        let mut raw = vec![0_u8; bytes as usize];
+                        stream.read_exact(&mut raw).await?;
+                        match self.client_put_blob(agent.clone(), room, name, raw).await {
+                            Ok(data) => ClientReply::success(data),
+                            Err(error) => client_error_reply(error),
+                        }
+                    }
+                }
+            } else {
+                self.execute_client(agent.clone(), request).await
+            };
             write_frame(&mut stream, &reply).await?;
         }
         Ok(())
@@ -836,9 +957,17 @@ impl Daemon {
 
     async fn execute_client(&self, agent: AgentId, request: ClientRequest) -> ClientReply {
         let result = match request {
-            ClientRequest::Create { name, stake, floor } => {
+            ClientRequest::Create {
+                name,
+                stake,
+                floor,
+                token,
+            } => {
                 let daemon = self.clone();
-                match task::spawn_blocking(move || daemon.create_ticket(&name, stake, floor)).await
+                match task::spawn_blocking(move || {
+                    daemon.create_ticket_with_token(&name, stake, floor, token)
+                })
+                .await
                 {
                     Ok(result) => result.map(|ticket| {
                         json!({
@@ -850,10 +979,13 @@ impl Daemon {
                     Err(error) => Err(error.into()),
                 }
             }
-            ClientRequest::Join { ticket, role } => self
-                .join_ticket(ticket, role)
-                .await
-                .map(|chain| json!({ "id": chain.room, "role": role })),
+            ClientRequest::Join { ticket, role } => match ticket.resolve() {
+                Ok(ticket) => self
+                    .join_ticket(ticket, role)
+                    .await
+                    .map(|chain| json!({ "id": chain.room, "role": role })),
+                Err(error) => Err(error.into()),
+            },
             ClientRequest::WaitForFloor { room, timeout_secs } => {
                 self.client_wait_for_floor(agent, room, timeout_secs).await
             }
@@ -864,6 +996,20 @@ impl Daemon {
             } => self.client_speak(agent, room, text, request_id).await,
             ClientRequest::Yield { room } => self.client_yield(agent, room).await,
             ClientRequest::RaiseHand { room } => self.client_raise_hand(agent, room).await,
+            ClientRequest::Grant { room, to } => self.client_grant(agent, room, to).await,
+            ClientRequest::Yank { room } => self.client_yank(agent, room).await,
+            ClientRequest::Breakout {
+                room,
+                name,
+                members,
+            } => self.client_breakout(agent, room, name, members).await,
+            ClientRequest::Membership { room, stake, floor } => {
+                self.client_membership(agent, room, stake, floor).await
+            }
+            ClientRequest::Leave { room, vacate } => self.client_leave(agent, room, vacate).await,
+            ClientRequest::PutBlob { .. } => Err(DaemonError::Protocol(
+                "put_blob requires a following raw frame",
+            )),
             ClientRequest::History { room, from_n } => self.replay(room).and_then(|replay| {
                 serde_json::to_value(
                     replay
@@ -878,33 +1024,7 @@ impl Daemon {
             ClientRequest::Attach { .. } => Err(DaemonError::Protocol("duplicate attach")),
         };
 
-        match result {
-            Ok(data) => ClientReply::success(data),
-            Err(DaemonError::UnknownRoom(_)) => {
-                ClientReply::failure("unknown_room", "room is not joined on this node")
-            }
-            Err(DaemonError::Floor(FloorError::NoGrant)) => {
-                ClientReply::failure("no_grant", "no OPEN grant for this mouth")
-            }
-            Err(DaemonError::Floor(FloorError::NotStaker)) => {
-                ClientReply::failure("unauthorized", "observer or removed node cannot speak")
-            }
-            Err(DaemonError::Floor(FloorError::Timeout)) => {
-                ClientReply::failure("timeout", "wait-for-floor timed out")
-            }
-            Err(error @ DaemonError::Ticket(_)) | Err(error @ DaemonError::BadTicket(_)) => {
-                ClientReply::failure("bad_ticket", error.to_string())
-            }
-            Err(error @ DaemonError::JoinUnavailable)
-            | Err(error @ DaemonError::SyncTimeout)
-            | Err(error @ DaemonError::MutationUnavailable) => {
-                ClientReply::failure("unavailable", error.to_string())
-            }
-            Err(error @ DaemonError::Store(StoreError::SickHole(_))) => {
-                ClientReply::failure("sick", error.to_string())
-            }
-            Err(error) => ClientReply::failure("invalid", error.to_string()),
-        }
+        result.map_or_else(client_error_reply, ClientReply::success)
     }
 
     async fn client_wait_for_floor(
@@ -954,6 +1074,299 @@ impl Daemon {
     async fn client_raise_hand(&self, agent: AgentId, room: RoomId) -> Result<Value, DaemonError> {
         let id = self.queue_intent(room, agent, IntentKind::Raise).await?;
         Ok(json!({ "intent_id": id }))
+    }
+
+    async fn client_grant(
+        &self,
+        agent: AgentId,
+        room: RoomId,
+        to: Mouth,
+    ) -> Result<Value, DaemonError> {
+        let floor = self.floor(room)?;
+        let _mutation = floor.mutation.lock().await;
+        let replay = self.replay(room)?;
+        self.require_moderator(&replay, &agent)?;
+        if replay.chain.live_grant.is_some() || !replay.chain.roster.contains(&to.node) {
+            return Err(FloorError::NoGrant.into());
+        }
+        let record = self
+            .commit_singleton_body(
+                room,
+                Body::Grant {
+                    to,
+                    reason: GrantReason::Moderator,
+                    intent_id: Hash32::from_bytes(random::<[u8; 32]>()),
+                },
+                &floor,
+            )
+            .await?;
+        Ok(serde_json::to_value(record.scene)?)
+    }
+
+    async fn client_yank(&self, agent: AgentId, room: RoomId) -> Result<Value, DaemonError> {
+        let floor = self.floor(room)?;
+        let _mutation = floor.mutation.lock().await;
+        let replay = self.replay(room)?;
+        self.require_moderator(&replay, &agent)?;
+        let grant = replay.chain.live_grant.ok_or(FloorError::NoGrant)?;
+        let frozen = {
+            let mut engine = floor.engine.lock().expect("floor lock is not poisoned");
+            if engine
+                .take()
+                .is_some_and(|take| take.grant_hash == grant.hash)
+            {
+                let frozen = engine.freeze(room, grant.hash)?;
+                let take = engine.take().expect("freeze preserves take").clone();
+                Some((frozen, take))
+            } else {
+                None
+            }
+        };
+        let (text, blobs) = if let Some((frozen, take)) = frozen {
+            let store = self.store(room)?;
+            task::spawn_blocking(move || write_take(&store, &take)).await??;
+            (frozen.text, frozen.blobs)
+        } else {
+            (String::new(), Vec::new())
+        };
+        loop {
+            self.commit_singleton_body(
+                room,
+                Body::Speech {
+                    closes_grant: grant.hash,
+                    text: text.clone(),
+                    blobs: blobs.clone(),
+                },
+                &floor,
+            )
+            .await?;
+            if self
+                .replay(room)?
+                .chain
+                .live_grant
+                .as_ref()
+                .is_none_or(|live| live.hash != grant.hash)
+            {
+                break;
+            }
+        }
+        Ok(json!({ "ok": true, "closes_grant": grant.hash }))
+    }
+
+    async fn client_membership(
+        &self,
+        agent: AgentId,
+        room: RoomId,
+        stake: Option<StakePolicy>,
+        floor_config: Option<FloorConfig>,
+    ) -> Result<Value, DaemonError> {
+        let floor = self.floor(room)?;
+        let _mutation = floor.mutation.lock().await;
+        if !self.can_certify(room)? {
+            return Err(FloorError::NotStaker.into());
+        }
+        let replay = self.replay(room)?;
+        let mouth = Mouth {
+            agent,
+            node: self.node_id(),
+        };
+        let closes_grant = match &replay.chain.live_grant {
+            Some(grant) if grant.to == mouth => Some(grant.hash),
+            Some(_) => return Err(FloorError::NoGrant.into()),
+            None => None,
+        };
+        if let Some(grant_hash) = closes_grant {
+            let take = {
+                let mut engine = floor.engine.lock().expect("floor lock is not poisoned");
+                engine.freeze(room, grant_hash)?;
+                engine.take().expect("freeze preserves take").clone()
+            };
+            let store = self.store(room)?;
+            task::spawn_blocking(move || write_take(&store, &take)).await??;
+        }
+        let stake = stake.unwrap_or_else(|| {
+            replay
+                .chain
+                .stake
+                .clone()
+                .expect("committed room has stake policy")
+        });
+        let floor_config = floor_config.unwrap_or_else(|| floor_config_from_chain(&replay.chain));
+        let record = self
+            .commit_singleton_body(
+                room,
+                Body::Membership {
+                    stake,
+                    floor: floor_config,
+                    closes_grant,
+                },
+                &floor,
+            )
+            .await?;
+        Ok(serde_json::to_value(record.scene)?)
+    }
+
+    async fn client_breakout(
+        &self,
+        agent: AgentId,
+        room: RoomId,
+        name: String,
+        members: Option<Vec<NodeId>>,
+    ) -> Result<Value, DaemonError> {
+        let floor = self.floor(room)?;
+        let _mutation = floor.mutation.lock().await;
+        let replay = self.replay(room)?;
+        let mouth = Mouth {
+            agent,
+            node: self.node_id(),
+        };
+        let grant = replay
+            .chain
+            .live_grant
+            .as_ref()
+            .ok_or(FloorError::NoGrant)?;
+        if grant.to != mouth {
+            return Err(FloorError::NoGrant.into());
+        }
+        let mut auto_join = members.unwrap_or_else(|| replay.chain.roster.clone());
+        auto_join.sort_unstable();
+        auto_join.dedup();
+        if auto_join
+            .iter()
+            .any(|node| !replay.chain.roster.contains(node))
+        {
+            return Err(DaemonError::Protocol(
+                "breakout members must be in the parent roster",
+            ));
+        }
+        let take = {
+            let mut engine = floor.engine.lock().expect("floor lock is not poisoned");
+            engine.freeze(room, grant.hash)?;
+            engine.take().expect("freeze preserves take").clone()
+        };
+        let store = self.store(room)?;
+        task::spawn_blocking(move || write_take(&store, &take)).await??;
+
+        let token = self
+            .inner
+            .joins
+            .read()
+            .expect("join registry lock is not poisoned")
+            .get(&room)
+            .and_then(|join| join.token)
+            .map(|_| Hash32::from_bytes(random::<[u8; 32]>()));
+        let daemon = self.clone();
+        let child_name = name.clone();
+        let child = task::spawn_blocking(move || {
+            daemon.create_ticket_inner(
+                &child_name,
+                StakePolicy::default(),
+                FloorConfig::stick(30),
+                token,
+                Some(room),
+            )
+        })
+        .await??;
+        let record = self
+            .commit_singleton_body(
+                room,
+                Body::Breakout {
+                    closes_grant: grant.hash,
+                    ticket: serde_json::to_value(&child)?,
+                    auto_join,
+                },
+                &floor,
+            )
+            .await?;
+        Ok(json!({
+            "id": child.id,
+            "magnet": child.to_magnet(),
+            "ticket": child,
+            "scene": record.scene,
+        }))
+    }
+
+    async fn client_put_blob(
+        &self,
+        agent: AgentId,
+        room: RoomId,
+        name: String,
+        bytes: Vec<u8>,
+    ) -> Result<Value, DaemonError> {
+        let floor = self.floor(room)?;
+        let _mutation = floor.mutation.lock().await;
+        let mouth = Mouth {
+            agent,
+            node: self.node_id(),
+        };
+        if floor
+            .engine
+            .lock()
+            .expect("floor lock is not poisoned")
+            .open_grant_for(&mouth)
+            .is_none()
+        {
+            return Err(FloorError::NoGrant.into());
+        }
+        let store = self.store(room)?;
+        let blob_store = store.clone();
+        let verified = task::spawn_blocking(move || blob_store.put_blob(&bytes)).await??;
+        let blob = BlobRef {
+            name,
+            sha256: verified.sha256,
+            bytes: verified.bytes,
+        };
+        let take = {
+            let mut engine = floor.engine.lock().expect("floor lock is not poisoned");
+            engine.attach_blob(&mouth, blob.clone())?;
+            engine.take().expect("open grant has a take").clone()
+        };
+        task::spawn_blocking(move || write_take(&store, &take)).await??;
+        Ok(serde_json::to_value(blob)?)
+    }
+
+    async fn client_leave(
+        &self,
+        _agent: AgentId,
+        room: RoomId,
+        _vacate: bool,
+    ) -> Result<Value, DaemonError> {
+        let replay = self.replay(room)?;
+        if replay.chain.roster.contains(&self.node_id()) {
+            return Err(DaemonError::MutationUnavailable);
+        }
+        let join = LocalJoin {
+            role: JoinRole::Observe,
+            token: self
+                .inner
+                .joins
+                .read()
+                .expect("join registry lock is not poisoned")
+                .get(&room)
+                .and_then(|join| join.token),
+        };
+        let store = self.store(room)?;
+        let persisted = join.clone();
+        task::spawn_blocking(move || write_local_join(&store, &persisted)).await??;
+        self.inner
+            .joins
+            .write()
+            .expect("join registry lock is not poisoned")
+            .insert(room, join);
+        Ok(json!({ "ok": true, "role": "observe" }))
+    }
+
+    fn require_moderator(&self, replay: &Replay, agent: &AgentId) -> Result<(), DaemonError> {
+        let from = Mouth {
+            agent: agent.clone(),
+            node: self.node_id(),
+        };
+        if replay.chain.floor_mode != Some(FloorMode::Moderator)
+            || replay.chain.moderator.as_ref() != Some(&from)
+        {
+            return Err(DaemonError::NotModerator);
+        }
+        Ok(())
     }
 
     async fn queue_intent(
@@ -1316,16 +1729,14 @@ impl Daemon {
             body,
             certs: Vec::new(),
         };
-        let resources = ApplyResources {
-            intents: floor
-                .engine
-                .lock()
-                .expect("floor lock is not poisoned")
-                .intents()
-                .cloned()
-                .collect(),
-            blobs: BTreeMap::new(),
-        };
+        let mut resources = store.load_blob_inventory()?;
+        resources.intents = floor
+            .engine
+            .lock()
+            .expect("floor lock is not poisoned")
+            .intents()
+            .cloned()
+            .collect();
         apply(&replay.chain, &scene, None, ApplyMode::Precert(&resources))?;
         let hash = hash_scene(&scene);
         let digest = cert_digest(&room, scene.n, hash.as_bytes(), rpc_term, &node, &node);
@@ -1640,6 +2051,52 @@ impl Daemon {
 
     fn room_path(&self, room: RoomId) -> PathBuf {
         self.inner.data_dir.join("rooms").join(room.to_string())
+    }
+}
+
+fn client_error_reply(error: DaemonError) -> ClientReply {
+    match error {
+        DaemonError::UnknownRoom(_) => {
+            ClientReply::failure("unknown_room", "room is not joined on this node")
+        }
+        DaemonError::Floor(FloorError::NoGrant) => {
+            ClientReply::failure("no_grant", "no OPEN grant for this mouth")
+        }
+        DaemonError::Floor(FloorError::NotStaker) => {
+            ClientReply::failure("unauthorized", "observer or removed node cannot speak")
+        }
+        DaemonError::Floor(FloorError::Timeout) => {
+            ClientReply::failure("timeout", "wait-for-floor timed out")
+        }
+        error @ (DaemonError::Ticket(_) | DaemonError::BadTicket(_)) => {
+            ClientReply::failure("bad_ticket", error.to_string())
+        }
+        error @ (DaemonError::JoinUnavailable
+        | DaemonError::SyncTimeout
+        | DaemonError::MutationUnavailable) => {
+            ClientReply::failure("unavailable", error.to_string())
+        }
+        error @ DaemonError::Store(StoreError::SickHole(_)) => {
+            ClientReply::failure("sick", error.to_string())
+        }
+        DaemonError::NotModerator => {
+            ClientReply::failure("not_moderator", "request is not from the moderator mouth")
+        }
+        DaemonError::InvalidJoinRole => ClientReply::failure(
+            "unauthorized",
+            "a roster member must be removed before joining as an observer",
+        ),
+        error => ClientReply::failure("invalid", error.to_string()),
+    }
+}
+
+fn floor_config_from_chain(chain: &ChainState) -> FloorConfig {
+    FloorConfig {
+        mode: chain.floor_mode.expect("committed room has a floor mode"),
+        timeout_secs: chain
+            .timeout_secs
+            .expect("committed room has a floor timeout"),
+        moderator: chain.moderator.clone(),
     }
 }
 
@@ -1982,7 +2439,7 @@ mod tests {
             &replay.chain,
             &staged,
             None,
-            ApplyMode::Precert(&ApplyResources::default()),
+            ApplyMode::Precert(&conch_core::apply::ApplyResources::default()),
         )
         .unwrap();
         let hash = hash_scene(&staged);
