@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/conch-core"]
+members = ["crates/conch-core", "crates/conchd"]
 
 [workspace.package]
 edition = "2021"
@@ -16,3 +16,5 @@ serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 sha2 = "0.10.9"
 thiserror = "2.0.18"
 tempfile = "3.23.0"
+rand = "0.8.5"
+tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "sync", "time", "io-util"] }

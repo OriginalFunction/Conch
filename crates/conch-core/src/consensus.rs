@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 pub use crate::types::ConsensusRole;
@@ -27,6 +28,44 @@ pub struct HaveObservation {
     /// Informational only. This value must not be passed to `advance_term`
     /// until a corresponding proof is fetched, verified, and installed.
     pub advertised_rpc: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hello {
+    pub node: NodeId,
+    pub r#pub: NodeId,
+    pub addrs: Vec<String>,
+    pub decl: Vec<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Auth {
+    pub room: RoomId,
+    pub token: Hash32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerInfo {
+    pub node: NodeId,
+    pub addrs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pex {
+    pub peers: Vec<PeerInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HaveMessage {
+    pub room: RoomId,
+    pub n: u64,
+    pub hash: Hash32,
+    pub rpc_term: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,6 +206,10 @@ pub struct GetScenes {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "typ", rename_all = "snake_case")]
 pub enum SwarmMsg {
+    Hello(Hello),
+    Auth(Auth),
+    Pex(Pex),
+    Have(HaveMessage),
     RequestVote(RequestVote),
     Vote(Vote),
     Append(Append),
