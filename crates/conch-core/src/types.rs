@@ -494,6 +494,29 @@ impl Default for ChainState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsensusState {
+    pub current_term: u64,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null"
+    )]
+    pub voted_for: Option<NodeId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pending {
+    pub n: u64,
+    pub hash: Hash32,
+    pub scene: Scene,
+    pub accepted_rpc_term: u64,
+    pub accepted_leader: NodeId,
+    pub cert: Cert,
+}
+
 fn deserialize_optional_non_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
