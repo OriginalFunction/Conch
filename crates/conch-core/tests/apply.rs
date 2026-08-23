@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use conch_core::{
-    apply::{apply, ApplyError, ApplyMode, ApplyResources},
+    apply::{apply, ApplyError, ApplyMode, ApplyResources, VerifiedBlob},
     encoding::{cert_digest, scene_hash, sign, signed_object_digest},
     types::{
         AgentId, BlobRef, Body, Cert, ChainState, CommitProof, FloorConfig, FloorMode, GrantReason,
@@ -378,7 +378,7 @@ fn staged_allows_missing_blobs_commit_does_not() {
     ));
 
     let mut blobs = BTreeMap::new();
-    blobs.insert(blob_hash, bytes);
+    blobs.insert(blob_hash, VerifiedBlob::from_bytes(&bytes));
     let committed = apply(
         &granted,
         &speech,

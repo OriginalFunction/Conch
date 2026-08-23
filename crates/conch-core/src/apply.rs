@@ -6,6 +6,7 @@ use thiserror::Error;
 
 use crate::{
     encoding::{cert_digest, scene_hash, signed_object_digest, verify},
+    floor::intent_supersedes,
     types::{
         Body, CertSigner, ChainState, CommitProof, FloorConfig, FloorMode, Hash32, Intent,
         LiveGrant, Mouth, NodeId, Scene,
@@ -19,8 +20,23 @@ pub struct ApplyResources {
     /// Validated gossip candidates known to this node. `apply` still verifies
     /// signatures before using one for queue ordering.
     pub intents: Vec<Intent>,
-    /// Materialized bytes keyed by their advertised digest.
-    pub blobs: BTreeMap<Hash32, Vec<u8>>,
+    /// Stream-verified materialized blobs keyed by their advertised digest.
+    pub blobs: BTreeMap<Hash32, VerifiedBlob>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedBlob {
+    pub sha256: Hash32,
+    pub bytes: u64,
+}
+
+impl VerifiedBlob {
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        Self {
+            sha256: Hash32::from_bytes(Sha256::digest(bytes).into()),
+            bytes: bytes.len() as u64,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -394,7 +410,7 @@ fn validate_grant_intent(
             node: intent.node,
         };
         match active_by_mouth.get(&mouth) {
-            Some(previous) if (previous.ts, previous.id) >= (intent.ts, intent.id) => {}
+            Some(previous) if !intent_supersedes(intent, previous) => {}
             _ => {
                 active_by_mouth.insert(mouth, intent);
             }
@@ -512,15 +528,14 @@ fn validate_blobs(scene: &Scene, resources: &ApplyResources) -> Result<(), Apply
     };
     validate_blob_refs(blobs)?;
     for blob in blobs {
-        let bytes = resources
+        let materialized = resources
             .blobs
             .get(&blob.sha256)
             .ok_or(ApplyError::MissingBlob(blob.sha256))?;
-        if bytes.len() as u64 != blob.bytes {
+        if materialized.bytes != blob.bytes {
             return Err(ApplyError::BlobLengthMismatch(blob.sha256));
         }
-        let actual = Hash32::from_bytes(Sha256::digest(bytes).into());
-        if actual != blob.sha256 {
+        if materialized.sha256 != blob.sha256 {
             return Err(ApplyError::BlobHashMismatch(blob.sha256));
         }
     }

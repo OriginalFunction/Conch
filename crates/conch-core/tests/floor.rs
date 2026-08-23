@@ -121,7 +121,9 @@ fn closing_rejects_extra_speak_but_preserves_retry_result() {
     floor.observe_committed(&state(room, vec![holder.node], Some(grant(holder.clone()))));
     let first_id = "01".repeat(16);
     let first = floor.speak(&holder, "hello", &first_id).unwrap();
-    floor.freeze(&holder).unwrap();
+    floor
+        .freeze(room, floor.take().unwrap().grant_hash)
+        .unwrap();
 
     assert_eq!(floor.take().unwrap().phase, TakePhase::Closing);
     assert_eq!(floor.speak(&holder, "retry", &first_id).unwrap(), first);
@@ -137,6 +139,9 @@ fn wait_for_floor_unblocks_only_on_committed_grant() {
     let holder = mouth(&key, "codex");
     let room = RoomId::from_bytes([3; 32]);
     let watch = FloorWatch::new(FloorEngine::new(holder.node));
+    let queued = intent(&key, room, "codex", 7, 10);
+    let vacant = state(room, vec![holder.node], None);
+    watch.with_engine(|engine| engine.upsert_intent(&vacant, queued).unwrap());
     let waiter = watch.clone();
     let waiting_mouth = holder.clone();
     let thread =
@@ -150,4 +155,74 @@ fn wait_for_floor_unblocks_only_on_committed_grant() {
     watch.observe_committed(&state(room, vec![holder.node], Some(grant(holder))));
 
     assert!(thread.join().unwrap().is_ok());
+}
+
+#[test]
+fn stale_intent_cannot_resurrect_after_supersede() {
+    let key = SigningKey::from_bytes(&[1; 32]);
+    let holder = mouth(&key, "codex");
+    let room = RoomId::from_bytes([3; 32]);
+    let chain = state(room, vec![holder.node], None);
+    let newer = intent(&key, room, "codex", 9, 20);
+    let stale = intent(&key, room, "codex", 8, 10);
+    let mut floor = FloorEngine::new(holder.node);
+
+    assert!(floor.upsert_intent(&chain, newer.clone()).unwrap());
+    assert!(!floor.upsert_intent(&chain, stale).unwrap());
+    assert_eq!(floor.queue_head(&chain, 21).unwrap().id, newer.id);
+}
+
+#[test]
+fn same_id_refreshes_expiry_without_changing_queue_identity() {
+    let key = SigningKey::from_bytes(&[1; 32]);
+    let holder = mouth(&key, "codex");
+    let room = RoomId::from_bytes([3; 32]);
+    let chain = state(room, vec![holder.node], None);
+    let original = intent(&key, room, "codex", 9, 20);
+    let mut refreshed = original.clone();
+    refreshed.exp += 60;
+    refreshed.sig = SignatureBytes::from_bytes(sign(
+        &key,
+        &signed_object_digest(&serde_json::to_value(&refreshed).unwrap()),
+    ));
+    let mut floor = FloorEngine::new(holder.node);
+
+    floor.upsert_intent(&chain, original).unwrap();
+    assert!(floor.upsert_intent(&chain, refreshed.clone()).unwrap());
+    assert_eq!(floor.queue_head(&chain, 21).unwrap().exp, refreshed.exp);
+}
+
+#[test]
+fn expiry_boundary_and_consumption_leave_the_next_intent_queued() {
+    let first_key = SigningKey::from_bytes(&[1; 32]);
+    let second_key = SigningKey::from_bytes(&[2; 32]);
+    let room = RoomId::from_bytes([3; 32]);
+    let first = intent(&first_key, room, "codex", 8, 10);
+    let second = intent(&second_key, room, "claude", 9, 20);
+    let mut chain = state(room, vec![first.node, second.node], None);
+    let mut floor = FloorEngine::new(first.node);
+    floor.upsert_intent(&chain, first.clone()).unwrap();
+    floor.upsert_intent(&chain, second.clone()).unwrap();
+
+    assert_eq!(floor.queue_head(&chain, first.exp).unwrap().id, second.id);
+    chain.consumed_intents.insert(first.id);
+    assert_eq!(floor.queue_head(&chain, 21).unwrap().id, second.id);
+}
+
+#[test]
+fn old_grant_freeze_and_other_room_commit_do_not_close_current_take() {
+    let key = SigningKey::from_bytes(&[1; 32]);
+    let holder = mouth(&key, "codex");
+    let room = RoomId::from_bytes([3; 32]);
+    let mut floor = FloorEngine::new(holder.node);
+    floor.observe_committed(&state(room, vec![holder.node], Some(grant(holder.clone()))));
+    let current_hash = floor.take().unwrap().grant_hash;
+
+    assert_eq!(
+        floor.freeze(room, Hash32::from_bytes([4; 32])),
+        Err(FloorError::NoGrant)
+    );
+    floor.observe_committed(&state(RoomId::from_bytes([5; 32]), vec![holder.node], None));
+    assert_eq!(floor.take().unwrap().grant_hash, current_hash);
+    assert_eq!(floor.take().unwrap().phase, TakePhase::Open);
 }

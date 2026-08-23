@@ -41,6 +41,7 @@ fn split_2_2_of_4_accepts_but_commits_nothing() {
     cluster.partition(&[0, 1], &[2, 3]);
 
     let scene = cluster.fresh_membership_scene(0).unwrap();
+    let accepted_hash = cluster.hash_scene(&scene);
     let outcome = cluster
         .append_scene(0, scene, AppendDelivery::AllReachable)
         .unwrap();
@@ -57,6 +58,14 @@ fn split_2_2_of_4_accepts_but_commits_nothing() {
     assert!(cluster.node(0).pending.is_some());
     assert!(cluster.node(1).pending.is_some());
     assert!(!cluster.campaign(2).unwrap().won());
+
+    cluster.heal();
+    assert!(!cluster.campaign(0).unwrap().won());
+    assert!(cluster.campaign(1).unwrap().won());
+    cluster.win_probe(1, AppendDelivery::AllReachable).unwrap();
+    for node in cluster.nodes() {
+        assert_eq!(node.chain.head_hash, Some(accepted_hash));
+    }
 }
 
 #[test]
@@ -354,5 +363,28 @@ fn heartbeat_and_append_nack_catch_up_a_lagging_follower() {
     assert_eq!(
         cluster.node(2).chain.head_hash,
         cluster.node(0).chain.head_hash
+    );
+}
+
+#[test]
+fn leader_with_pending_cannot_mint_a_different_hash_at_same_height() {
+    let temp = TempDir::new().unwrap();
+    let mut cluster = Cluster::bootstrap(temp.path(), 4).unwrap();
+    assert!(cluster.campaign(0).unwrap().won());
+    cluster.partition(&[0, 1], &[2, 3]);
+    let accepted = cluster.fresh_membership_scene(0).unwrap();
+    let accepted_hash = cluster.hash_scene(&accepted);
+    cluster
+        .append_scene(0, accepted.clone(), AppendDelivery::AllReachable)
+        .unwrap();
+    let mut rival = accepted;
+    rival.ts += 1;
+
+    assert!(cluster
+        .append_scene(0, rival, AppendDelivery::AllReachable)
+        .is_err());
+    assert_eq!(
+        cluster.node(0).pending.as_ref().unwrap().hash,
+        accepted_hash
     );
 }

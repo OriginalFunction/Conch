@@ -1,18 +1,22 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
     str::FromStr,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use ed25519_dalek::VerifyingKey;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    apply::{apply, ApplyError, ApplyMode, ApplyResources},
+    apply::{apply, ApplyError, ApplyMode, ApplyResources, VerifiedBlob},
     consensus::{advance_term, AdvanceSource},
     encoding::{cert_digest, scene_hash, verify},
     types::{
@@ -55,6 +59,8 @@ pub struct Replay {
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
+    blob_inventory: Arc<Mutex<Option<BTreeMap<Hash32, VerifiedBlob>>>>,
+    scene_index: Arc<Mutex<BTreeMap<u64, Hash32>>>,
 }
 
 impl Store {
@@ -64,7 +70,11 @@ impl Store {
         fs::create_dir_all(root.join("blobs"))?;
         fs::create_dir_all(root.join("intents"))?;
         sync_dir(&root)?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            blob_inventory: Arc::new(Mutex::new(None)),
+            scene_index: Arc::new(Mutex::new(BTreeMap::new())),
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -146,6 +156,10 @@ impl Store {
             commit_proof: proof.clone(),
         };
         write_json_atomic(&self.scene_path(scene.n, hash), &stored)?;
+        self.scene_index
+            .lock()
+            .expect("scene index lock is not poisoned")
+            .insert(scene.n, hash);
         write_json_atomic(&self.root.join("head"), &HeadCache { n: scene.n, hash })?;
         Ok(next)
     }
@@ -255,6 +269,21 @@ impl Store {
             self.write_consensus(&consensus)?;
         }
 
+        *self
+            .scene_index
+            .lock()
+            .expect("scene index lock is not poisoned") = history
+            .iter()
+            .map(|record| {
+                (
+                    record.scene.n,
+                    Hash32::from_bytes(scene_hash(
+                        &serde_json::to_value(&record.scene).expect("typed scene is serializable"),
+                    )),
+                )
+            })
+            .collect();
+
         Ok(Replay {
             chain,
             consensus,
@@ -294,19 +323,30 @@ impl Store {
     }
 
     fn reject_conflicting_scene(&self, n: u64, hash: Hash32) -> Result<(), StoreError> {
-        if self.scan_scene_files()?.get(&n).is_some_and(|scenes| {
-            scenes.iter().any(|stored| {
-                Hash32::from_bytes(scene_hash(
-                    &serde_json::to_value(&stored.scene).expect("typed scene is serializable"),
-                )) != hash
-            })
-        }) {
+        if self
+            .scene_index
+            .lock()
+            .expect("scene index lock is not poisoned")
+            .get(&n)
+            .is_some_and(|known| *known != hash)
+        {
             return Err(StoreError::ConflictingScenes(n));
         }
         Ok(())
     }
 
     fn load_blob_inventory(&self) -> Result<ApplyResources, StoreError> {
+        if let Some(blobs) = self
+            .blob_inventory
+            .lock()
+            .expect("blob inventory lock is not poisoned")
+            .clone()
+        {
+            return Ok(ApplyResources {
+                intents: Vec::new(),
+                blobs,
+            });
+        }
         let mut blobs = BTreeMap::new();
         for entry in fs::read_dir(self.root.join("blobs"))? {
             let Ok(entry) = entry else {
@@ -318,11 +358,33 @@ impl Store {
             let Ok(hash) = Hash32::from_str(&name) else {
                 continue;
             };
-            let Ok(bytes) = fs::read(entry.path()) else {
+            let Ok(file) = File::open(entry.path()) else {
                 continue;
             };
-            blobs.insert(hash, bytes);
+            let mut reader = BufReader::new(file);
+            let mut hasher = Sha256::new();
+            let mut bytes = 0_u64;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = reader.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+                bytes += read as u64;
+            }
+            blobs.insert(
+                hash,
+                VerifiedBlob {
+                    sha256: Hash32::from_bytes(hasher.finalize().into()),
+                    bytes,
+                },
+            );
         }
+        *self
+            .blob_inventory
+            .lock()
+            .expect("blob inventory lock is not poisoned") = Some(blobs.clone());
         Ok(ApplyResources {
             intents: Vec::new(),
             blobs,

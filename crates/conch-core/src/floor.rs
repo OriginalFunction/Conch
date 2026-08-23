@@ -18,7 +18,6 @@ use crate::{
 pub enum TakePhase {
     Open,
     Closing,
-    Closed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,7 +104,11 @@ impl FloorEngine {
         self.intents.values()
     }
 
-    pub fn upsert_intent(&mut self, state: &ChainState, intent: Intent) -> Result<(), FloorError> {
+    pub fn upsert_intent(
+        &mut self,
+        state: &ChainState,
+        intent: Intent,
+    ) -> Result<bool, FloorError> {
         if state.room != Some(intent.room)
             || intent.v != 1
             || intent.exp <= intent.ts
@@ -126,8 +129,16 @@ impl FloorEngine {
             agent: intent.agent.clone(),
             node: intent.node,
         };
+        if let Some(current) = self.intents.get(&mouth) {
+            if current.id == intent.id && (current.ts != intent.ts || current.kind != intent.kind) {
+                return Err(FloorError::InvalidIntent);
+            }
+            if !intent_supersedes(&intent, current) {
+                return Ok(false);
+            }
+        }
         self.intents.insert(mouth, intent);
-        Ok(())
+        Ok(true)
     }
 
     pub fn queue_head(&self, state: &ChainState, scene_ts: u64) -> Option<&Intent> {
@@ -135,6 +146,7 @@ impl FloorEngine {
             .values()
             .filter(|intent| {
                 state.roster.contains(&intent.node)
+                    && state.room == Some(intent.room)
                     && !state.consumed_intents.contains(&intent.id)
                     && scene_ts < intent.exp
             })
@@ -142,6 +154,13 @@ impl FloorEngine {
     }
 
     pub fn observe_committed(&mut self, state: &ChainState) {
+        if self
+            .take
+            .as_ref()
+            .is_some_and(|take| state.room != Some(take.room))
+        {
+            return;
+        }
         let Some(room) = state.room else {
             self.take = None;
             return;
@@ -197,6 +216,8 @@ impl FloorEngine {
             return Err(FloorError::NoGrant);
         }
         if let Some(response) = take.requests.get(request_id) {
+            // §12.1 request-id retention wins over phase rejection: a retry
+            // after a lost response returns the original acknowledgement.
             return Ok(response.clone());
         }
         if take.phase != TakePhase::Open {
@@ -214,9 +235,9 @@ impl FloorEngine {
         Ok(response)
     }
 
-    pub fn freeze(&mut self, mouth: &Mouth) -> Result<FrozenTake, FloorError> {
+    pub fn freeze(&mut self, room: RoomId, grant_hash: Hash32) -> Result<FrozenTake, FloorError> {
         let take = self.take.as_mut().ok_or(FloorError::NoGrant)?;
-        if &take.holder != mouth || take.phase == TakePhase::Closed {
+        if take.room != room || take.grant_hash != grant_hash {
             return Err(FloorError::NoGrant);
         }
         take.phase = TakePhase::Closing;
@@ -230,12 +251,26 @@ impl FloorEngine {
     }
 }
 
+/// Returns true when `candidate` is the canonical current intent for the same
+/// mouth. Different ids use the greater `(ts,id)`; a same-id refresh keeps its
+/// original timestamp and advances only `exp`.
+pub fn intent_supersedes(candidate: &Intent, current: &Intent) -> bool {
+    if candidate.id == current.id {
+        candidate.ts == current.ts && candidate.exp > current.exp
+    } else {
+        (candidate.ts, candidate.id) > (current.ts, current.id)
+    }
+}
+
 #[derive(Clone)]
 pub struct FloorWatch {
     inner: Arc<(Mutex<FloorEngine>, Condvar)>,
 }
 
 impl FloorWatch {
+    /// Blocking embedding/test helper. `observe_committed` must be called only
+    /// with a `ChainState` produced by successful `apply(commit)`; async daemon
+    /// callers use `tokio::sync::Notify` and return the stored grant scene.
     pub fn new(engine: FloorEngine) -> Self {
         Self {
             inner: Arc::new((Mutex::new(engine), Condvar::new())),

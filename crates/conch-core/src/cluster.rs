@@ -39,6 +39,8 @@ pub enum ClusterError {
     InvalidInjectedTerm,
     #[error("commit message envelope does not match its scene")]
     InvalidCommitMessage,
+    #[error("leader already has a different pending hash at this height")]
+    PendingConflict,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,6 +348,9 @@ impl Cluster {
     ) -> Result<Scene, ClusterError> {
         self.ensure_leader(leader_index)?;
         let leader = &self.nodes[leader_index];
+        if leader.pending.is_some() {
+            return Err(ClusterError::PendingConflict);
+        }
         let mut next_roster = leader.chain.roster.clone();
         for node in &remove {
             next_roster.retain(|member| member != node);
@@ -396,6 +401,13 @@ impl Cluster {
             scene,
         };
         let hash = hash_scene(&append.scene);
+        if self.nodes[leader_index]
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.n == append.scene.n && pending.hash != hash)
+        {
+            return Err(ClusterError::PendingConflict);
+        }
         self.nodes[leader_index].sent_appends.push((rpc_term, hash));
 
         let self_cert = match accept_append_on_node(
@@ -836,11 +848,16 @@ impl Cluster {
             {
                 return Ok(());
             }
-            return Err(ApplyError::StaleConflictingCommit.into());
+            // A stale different hash is a protocol violation, but committed
+            // history wins and the message is ignored (§10 step 9).
+            return Ok(());
         }
         let already_committed =
             node.chain.head_n == Some(scene.n) && node.chain.head_hash == Some(hash);
-        let next = node.store.durable_commit(scene, proof)?;
+        let next = node
+            .store
+            .persist_committed_scene(&node.chain, scene, proof)?;
+        node.store.unlink_pending_if_stale(next.head_n)?;
         node.chain = next;
         if node
             .pending
@@ -1222,7 +1239,7 @@ fn accept_append_on_node(
                     pending,
                 )));
             }
-        } else if append.rpc_term <= pending.accepted_rpc_term {
+        } else if preserve_leader || append.rpc_term <= pending.accepted_rpc_term {
             return Ok(DeliveryResult::RefusedSameTermConflict);
         } else {
             apply(

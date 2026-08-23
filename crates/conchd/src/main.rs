@@ -12,7 +12,8 @@ async fn main() {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut data_dir = default_data_dir();
-    let mut tcp: SocketAddr = "127.0.0.1:7421".parse()?;
+    let mut tcp: SocketAddr = "0.0.0.0:7421".parse()?;
+    let mut localhost = false;
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -25,8 +26,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or("--tcp requires an address")?
                     .parse()?;
             }
+            "--localhost" => localhost = true,
             _ => return Err(format!("unknown argument: {argument}").into()),
         }
+    }
+
+    if localhost {
+        tcp.set_ip("127.0.0.1".parse()?);
     }
 
     Daemon::open(data_dir)?.serve(tcp).await?;

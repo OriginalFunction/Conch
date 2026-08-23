@@ -32,3 +32,12 @@ fn frame_rejects_length_mismatch() {
         Err(FrameError::LengthMismatch)
     ));
 }
+
+#[test]
+fn frame_rejects_oversize_prefix_before_allocation() {
+    let forged = (64_u32 * 1024 * 1024 + 1).to_be_bytes();
+    assert!(matches!(
+        decode::<serde_json::Value>(&forged),
+        Err(FrameError::TooLarge)
+    ));
+}
