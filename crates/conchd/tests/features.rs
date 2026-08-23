@@ -81,6 +81,23 @@ async fn non_moderator_grant_not_moderator() {
     assert_eq!(denied.error.unwrap().code, "not_moderator");
 
     let mut operator = attach(server.addr(), moderator.as_str()).await;
+    let missing_intent = request(
+        &mut operator,
+        ClientRequest::Grant {
+            room: ticket.id,
+            to: target.clone(),
+        },
+    )
+    .await;
+    assert!(!missing_intent.ok);
+    assert_eq!(missing_intent.error.unwrap().code, "invalid");
+
+    let mut writer = attach(server.addr(), target.agent.as_str()).await;
+    let raised = request(&mut writer, ClientRequest::RaiseHand { room: ticket.id }).await;
+    assert!(raised.ok, "{raised:?}");
+    let intent_id: Hash32 =
+        serde_json::from_value(raised.data.unwrap()["intent_id"].clone()).unwrap();
+
     let granted = request(
         &mut operator,
         ClientRequest::Grant {
@@ -90,16 +107,9 @@ async fn non_moderator_grant_not_moderator() {
     )
     .await;
     assert!(granted.ok, "{granted:?}");
-    assert_eq!(
-        daemon
-            .replay(ticket.id)
-            .unwrap()
-            .chain
-            .live_grant
-            .unwrap()
-            .to,
-        target
-    );
+    let replay = daemon.replay(ticket.id).unwrap();
+    assert_eq!(replay.chain.live_grant.unwrap().to, target);
+    assert!(replay.chain.consumed_intents.contains(&intent_id));
 }
 
 #[tokio::test]
@@ -233,6 +243,38 @@ async fn blob_put_is_durable_before_speech_certification() {
 }
 
 #[tokio::test]
+async fn oversized_blob_declaration_replies_then_closes_transport() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let ticket = daemon
+        .create_ticket(
+            "blob framing",
+            StakePolicy::default(),
+            FloorConfig::stick(30),
+        )
+        .unwrap();
+    let server = daemon.start(loopback()).await.unwrap();
+    let mut client = attach(server.addr(), "agent:writer").await;
+    write_frame(
+        &mut client,
+        &ClientRequest::PutBlob {
+            room: ticket.id,
+            name: "too-large.bin".into(),
+            bytes: 32 * 1024 * 1024 + 1,
+        },
+    )
+    .await
+    .unwrap();
+    let reply: ClientReply = read_frame(&mut client).await.unwrap().unwrap();
+    assert!(!reply.ok);
+    assert_eq!(reply.error.unwrap().code, "invalid");
+    assert!(read_frame::<_, ClientReply>(&mut client)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn unsigned_hello_cannot_spoof_leader_freeze() {
     let data = TempDir::new().unwrap();
     let daemon = Daemon::open(data.path()).unwrap();
@@ -283,8 +325,14 @@ async fn unsigned_hello_cannot_spoof_leader_freeze() {
     )
     .await
     .unwrap();
-    let _: SwarmMsg = read_frame(&mut attacker).await.unwrap().unwrap();
-    let _: SwarmMsg = read_frame(&mut attacker).await.unwrap().unwrap();
+    loop {
+        if matches!(
+            read_frame(&mut attacker).await.unwrap().unwrap(),
+            SwarmMsg::Have(_)
+        ) {
+            break;
+        }
+    }
     write_frame(
         &mut attacker,
         &SwarmMsg::Freeze(Freeze {
@@ -322,7 +370,10 @@ async fn history_follow_streams_each_new_committed_batch() {
     .await
     .unwrap();
     let initial: ClientReply = read_frame(&mut follower).await.unwrap().unwrap();
-    assert_eq!(initial.data.unwrap().as_array().unwrap().len(), 1);
+    let initial = initial.data.unwrap();
+    assert_eq!(initial["scenes"].as_array().unwrap().len(), 1);
+    assert_eq!(initial["syncing"], false);
+    assert_eq!(initial["complete"], true);
 
     let mut writer = attach(server.addr(), "agent:writer").await;
     assert!(
@@ -337,8 +388,8 @@ async fn history_follow_streams_each_new_committed_batch() {
             .unwrap()
             .unwrap();
     let records = update.data.unwrap();
-    assert_eq!(records.as_array().unwrap().len(), 1);
-    assert_eq!(records[0]["scene"]["body"]["type"], "grant");
+    assert_eq!(records["scenes"].as_array().unwrap().len(), 1);
+    assert_eq!(records["scenes"][0]["scene"]["body"]["type"], "grant");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -454,6 +505,85 @@ async fn two_daemon_staker_wrap_uses_network_votes_and_certs() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn moderator_yank_freezes_remote_holder_before_commit() {
+    let source_data = TempDir::new().unwrap();
+    let holder_data = TempDir::new().unwrap();
+    let source = Daemon::open(source_data.path()).unwrap();
+    let holder = Daemon::open(holder_data.path()).unwrap();
+    let source_server = source.start(loopback()).await.unwrap();
+    let holder_server = holder.start(loopback()).await.unwrap();
+    let moderator = AgentId::new("human:moderator").unwrap();
+    let ticket = source
+        .create_ticket(
+            "remote yank",
+            StakePolicy::default(),
+            FloorConfig {
+                mode: FloorMode::Moderator,
+                timeout_secs: 30,
+                moderator: Some(Mouth {
+                    agent: moderator.clone(),
+                    node: source.node_id(),
+                }),
+            },
+        )
+        .unwrap();
+    holder
+        .join_ticket(ticket.clone(), JoinRole::Stake)
+        .await
+        .unwrap();
+
+    let mut writer = attach(holder_server.addr(), "agent:remote-holder").await;
+    let raised = request(&mut writer, ClientRequest::RaiseHand { room: ticket.id }).await;
+    assert!(raised.ok, "{raised:?}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut operator = attach(source_server.addr(), moderator.as_str()).await;
+    let granted = request(
+        &mut operator,
+        ClientRequest::Grant {
+            room: ticket.id,
+            to: Mouth {
+                agent: AgentId::new("agent:remote-holder").unwrap(),
+                node: holder.node_id(),
+            },
+        },
+    )
+    .await;
+    assert!(granted.ok, "{granted:?}");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while holder.replay(ticket.id).unwrap().chain.live_grant.is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let spoke = request(
+        &mut writer,
+        ClientRequest::Speak {
+            room: ticket.id,
+            text: "preserve this acknowledged text".into(),
+            request_id: "00000000000000000000000000000009".into(),
+        },
+    )
+    .await;
+    assert!(spoke.ok, "{spoke:?}");
+
+    let yanked = request(&mut operator, ClientRequest::Yank { room: ticket.id }).await;
+    assert!(yanked.ok, "{yanked:?}");
+    let source_history = source.replay(ticket.id).unwrap().history;
+    assert!(matches!(
+        &source_history.last().unwrap().scene.body,
+        Body::Speech { text, .. } if text == "preserve this acknowledged text"
+    ));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while holder.replay(ticket.id).unwrap().history != source_history {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn two_of_three_live_stakers_can_wrap() {
     let source_data = TempDir::new().unwrap();
@@ -518,6 +648,70 @@ async fn two_of_three_live_stakers_can_wrap() {
         source.replay(ticket.id).unwrap().history,
         second.replay(ticket.id).unwrap().history
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn remaining_majority_elects_successor_after_leader_stops() {
+    let source_data = TempDir::new().unwrap();
+    let second_data = TempDir::new().unwrap();
+    let third_data = TempDir::new().unwrap();
+    let source = Daemon::open(source_data.path()).unwrap();
+    let second = Daemon::open(second_data.path()).unwrap();
+    let third = Daemon::open(third_data.path()).unwrap();
+    let source_server = source.start(loopback()).await.unwrap();
+    let second_server = second.start(loopback()).await.unwrap();
+    let third_server = third.start(loopback()).await.unwrap();
+    let ticket = source
+        .create_ticket(
+            "automatic election",
+            StakePolicy::default(),
+            FloorConfig::stick(30),
+        )
+        .unwrap();
+    second
+        .join_ticket(ticket.clone(), JoinRole::Stake)
+        .await
+        .unwrap();
+    third
+        .join_ticket(ticket.clone(), JoinRole::Stake)
+        .await
+        .unwrap();
+    source_server.abort();
+    drop(source_server);
+
+    let leader_addr = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let second_state = second.replay(ticket.id).unwrap().consensus;
+            if second_state.role == conch_core::types::ConsensusRole::Leader
+                && second_state.leader_id == Some(second.node_id())
+            {
+                break second_server.addr();
+            }
+            let third_state = third.replay(ticket.id).unwrap().consensus;
+            if third_state.role == conch_core::types::ConsensusRole::Leader
+                && third_state.leader_id == Some(third.node_id())
+            {
+                break third_server.addr();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut writer = attach(leader_addr, "agent:successor").await;
+    let raised = request(&mut writer, ClientRequest::RaiseHand { room: ticket.id }).await;
+    assert!(raised.ok, "{raised:?}");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while second.replay(ticket.id).unwrap().chain.live_grant.is_none()
+            || third.replay(ticket.id).unwrap().chain.live_grant.is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(second.replay(ticket.id).unwrap().chain.live_grant.is_some());
+    assert!(third.replay(ticket.id).unwrap().chain.live_grant.is_some());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -666,6 +860,84 @@ async fn network_breakout_autojoins_listed_peer() {
         source.replay(child.id).unwrap().history,
         holder.replay(child.id).unwrap().history
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn uncommitted_breakout_child_stays_staged_across_restart() {
+    let source_data = TempDir::new().unwrap();
+    let follower_data = TempDir::new().unwrap();
+    let source = Daemon::open(source_data.path()).unwrap();
+    let follower = Daemon::open(follower_data.path()).unwrap();
+    let source_server = source.start(loopback()).await.unwrap();
+    let follower_server = follower.start(loopback()).await.unwrap();
+    let parent = source
+        .create_ticket(
+            "staged child",
+            StakePolicy::default(),
+            FloorConfig::stick(30),
+        )
+        .unwrap();
+    follower
+        .join_ticket(parent.clone(), JoinRole::Stake)
+        .await
+        .unwrap();
+    let mut client = attach(source_server.addr(), "agent:holder").await;
+    assert!(
+        request(&mut client, ClientRequest::RaiseHand { room: parent.id })
+            .await
+            .ok
+    );
+    follower_server.abort();
+    drop(follower_server);
+    drop(follower);
+
+    let failed = request(
+        &mut client,
+        ClientRequest::Breakout {
+            room: parent.id,
+            name: "original child".into(),
+            members: None,
+        },
+    )
+    .await;
+    assert!(!failed.ok);
+    let pending = source.replay(parent.id).unwrap().pending.unwrap();
+    let Body::Breakout { ticket, .. } = pending.scene.body else {
+        panic!("expected staged breakout pending");
+    };
+    let child: conch_core::ticket::Ticket = serde_json::from_value(ticket).unwrap();
+    assert!(source.replay(child.id).is_err());
+    assert!(source_data
+        .path()
+        .join("staged-breakouts")
+        .join(child.id.to_string())
+        .is_dir());
+    source_server.abort();
+    drop(source_server);
+    drop(source);
+
+    let source = Daemon::open(source_data.path()).unwrap();
+    assert!(source.replay(child.id).is_err());
+    let follower = Daemon::open(follower_data.path()).unwrap();
+    let source_server = source.start(loopback()).await.unwrap();
+    let _follower_server = follower.start(loopback()).await.unwrap();
+    follower
+        .sync_room_from(source_server.addr(), parent.id)
+        .await
+        .unwrap();
+    let mut client = attach(source_server.addr(), "agent:holder").await;
+    let recovered = request(
+        &mut client,
+        ClientRequest::Breakout {
+            room: parent.id,
+            name: "ignored retry name".into(),
+            members: None,
+        },
+    )
+    .await;
+    assert!(recovered.ok, "{recovered:?}");
+    assert_eq!(recovered.data.unwrap()["id"], child.id.to_string());
+    assert!(source.replay(child.id).is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]

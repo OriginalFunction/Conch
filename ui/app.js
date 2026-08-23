@@ -80,7 +80,9 @@ async function refresh() {
   if (!state.room || state.refreshing || state.pending.length) return;
   state.refreshing = true;
   try {
-    state.history = await rpc({ typ: "history", room: state.room, from_n: 0 });
+    const page = await rpc({ typ: "history", room: state.room, from_n: 0 });
+    state.history = page.scenes;
+    if (page.syncing) setConnection("syncing", "Showing a verified prefix while catching up");
     await renderHistory();
   } catch (error) {
     setConnection("offline", error.message);

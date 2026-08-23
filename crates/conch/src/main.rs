@@ -170,10 +170,17 @@ impl ParsedRequest {
                     .and_then(|name| name.to_str())
                     .ok_or("blob filename must be UTF-8")?
                     .to_owned();
-                let bytes = fs::read(path)?;
-                if bytes.len() > 32 * 1024 * 1024 {
-                    return Err("blob exceeds the 32 MiB limit".into());
-                }
+                let bytes = tokio::task::spawn_blocking(move || {
+                    let metadata = fs::metadata(&path)?;
+                    if metadata.len() > 32 * 1024 * 1024 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "blob exceeds the 32 MiB limit",
+                        ));
+                    }
+                    fs::read(path)
+                })
+                .await??;
                 Ok((
                     ClientRequest::PutBlob {
                         room,

@@ -7,6 +7,7 @@ use thiserror::Error;
 use crate::{
     encoding::{cert_digest, scene_hash, signed_object_digest, verify},
     floor::intent_supersedes,
+    ticket::Ticket,
     types::{
         Body, CertSigner, ChainState, CommitProof, FloorConfig, FloorMode, GrantReason, Hash32,
         Intent, LiveGrant, Mouth, NodeId, Scene,
@@ -105,6 +106,8 @@ pub enum ApplyError {
     InvalidViewChange,
     #[error("breakout auto_join must be a subset of the current roster")]
     InvalidAutoJoin,
+    #[error("breakout must contain a valid child ticket whose parent is this room")]
+    InvalidBreakoutTicket,
     #[error("commit or staged validation requires a commit proof")]
     MissingCommitProof,
     #[error("commit proof leader is not in the derived roster")]
@@ -252,11 +255,21 @@ fn validate_body(state: &ChainState, scene: &Scene) -> Result<(), ApplyError> {
             // reducer validity condition; the leader path chooses it per §12.
         }
         Body::Speech { blobs, .. } => validate_blob_refs(blobs)?,
-        Body::Breakout { auto_join, .. } => {
+        Body::Breakout {
+            ticket, auto_join, ..
+        } => {
             if has_duplicates(auto_join)
                 || auto_join.iter().any(|node| !scene.roster.contains(node))
             {
                 return Err(ApplyError::InvalidAutoJoin);
+            }
+            let ticket: Ticket = serde_json::from_value(ticket.clone())
+                .map_err(|_| ApplyError::InvalidBreakoutTicket)?;
+            ticket
+                .validate()
+                .map_err(|_| ApplyError::InvalidBreakoutTicket)?;
+            if ticket.parent != Some(scene.room) {
+                return Err(ApplyError::InvalidBreakoutTicket);
             }
         }
         Body::Membership { floor, .. } => validate_floor_config(floor)?,
@@ -373,12 +386,12 @@ fn validate_grant_intent(
     scene: &Scene,
     resources: &ApplyResources,
 ) -> Result<(), ApplyError> {
-    let (to, intent_id) = match &scene.body {
+    let (to, reason, intent_id) = match &scene.body {
         Body::Grant {
-            reason: GrantReason::Moderator,
-            ..
-        } => return Ok(()),
-        Body::Grant { to, intent_id, .. } => (to, intent_id),
+            to,
+            reason,
+            intent_id,
+        } => (to, reason, intent_id),
         _ => return Ok(()),
     };
 
@@ -430,6 +443,12 @@ fn validate_grant_intent(
         .is_none_or(|active| active.id != target.id)
     {
         return Err(ApplyError::IntentNotQueueHead);
+    }
+
+    // A moderator chooses a waiter, not necessarily the globally oldest
+    // waiter. Every grant still names that mouth's live intent.
+    if *reason == GrantReason::Moderator {
+        return Ok(());
     }
 
     let head = active_by_mouth

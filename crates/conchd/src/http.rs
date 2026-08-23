@@ -174,9 +174,7 @@ async fn get_history(
 ) -> Result<Json<Value>, HttpError> {
     let room = parse_room(&id)?;
     authorize(&daemon, room, &headers)?;
-    Ok(Json(serde_json::to_value(
-        daemon.history_from(room, query.from)?,
-    )?))
+    Ok(Json(daemon.history_page_from(room, query.from)?))
 }
 
 async fn ws_swarm(State(daemon): State<Daemon>, upgrade: WebSocketUpgrade) -> impl IntoResponse {
@@ -273,7 +271,12 @@ async fn websocket_bridge(
                     }
                 }
                 Message::Close(_) => break,
-                Message::Binary(_) | Message::Pong(_) => {}
+                Message::Binary(bytes) => {
+                    if bridge_writer.write_all(&bytes).await.is_err() {
+                        break;
+                    }
+                }
+                Message::Pong(_) => {}
             }
         }
     });
@@ -333,9 +336,12 @@ async fn tungstenite_bridge(
                     }
                 }
                 TungsteniteMessage::Close(_) => break,
-                TungsteniteMessage::Binary(_)
-                | TungsteniteMessage::Pong(_)
-                | TungsteniteMessage::Frame(_) => {}
+                TungsteniteMessage::Binary(bytes) => {
+                    if bridge_writer.write_all(&bytes).await.is_err() {
+                        break;
+                    }
+                }
+                TungsteniteMessage::Pong(_) | TungsteniteMessage::Frame(_) => {}
             }
         }
     });

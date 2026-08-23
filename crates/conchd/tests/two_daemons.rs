@@ -1,4 +1,7 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::{
+    fs,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+};
 
 use conch_core::{
     client::ClientReply,
@@ -156,6 +159,34 @@ async fn listen_file_and_advertise_feed_new_tickets() {
         .unwrap();
     assert_eq!(ticket.peers[0], "tcp://conch.example.test:7421");
     assert_eq!(ticket.trackers[0], "wss://conch.example.test/swarm");
+}
+
+#[tokio::test]
+async fn observer_learns_roster_peer_endpoints_through_pex() {
+    let source_data = TempDir::new().unwrap();
+    let second_data = TempDir::new().unwrap();
+    let observer_data = TempDir::new().unwrap();
+    let source = Daemon::open(source_data.path()).unwrap();
+    let second = Daemon::open(second_data.path()).unwrap();
+    let observer = Daemon::open(observer_data.path()).unwrap();
+    let _source_server = source.start(loopback()).await.unwrap();
+    let _second_server = second.start(loopback()).await.unwrap();
+    let ticket = source
+        .create_ticket("pex", StakePolicy::default(), FloorConfig::stick(30))
+        .unwrap();
+    second
+        .join_ticket(ticket.clone(), JoinRole::Stake)
+        .await
+        .unwrap();
+    observer
+        .join_ticket(ticket, JoinRole::Observe)
+        .await
+        .unwrap();
+
+    let peers: serde_json::Value =
+        serde_json::from_slice(&fs::read(observer_data.path().join("peers.json")).unwrap())
+            .unwrap();
+    assert!(peers.get(second.node_id().to_string()).is_some());
 }
 
 fn loopback() -> SocketAddr {

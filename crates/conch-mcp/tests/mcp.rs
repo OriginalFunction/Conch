@@ -92,8 +92,34 @@ async fn mcp_calls_the_same_daemon_floor_protocol() {
         .await
         .unwrap();
     assert_eq!(history["result"]["isError"], false);
-    let records: Vec<Value> =
+    let page: Value =
         serde_json::from_str(history["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(records.len(), 3);
-    assert_eq!(records[2]["scene"]["body"]["type"], "speech");
+    assert_eq!(page["scenes"].as_array().unwrap().len(), 3);
+    assert_eq!(page["scenes"][2]["scene"]["body"]["type"], "speech");
+    assert_eq!(page["complete"], true);
+}
+
+#[tokio::test]
+async fn tool_errors_keep_the_daemon_code_in_structured_content() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let ticket = daemon
+        .create_ticket("mcp errors", StakePolicy::default(), FloorConfig::stick(30))
+        .unwrap();
+    let daemon_server = daemon.start(loopback()).await.unwrap();
+    let server = Server::new(
+        format!("tcp://{}", daemon_server.addr()),
+        AgentId::new("agent:mcp").unwrap(),
+        Some(ticket.id),
+    );
+
+    let response = server
+        .handle_message(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "speak", "arguments": { "text": "no floor" } }
+        }))
+        .await
+        .unwrap();
+    assert_eq!(response["result"]["isError"], true);
+    assert_eq!(response["result"]["structuredContent"]["code"], "no_grant");
 }

@@ -1,4 +1,4 @@
-use std::{fs, net::SocketAddr, path::PathBuf, str::FromStr};
+use std::{fs, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 
 use conch_core::{
     client::{ClientReply, ClientRequest},
@@ -12,6 +12,8 @@ use serde_json::{json, Map, Value};
 use tokio::{
     io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     net::TcpStream,
+    sync::Mutex,
+    task::{self, JoinSet},
 };
 
 const LATEST_PROTOCOL: &str = "2025-06-18";
@@ -89,7 +91,7 @@ impl Server {
         let prepared = self.prepare(name, &arguments).await;
         let reply = match prepared {
             Ok((request, raw)) => self.send(request, raw).await,
-            Err(error) => return Ok(tool_error(&error)),
+            Err(error) => return Ok(tool_error("invalid", &error)),
         };
         match reply {
             Ok(reply) if reply.ok => {
@@ -105,13 +107,18 @@ impl Server {
                 }))
             }
             Ok(reply) => {
-                let error = reply.error.map_or_else(
-                    || "daemon returned an unspecified error".to_owned(),
-                    |error| format!("{}: {}", error.code, error.message),
+                let (code, message) = reply.error.map_or_else(
+                    || {
+                        (
+                            "invalid".to_owned(),
+                            "daemon returned an unspecified error".to_owned(),
+                        )
+                    },
+                    |error| (error.code, error.message),
                 );
-                Ok(tool_error(&error))
+                Ok(tool_error(&code, &message))
             }
-            Err(error) => Ok(tool_error(&error)),
+            Err(error) => Ok(tool_error("unavailable", &error)),
         }
     }
 
@@ -256,15 +263,20 @@ impl Server {
             }
             "blob_put" => {
                 let path = PathBuf::from(arguments.string_ref("path")?);
-                let bytes = fs::read(&path).map_err(|error| error.to_string())?;
-                if bytes.len() > MAX_BLOB_BYTES {
-                    return Err("blob exceeds the 32 MiB limit".into());
-                }
                 let name = path
                     .file_name()
                     .and_then(|name| name.to_str())
                     .ok_or("blob filename must be UTF-8")?
                     .to_owned();
+                let bytes = task::spawn_blocking(move || {
+                    let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
+                    if metadata.len() > MAX_BLOB_BYTES as u64 {
+                        return Err("blob exceeds the 32 MiB limit".to_owned());
+                    }
+                    fs::read(path).map_err(|error| error.to_string())
+                })
+                .await
+                .map_err(|error| error.to_string())??;
                 (
                     ClientRequest::PutBlob {
                         room: room()?,
@@ -331,14 +343,21 @@ pub async fn run(node: String, agent: AgentId, room: Option<RoomId>) -> Result<(
     let server = Server::new(node, agent, room);
     let input = BufReader::new(io::stdin());
     let mut lines = input.lines();
-    let mut output = BufWriter::new(io::stdout());
+    let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
+    let mut requests = JoinSet::new();
     while let Some(line) = lines.next_line().await.map_err(|error| error.to_string())? {
-        let response = match serde_json::from_str::<Value>(&line) {
-            Ok(message) => server.handle_message(message).await,
-            Err(error) => Some(json_rpc_error(Value::Null, -32700, &error.to_string())),
-        };
-        if let Some(response) = response {
+        let server = server.clone();
+        let output = Arc::clone(&output);
+        requests.spawn(async move {
+            let response = match serde_json::from_str::<Value>(&line) {
+                Ok(message) => server.handle_message(message).await,
+                Err(error) => Some(json_rpc_error(Value::Null, -32700, &error.to_string())),
+            };
+            let Some(response) = response else {
+                return Ok::<_, String>(());
+            };
             let encoded = serde_json::to_vec(&response).map_err(|error| error.to_string())?;
+            let mut output = output.lock().await;
             output
                 .write_all(&encoded)
                 .await
@@ -347,8 +366,11 @@ pub async fn run(node: String, agent: AgentId, room: Option<RoomId>) -> Result<(
                 .write_all(b"\n")
                 .await
                 .map_err(|error| error.to_string())?;
-            output.flush().await.map_err(|error| error.to_string())?;
-        }
+            output.flush().await.map_err(|error| error.to_string())
+        });
+    }
+    while let Some(result) = requests.join_next().await {
+        result.map_err(|error| error.to_string())??;
     }
     Ok(())
 }
@@ -500,9 +522,10 @@ fn json_rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-fn tool_error(message: &str) -> Value {
+fn tool_error(code: &str, message: &str) -> Value {
     json!({
         "content": [{ "type": "text", "text": message }],
+        "structuredContent": { "code": code, "message": message },
         "isError": true
     })
 }

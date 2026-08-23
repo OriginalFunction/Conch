@@ -117,6 +117,47 @@ async fn ws_client_and_tcp_expose_the_same_commit_hashes() {
 }
 
 #[tokio::test]
+async fn ws_client_accepts_blob_raw_frame_as_binary() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let room = daemon.create_genesis("ws blob").unwrap();
+    let http = daemon.start_http(loopback()).await.unwrap();
+    let (mut socket, _) = connect_async(format!("ws://{}/client", http.addr()))
+        .await
+        .unwrap();
+    socket
+        .send(json_message(&ClientRequest::Attach {
+            agent: AgentId::new("agent:browser").unwrap(),
+        }))
+        .await
+        .unwrap();
+    assert!(next_reply(&mut socket).await.ok);
+    socket
+        .send(json_message(&ClientRequest::RaiseHand { room }))
+        .await
+        .unwrap();
+    assert!(next_reply(&mut socket).await.ok);
+
+    let raw = b"binary websocket attachment";
+    socket
+        .send(json_message(&ClientRequest::PutBlob {
+            room,
+            name: "browser.bin".into(),
+            bytes: raw.len() as u64,
+        }))
+        .await
+        .unwrap();
+    let mut frame = Vec::with_capacity(4 + raw.len());
+    frame.extend_from_slice(&(raw.len() as u32).to_be_bytes());
+    frame.extend_from_slice(raw);
+    socket.send(Message::Binary(frame.into())).await.unwrap();
+    let reply = next_reply(&mut socket).await;
+    assert!(reply.ok, "{reply:?}");
+    let blob: conch_core::types::BlobRef = serde_json::from_value(reply.data.unwrap()).unwrap();
+    assert_eq!(blob.bytes, raw.len() as u64);
+}
+
+#[tokio::test]
 async fn ui_html_is_embedded_and_served_at_root_and_ui() {
     let data = TempDir::new().unwrap();
     let daemon = Daemon::open(data.path()).unwrap();
@@ -164,7 +205,11 @@ async fn ws_and_tcp_same_commit_hashes() {
     .await;
     assert_eq!(
         through_tcp.data.unwrap(),
-        serde_json::to_value(source.replay(room).unwrap().history).unwrap()
+        serde_json::json!({
+            "scenes": source.replay(room).unwrap().history,
+            "syncing": false,
+            "complete": true,
+        })
     );
 }
 

@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use conch_core::{
     apply::{apply, ApplyError, ApplyMode, ApplyResources, VerifiedBlob},
     encoding::{cert_digest, scene_hash, sign, signed_object_digest},
+    ticket::Ticket,
     types::{
         AgentId, BlobRef, Body, Cert, ChainState, CommitProof, FloorConfig, FloorMode, GrantReason,
         Hash32, Intent, IntentKind, Mouth, NodeId, RoomId, Scene, SignatureBytes, StakePolicy,
@@ -288,6 +289,38 @@ fn precert_grant_requires_the_deterministic_queue_head() {
 }
 
 #[test]
+fn moderator_grant_requires_target_intent_but_may_skip_global_queue_head() {
+    let fixture = Fixture::new();
+    let state = committed_genesis(&fixture);
+    let target = fixture.signed_intent_for(&fixture.creator_key, "target", 9, 1_766_700_020);
+    let earlier = fixture.signed_intent_for(&fixture.creator_key, "earlier", 8, 1_766_700_010);
+    let mut scene = grant_scene(&fixture, &state, &target);
+    if let Body::Grant { reason, .. } = &mut scene.body {
+        *reason = GrantReason::Moderator;
+    }
+
+    assert!(matches!(
+        apply(
+            &state,
+            &scene,
+            None,
+            ApplyMode::Precert(&ApplyResources::default())
+        ),
+        Err(ApplyError::MissingIntent)
+    ));
+    assert!(apply(
+        &state,
+        &scene,
+        None,
+        ApplyMode::Precert(&ApplyResources {
+            intents: vec![target, earlier],
+            blobs: BTreeMap::new(),
+        })
+    )
+    .is_ok());
+}
+
+#[test]
 fn precert_queue_ignores_intents_from_non_roster_nodes() {
     let fixture = Fixture::new();
     let state = committed_genesis(&fixture);
@@ -391,6 +424,60 @@ fn staged_allows_missing_blobs_commit_does_not() {
     .unwrap();
     assert_eq!(committed.head_n, Some(2));
     assert!(committed.live_grant.is_none());
+}
+
+#[test]
+fn breakout_ticket_must_name_the_parent_room() {
+    let fixture = Fixture::new();
+    let genesis = committed_genesis(&fixture);
+    let intent = fixture.signed_intent(9, 1_766_700_010);
+    let grant = grant_scene(&fixture, &genesis, &intent);
+    let grant_proof = fixture.proof(&grant, fixture.creator(), &[&fixture.creator_key]);
+    let granted = apply(
+        &genesis,
+        &grant,
+        Some(&grant_proof),
+        ApplyMode::Commit(&ApplyResources::default()),
+    )
+    .unwrap();
+    let child = Ticket {
+        v: 1,
+        id: RoomId::from_bytes([7; 32]),
+        name: "child".into(),
+        trackers: Vec::new(),
+        peers: vec!["tcp://127.0.0.1:7421".into()],
+        token: None,
+        stake: StakePolicy::default(),
+        floor: FloorConfig::stick(30),
+        parent: None,
+        genesis: Hash32::from_bytes([8; 32]),
+    };
+    let breakout = Scene {
+        v: 1,
+        room: fixture.room(),
+        n: 2,
+        term: 1,
+        parent: granted.head_hash,
+        roster: granted.roster.clone(),
+        leader: fixture.creator(),
+        ts: 1_766_700_020,
+        body: Body::Breakout {
+            closes_grant: granted.live_grant.as_ref().unwrap().hash,
+            ticket: serde_json::to_value(child).unwrap(),
+            auto_join: vec![fixture.creator()],
+        },
+        certs: Vec::new(),
+    };
+
+    assert!(matches!(
+        apply(
+            &granted,
+            &breakout,
+            None,
+            ApplyMode::Precert(&ApplyResources::default())
+        ),
+        Err(ApplyError::InvalidBreakoutTicket)
+    ));
 }
 
 #[test]

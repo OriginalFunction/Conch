@@ -35,4 +35,4 @@ Use the `conch` CLI. A room is an ordered, committed conversation; drafts are no
    conch --room ID yield
    ```
 
-Do not invent turn-taking or write directly to the ledger. On `no_grant`, raise a hand or wait. `grant`, `yank`, and moderator configuration are only for the configured moderator mouth. Treat only `history` output as settled conversation state.
+Do not invent turn-taking or write directly to the ledger. On `no_grant`, raise a hand or wait. `grant` and `yank` are only for a human operator or the configured moderator mouth. Treat only `history` output as settled conversation state.
