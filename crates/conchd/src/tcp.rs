@@ -13,8 +13,8 @@ use conch_core::{
     client::{ClientReply, ClientRequest},
     consensus::{
         advance_term, begin_campaign, tail, up_to_date, AdvanceSource, Append, BlobMeta,
-        CertMessage, CloseTake, ConsensusError, GetScenes, HaveMessage, Heartbeat, Hello, Nack,
-        PeerInfo, Pex, RequestVote, SwarmMsg, Vote,
+        CertMessage, CloseTake, ConsensusError, GetScenes, GrantReq, HaveMessage, Heartbeat, Hello,
+        Leave, Nack, PeerInfo, Pex, RequestVote, SwarmMsg, Vote, YankReq,
     },
     disk::{Replay, Store, StoreError},
     encoding::{cert_digest, scene_hash, sign, signed_object_digest, verify},
@@ -1375,6 +1375,63 @@ impl Daemon {
                         });
                     }
                 }
+                SwarmMsg::Leave(leave) => {
+                    let declared_for_room = peer
+                        .decl
+                        .iter()
+                        .any(|declaration| declaration.room == leave.room);
+                    if declared_for_room
+                        && leave.node == peer.node
+                        && valid_leave(&leave)
+                        && self.room_authorized(leave.room, &authed)?
+                    {
+                        if let Ok(Some(record)) = self.receive_leave(&leave).await {
+                            write_message(&mut stream, &SwarmMsg::Scene(record)).await?;
+                        }
+                    }
+                }
+                SwarmMsg::GrantReq(request) => {
+                    let declared = peer.decl.iter().any(|declaration| {
+                        declaration.room == request.room
+                            && request.from.node == peer.node
+                            && declaration.agents.contains(&request.from.agent)
+                    });
+                    if declared && self.room_authorized(request.room, &authed)? {
+                        if let Ok(scene) = self
+                            .client_grant_from(request.from, request.room, request.to)
+                            .await
+                        {
+                            if let Ok(scene) = serde_json::from_value::<Scene>(scene) {
+                                if let Some(record) = self
+                                    .replay(request.room)?
+                                    .history
+                                    .into_iter()
+                                    .find(|record| hash_scene(&record.scene) == hash_scene(&scene))
+                                {
+                                    write_message(&mut stream, &SwarmMsg::Scene(record)).await?;
+                                }
+                            }
+                        }
+                    }
+                }
+                SwarmMsg::YankReq(request) => {
+                    let declared = peer.decl.iter().any(|declaration| {
+                        declaration.room == request.room
+                            && request.from.node == peer.node
+                            && declaration.agents.contains(&request.from.agent)
+                    });
+                    if declared
+                        && self.room_authorized(request.room, &authed)?
+                        && self
+                            .client_yank_from(request.from, request.room)
+                            .await
+                            .is_ok()
+                    {
+                        if let Some(record) = self.replay(request.room)?.history.last().cloned() {
+                            write_message(&mut stream, &SwarmMsg::Scene(record)).await?;
+                        }
+                    }
+                }
                 SwarmMsg::Have(have) => {
                     let declared_for_room = peer
                         .decl
@@ -1894,10 +1951,41 @@ impl Daemon {
         room: RoomId,
         to: Mouth,
     ) -> Result<Value, DaemonError> {
+        self.client_grant_from(
+            Mouth {
+                agent,
+                node: self.node_id(),
+            },
+            room,
+            to,
+        )
+        .await
+    }
+
+    async fn client_grant_from(
+        &self,
+        from: Mouth,
+        room: RoomId,
+        to: Mouth,
+    ) -> Result<Value, DaemonError> {
         let floor = self.floor(room)?;
         let _mutation = floor.mutation.lock().await;
         let replay = self.replay(room)?;
-        self.require_moderator(&replay, &agent)?;
+        self.require_moderator_mouth(&replay, &from)?;
+        if let Some(leader) = replay
+            .consensus
+            .leader_id
+            .filter(|leader| *leader != self.node_id())
+        {
+            let record = self
+                .request_grant(leader, &GrantReq { room, to, from })
+                .await?
+                .ok_or(DaemonError::MutationUnavailable)?;
+            let scene = record.scene.clone();
+            let daemon = self.clone();
+            task::spawn_blocking(move || daemon.install_record_blocking(room, &record)).await??;
+            return Ok(serde_json::to_value(scene)?);
+        }
         if replay.chain.live_grant.is_some() || !replay.chain.roster.contains(&to.node) {
             return Err(DaemonError::Protocol(
                 "grant target is not currently grantable",
@@ -1931,10 +2019,35 @@ impl Daemon {
     }
 
     async fn client_yank(&self, agent: AgentId, room: RoomId) -> Result<Value, DaemonError> {
+        self.client_yank_from(
+            Mouth {
+                agent,
+                node: self.node_id(),
+            },
+            room,
+        )
+        .await
+    }
+
+    async fn client_yank_from(&self, from: Mouth, room: RoomId) -> Result<Value, DaemonError> {
         let floor = self.floor(room)?;
         let _mutation = floor.mutation.lock().await;
         let replay = self.replay(room)?;
-        self.require_moderator(&replay, &agent)?;
+        self.require_moderator_mouth(&replay, &from)?;
+        if let Some(leader) = replay
+            .consensus
+            .leader_id
+            .filter(|leader| *leader != self.node_id())
+        {
+            let record = self
+                .request_yank(leader, &YankReq { room, from })
+                .await?
+                .ok_or(DaemonError::MutationUnavailable)?;
+            let scene = record.scene.clone();
+            let daemon = self.clone();
+            task::spawn_blocking(move || daemon.install_record_blocking(room, &record)).await??;
+            return Ok(serde_json::to_value(scene)?);
+        }
         let grant = replay.chain.live_grant.ok_or(FloorError::NoGrant)?;
         if replay.chain.roster.len() > 1 {
             self.ensure_network_leader(room).await?;
@@ -2215,6 +2328,25 @@ impl Daemon {
         let _mutation = floor.mutation.lock().await;
         let mut replay = self.replay(room)?;
         let node = self.node_id();
+        if replay.chain.roster.contains(&node) && replay.chain.live_grant.is_none() {
+            if let Some(leader) = replay.consensus.leader_id.filter(|leader| *leader != node) {
+                let mut leave = Leave {
+                    room,
+                    node,
+                    sig: SignatureBytes::from_bytes([0; 64]),
+                };
+                leave.sig = SignatureBytes::from_bytes(sign(
+                    &self.inner.node_key,
+                    &signed_object_digest(&serde_json::to_value(&leave)?),
+                ));
+                if let Ok(Some(record)) = self.request_leave(leader, &leave).await {
+                    let daemon = self.clone();
+                    task::spawn_blocking(move || daemon.install_record_blocking(room, &record))
+                        .await??;
+                    replay = self.replay(room)?;
+                }
+            }
+        }
         if replay.chain.roster.contains(&node) {
             if let Some(grant) = replay.chain.live_grant.clone() {
                 let mouth = Mouth { agent, node };
@@ -2287,13 +2419,9 @@ impl Daemon {
         Ok(json!({ "ok": true, "role": "observe" }))
     }
 
-    fn require_moderator(&self, replay: &Replay, agent: &AgentId) -> Result<(), DaemonError> {
-        let from = Mouth {
-            agent: agent.clone(),
-            node: self.node_id(),
-        };
+    fn require_moderator_mouth(&self, replay: &Replay, from: &Mouth) -> Result<(), DaemonError> {
         if replay.chain.floor_mode != Some(FloorMode::Moderator)
-            || replay.chain.moderator.as_ref() != Some(&from)
+            || replay.chain.moderator.as_ref() != Some(from)
         {
             return Err(DaemonError::NotModerator);
         }
@@ -2530,6 +2658,35 @@ impl Daemon {
             // text with an empty speech merely because its reply is delayed.
             Err(_) => Err(DaemonError::MutationUnavailable),
         }
+    }
+
+    async fn receive_leave(&self, leave: &Leave) -> Result<Option<CommittedScene>, DaemonError> {
+        let floor = self.floor(leave.room)?;
+        let _mutation = floor.mutation.lock().await;
+        let replay = self.replay(leave.room)?;
+        if replay.consensus.role != ConsensusRole::Leader
+            || replay.consensus.leader_id != Some(self.node_id())
+            || replay.chain.live_grant.is_some()
+            || !replay.chain.roster.contains(&leave.node)
+            || replay.chain.roster.len() <= 1
+        {
+            return Ok(None);
+        }
+        let mut next_roster = replay.chain.roster.clone();
+        next_roster.retain(|node| *node != leave.node);
+        let record = self
+            .commit_singleton_body(
+                leave.room,
+                Body::ViewChange {
+                    add: Vec::new(),
+                    remove: vec![leave.node],
+                    next_roster,
+                    closes_grant: None,
+                },
+                &floor,
+            )
+            .await?;
+        Ok(Some(record))
     }
 
     async fn client_speak(
@@ -3103,6 +3260,93 @@ impl Daemon {
             Ok::<_, DaemonError>(None)
         };
         match timeout(Duration::from_millis(500), response).await {
+            Ok(result) => result,
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn request_leave(
+        &self,
+        leader: NodeId,
+        leave: &Leave,
+    ) -> Result<Option<CommittedScene>, DaemonError> {
+        let mut stream = self.connect_known_peer(leader, leave.room).await?;
+        write_message(&mut stream, &SwarmMsg::Leave(leave.clone())).await?;
+        let response = async {
+            while let Some(message) = read_message(&mut stream).await? {
+                if let SwarmMsg::Scene(record) = message {
+                    if record.scene.room == leave.room
+                        && matches!(
+                            &record.scene.body,
+                            Body::ViewChange { remove, .. } if remove == std::slice::from_ref(&leave.node)
+                        )
+                    {
+                        return Ok(Some(record));
+                    }
+                }
+            }
+            Ok::<_, DaemonError>(None)
+        };
+        match timeout(Duration::from_secs(3), response).await {
+            Ok(result) => result,
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn request_grant(
+        &self,
+        leader: NodeId,
+        request: &GrantReq,
+    ) -> Result<Option<CommittedScene>, DaemonError> {
+        let mut stream = self.connect_known_peer(leader, request.room).await?;
+        write_message(&mut stream, &SwarmMsg::GrantReq(request.clone())).await?;
+        let response = async {
+            while let Some(message) = read_message(&mut stream).await? {
+                if let SwarmMsg::Scene(record) = message {
+                    if record.scene.room == request.room
+                        && matches!(&record.scene.body, Body::Grant { to, .. } if to == &request.to)
+                    {
+                        return Ok(Some(record));
+                    }
+                }
+            }
+            Ok::<_, DaemonError>(None)
+        };
+        match timeout(Duration::from_secs(3), response).await {
+            Ok(result) => result,
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn request_yank(
+        &self,
+        leader: NodeId,
+        request: &YankReq,
+    ) -> Result<Option<CommittedScene>, DaemonError> {
+        let grant_hash = self
+            .replay(request.room)?
+            .chain
+            .live_grant
+            .ok_or(FloorError::NoGrant)?
+            .hash;
+        let mut stream = self.connect_known_peer(leader, request.room).await?;
+        write_message(&mut stream, &SwarmMsg::YankReq(request.clone())).await?;
+        let response = async {
+            while let Some(message) = read_message(&mut stream).await? {
+                if let SwarmMsg::Scene(record) = message {
+                    if record.scene.room == request.room
+                        && matches!(
+                            &record.scene.body,
+                            Body::Speech { closes_grant, .. } if *closes_grant == grant_hash
+                        )
+                    {
+                        return Ok(Some(record));
+                    }
+                }
+            }
+            Ok::<_, DaemonError>(None)
+        };
+        match timeout(Duration::from_secs(8), response).await {
             Ok(result) => result,
             Err(_) => Ok(None),
         }
@@ -3962,6 +4206,18 @@ fn valid_request_vote(request: &RequestVote) -> bool {
                 &serde_json::to_value(request).expect("request_vote is serializable"),
             ),
             request.sig.as_bytes(),
+        )
+    })
+}
+
+fn valid_leave(leave: &Leave) -> bool {
+    VerifyingKey::from_bytes(leave.node.as_bytes()).is_ok_and(|key| {
+        verify(
+            &key,
+            &signed_object_digest(
+                &serde_json::to_value(leave).expect("leave is JSON serializable"),
+            ),
+            leave.sig.as_bytes(),
         )
     })
 }

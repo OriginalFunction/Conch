@@ -584,6 +584,64 @@ async fn moderator_yank_freezes_remote_holder_before_commit() {
     .unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn observer_moderator_forwards_grant_and_yank_to_leader() {
+    let source_data = TempDir::new().unwrap();
+    let moderator_data = TempDir::new().unwrap();
+    let source = Daemon::open(source_data.path()).unwrap();
+    let moderator_node = Daemon::open(moderator_data.path()).unwrap();
+    let source_server = source.start(loopback()).await.unwrap();
+    let moderator_server = moderator_node.start(loopback()).await.unwrap();
+    let moderator = AgentId::new("human:remote-moderator").unwrap();
+    let ticket = source
+        .create_ticket(
+            "observer moderator",
+            StakePolicy::default(),
+            FloorConfig {
+                mode: FloorMode::Moderator,
+                timeout_secs: 30,
+                moderator: Some(Mouth {
+                    agent: moderator.clone(),
+                    node: moderator_node.node_id(),
+                }),
+            },
+        )
+        .unwrap();
+    moderator_node
+        .join_ticket(ticket.clone(), JoinRole::Observe)
+        .await
+        .unwrap();
+
+    let mut writer = attach(source_server.addr(), "agent:writer").await;
+    assert!(
+        request(&mut writer, ClientRequest::RaiseHand { room: ticket.id })
+            .await
+            .ok
+    );
+    let mut operator = attach(moderator_server.addr(), moderator.as_str()).await;
+    let granted = request(
+        &mut operator,
+        ClientRequest::Grant {
+            room: ticket.id,
+            to: Mouth {
+                agent: AgentId::new("agent:writer").unwrap(),
+                node: source.node_id(),
+            },
+        },
+    )
+    .await;
+    assert!(granted.ok, "{granted:?}");
+    assert!(source.replay(ticket.id).unwrap().chain.live_grant.is_some());
+
+    let yanked = request(&mut operator, ClientRequest::Yank { room: ticket.id }).await;
+    assert!(yanked.ok, "{yanked:?}");
+    assert!(source.replay(ticket.id).unwrap().chain.live_grant.is_none());
+    assert_eq!(
+        source.replay(ticket.id).unwrap().history,
+        moderator_node.replay(ticket.id).unwrap().history
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn two_of_three_live_stakers_can_wrap() {
     let source_data = TempDir::new().unwrap();
@@ -995,4 +1053,53 @@ async fn leader_self_removal_pushes_commit_then_cannot_campaign() {
         source.replay(ticket.id).unwrap().history,
         second.replay(ticket.id).unwrap().history
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn follower_leave_is_signed_and_forwarded_to_the_leader() {
+    let source_data = TempDir::new().unwrap();
+    let second_data = TempDir::new().unwrap();
+    let third_data = TempDir::new().unwrap();
+    let source = Daemon::open(source_data.path()).unwrap();
+    let second = Daemon::open(second_data.path()).unwrap();
+    let third = Daemon::open(third_data.path()).unwrap();
+    let _source_server = source.start(loopback()).await.unwrap();
+    let second_server = second.start(loopback()).await.unwrap();
+    let _third_server = third.start(loopback()).await.unwrap();
+    let ticket = source
+        .create_ticket(
+            "forward leave",
+            StakePolicy::default(),
+            FloorConfig::stick(30),
+        )
+        .unwrap();
+    second
+        .join_ticket(ticket.clone(), JoinRole::Stake)
+        .await
+        .unwrap();
+    third
+        .join_ticket(ticket.clone(), JoinRole::Stake)
+        .await
+        .unwrap();
+    assert_eq!(
+        second.replay(ticket.id).unwrap().consensus.leader_id,
+        Some(source.node_id())
+    );
+
+    let mut client = attach(second_server.addr(), "agent:leaver").await;
+    let left = request(
+        &mut client,
+        ClientRequest::Leave {
+            room: ticket.id,
+            vacate: false,
+        },
+    )
+    .await;
+    assert!(left.ok, "{left:?}");
+    let record = source.replay(ticket.id).unwrap().history.pop().unwrap();
+    assert_eq!(record.commit_proof.leader, source.node_id());
+    assert!(matches!(
+        record.scene.body,
+        Body::ViewChange { remove, .. } if remove == vec![second.node_id()]
+    ));
 }

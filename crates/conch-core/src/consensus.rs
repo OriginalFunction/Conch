@@ -221,6 +221,29 @@ pub struct CloseTake {
     pub blobs: Vec<BlobRef>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Leave {
+    pub room: RoomId,
+    pub node: NodeId,
+    pub sig: SignatureBytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantReq {
+    pub room: RoomId,
+    pub to: crate::types::Mouth,
+    pub from: crate::types::Mouth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct YankReq {
+    pub room: RoomId,
+    pub from: crate::types::Mouth,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GetBlob {
@@ -253,6 +276,9 @@ pub enum SwarmMsg {
     Intent(Intent),
     Freeze(Freeze),
     CloseTake(CloseTake),
+    Leave(Leave),
+    GrantReq(GrantReq),
+    YankReq(YankReq),
     GetBlob(GetBlob),
     BlobMeta(BlobMeta),
 }
