@@ -13,6 +13,7 @@ use thiserror::Error;
 
 use crate::{
     apply::{apply, ApplyError, ApplyMode, ApplyResources},
+    consensus::{advance_term, AdvanceSource},
     encoding::{cert_digest, scene_hash, verify},
     types::{CertSigner, ChainState, CommitProof, ConsensusState, Hash32, Pending, Scene},
 };
@@ -188,7 +189,7 @@ impl Store {
             pending = None;
         }
 
-        let floor = [
+        let recovered_term = [
             pending.as_ref().map(|pending| pending.accepted_rpc_term),
             head_proof.as_ref().map(|proof| proof.rpc_term),
         ]
@@ -196,9 +197,12 @@ impl Store {
         .flatten()
         .max()
         .unwrap_or(0);
-        if floor > consensus.current_term {
-            consensus.current_term = floor;
-            consensus.voted_for = None;
+        if advance_term(
+            &mut consensus,
+            pending.as_ref(),
+            head_proof.as_ref(),
+            AdvanceSource::RecoveredPersistentState(recovered_term),
+        ) {
             self.write_consensus(&consensus)?;
         }
 

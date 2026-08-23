@@ -494,6 +494,14 @@ impl Default for ChainState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConsensusRole {
+    #[default]
+    Follower,
+    Candidate,
+    Leader,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConsensusState {
@@ -504,6 +512,10 @@ pub struct ConsensusState {
         deserialize_with = "deserialize_optional_non_null"
     )]
     pub voted_for: Option<NodeId>,
+    #[serde(skip)]
+    pub leader_id: Option<NodeId>,
+    #[serde(skip)]
+    pub role: ConsensusRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
