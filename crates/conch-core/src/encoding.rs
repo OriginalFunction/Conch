@@ -27,6 +27,15 @@ pub fn scene_hash(scene_json: &Value) -> [u8; 32] {
     sha256(&canonical_json(&immutable))
 }
 
+/// Digest for signed JSON objects whose signature is carried in `sig`.
+pub fn signed_object_digest(object: &Value) -> [u8; 32] {
+    let mut unsigned = object.clone();
+    if let Value::Object(fields) = &mut unsigned {
+        fields.remove("sig");
+    }
+    sha256(&canonical_json(&unsigned))
+}
+
 /// Build the exact term-bound commit certificate digest from spec §8.1.
 pub fn cert_digest(
     room: &RoomId,
