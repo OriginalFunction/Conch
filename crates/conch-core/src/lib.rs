@@ -6,4 +6,5 @@ pub mod disk;
 pub mod encoding;
 pub mod floor;
 pub mod frame;
+pub mod ticket;
 pub mod types;

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use thiserror::Error;
 
+use crate::ticket::Declaration;
 pub use crate::types::ConsensusRole;
 use crate::types::{
     BlobRef, Cert, CommitProof, ConsensusState, Hash32, Intent, NodeId, Pending, RoomId, Scene,
@@ -37,7 +37,7 @@ pub struct Hello {
     pub node: NodeId,
     pub r#pub: NodeId,
     pub addrs: Vec<String>,
-    pub decl: Vec<Value>,
+    pub decl: Vec<Declaration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

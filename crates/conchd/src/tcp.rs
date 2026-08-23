@@ -19,6 +19,7 @@ use conch_core::{
     encoding::{cert_digest, scene_hash, sign},
     floor::{FloorEngine, FloorError, SpeakAck, TakeBuffer, TakePhase},
     frame::{self, FrameError, MAX_FRAME_BYTES},
+    ticket::{Declaration, JoinRole, Ticket, TicketError},
     types::{
         AgentId, Body, Cert, ChainState, CommitProof, CommittedScene, ConsensusRole,
         ConsensusState, FloorConfig, GrantReason, Hash32, Intent, IntentKind, Mouth, NodeId,
@@ -57,6 +58,8 @@ pub enum DaemonError {
     Floor(#[from] FloorError),
     #[error("JSON failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Ticket(#[from] TicketError),
     #[error("blocking store task failed: {0}")]
     Join(#[from] JoinError),
     #[error("node key is invalid")]
@@ -67,6 +70,12 @@ pub enum DaemonError {
     Protocol(&'static str),
     #[error("room synchronization timed out")]
     SyncTimeout,
+    #[error("bad ticket: {0}")]
+    BadTicket(&'static str),
+    #[error("no ticket peer could provide the room")]
+    JoinUnavailable,
+    #[error("room mutation requires an available local leader")]
+    MutationUnavailable,
 }
 
 #[derive(Clone)]
@@ -80,6 +89,17 @@ struct Inner {
     rooms: RwLock<BTreeMap<RoomId, Store>>,
     replays: RwLock<BTreeMap<RoomId, Arc<Mutex<Replay>>>>,
     floors: RwLock<BTreeMap<RoomId, Arc<RoomFloor>>>,
+    joins: RwLock<BTreeMap<RoomId, LocalJoin>>,
+    agents: RwLock<BTreeSet<AgentId>>,
+    addrs: RwLock<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalJoin {
+    role: JoinRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token: Option<Hash32>,
 }
 
 struct RoomFloor {
@@ -118,6 +138,7 @@ impl Daemon {
         let mut rooms = BTreeMap::new();
         let mut replays = BTreeMap::new();
         let mut floors = BTreeMap::new();
+        let mut joins = BTreeMap::new();
         for entry in fs::read_dir(data_dir.join("rooms"))? {
             let Ok(entry) = entry else {
                 continue;
@@ -136,11 +157,24 @@ impl Daemon {
                 engine.observe_committed(&replay.chain);
                 for intent in store.load_intents()? {
                     if !replay.chain.consumed_intents.contains(&intent.id) {
-                        engine.upsert_intent(&replay.chain, intent)?;
+                        let id = intent.id;
+                        if engine.upsert_intent(&replay.chain, intent).is_err() {
+                            store.remove_intent(id)?;
+                            eprintln!("conchd: discarded invalid or stale intent {id}");
+                        }
                     }
                 }
+                let local_join = read_local_join(&store)?.unwrap_or(LocalJoin {
+                    role: if replay.chain.roster.contains(&node_id) {
+                        JoinRole::Stake
+                    } else {
+                        JoinRole::Observe
+                    },
+                    token: None,
+                });
                 floors.insert(room, Arc::new(RoomFloor::new(engine)));
                 replays.insert(room, Arc::new(Mutex::new(replay)));
+                joins.insert(room, local_join);
                 rooms.insert(room, store);
             }
         }
@@ -151,6 +185,9 @@ impl Daemon {
                 rooms: RwLock::new(rooms),
                 replays: RwLock::new(replays),
                 floors: RwLock::new(floors),
+                joins: RwLock::new(joins),
+                agents: RwLock::new(BTreeSet::new()),
+                addrs: RwLock::new(Vec::new()),
             }),
         })
     }
@@ -159,9 +196,42 @@ impl Daemon {
         NodeId::from_bytes(self.inner.node_key.verifying_key().to_bytes())
     }
 
+    pub fn can_certify(&self, room: RoomId) -> Result<bool, DaemonError> {
+        let role = self
+            .inner
+            .joins
+            .read()
+            .expect("join registry lock is not poisoned")
+            .get(&room)
+            .map(|join| join.role)
+            .unwrap_or(JoinRole::Observe);
+        Ok(role == JoinRole::Stake && self.replay(room)?.chain.roster.contains(&self.node_id()))
+    }
+
     pub fn track_room(&self, room: RoomId) -> Result<(), DaemonError> {
         let store = Store::open(self.room_path(room))?;
         let replay = store.load_replay()?;
+        let persisted = read_take(&store)?;
+        let mut engine = FloorEngine::restore(self.node_id(), persisted);
+        engine.observe_committed(&replay.chain);
+        for intent in store.load_intents()? {
+            if !replay.chain.consumed_intents.contains(&intent.id) {
+                let id = intent.id;
+                if engine.upsert_intent(&replay.chain, intent).is_err() {
+                    store.remove_intent(id)?;
+                    eprintln!("conchd: discarded invalid or stale intent {id}");
+                }
+            }
+        }
+        let default_role = if replay.chain.roster.contains(&self.node_id()) {
+            JoinRole::Stake
+        } else {
+            JoinRole::Observe
+        };
+        let local_join = read_local_join(&store)?.unwrap_or(LocalJoin {
+            role: default_role,
+            token: None,
+        });
         self.inner
             .rooms
             .write()
@@ -176,14 +246,27 @@ impl Daemon {
             .floors
             .write()
             .expect("floor registry lock is not poisoned")
-            .insert(
-                room,
-                Arc::new(RoomFloor::new(FloorEngine::new(self.node_id()))),
-            );
+            .insert(room, Arc::new(RoomFloor::new(engine)));
+        self.inner
+            .joins
+            .write()
+            .expect("join registry lock is not poisoned")
+            .insert(room, local_join);
         Ok(())
     }
 
     pub fn create_genesis(&self, name: &str) -> Result<RoomId, DaemonError> {
+        Ok(self
+            .create_ticket(name, StakePolicy::default(), FloorConfig::stick(30))?
+            .id)
+    }
+
+    pub fn create_ticket(
+        &self,
+        name: &str,
+        stake: StakePolicy,
+        floor: FloorConfig,
+    ) -> Result<Ticket, DaemonError> {
         let room_key = SigningKey::from_bytes(&random::<[u8; 32]>());
         let room = RoomId::from_bytes(room_key.verifying_key().to_bytes());
         let node = self.node_id();
@@ -198,8 +281,8 @@ impl Daemon {
             ts: unix_timestamp(),
             body: Body::Genesis {
                 name: name.to_owned(),
-                stake: StakePolicy::default(),
-                floor: FloorConfig::stick(30),
+                stake: stake.clone(),
+                floor: floor.clone(),
                 creator_node: node,
                 parent_room: None,
                 token_sha256: None,
@@ -219,11 +302,35 @@ impl Daemon {
                 Cert::room(SignatureBytes::from_bytes(sign(&room_key, hash.as_bytes()))),
             ],
         };
+        let ticket = Ticket {
+            v: 1,
+            id: room,
+            name: name.to_owned(),
+            trackers: Vec::new(),
+            peers: self
+                .inner
+                .addrs
+                .read()
+                .expect("address registry lock is not poisoned")
+                .clone(),
+            token: None,
+            stake,
+            floor,
+            parent: None,
+            genesis: hash,
+        };
+        ticket.validate()?;
 
         let room_path = self.room_path(room);
         fs::create_dir_all(&room_path)?;
         write_secret(&room_path.join("room.key"), &room_key.to_bytes())?;
         let store = Store::open(&room_path)?;
+        write_ticket(&store, &ticket)?;
+        let local_join = LocalJoin {
+            role: JoinRole::Stake,
+            token: ticket.token,
+        };
+        write_local_join(&store, &local_join)?;
         store.persist_committed_scene(&ChainState::empty(), &scene, &proof)?;
         store.unlink_pending_if_stale(Some(0))?;
         let replay = store.load_replay()?;
@@ -246,7 +353,12 @@ impl Daemon {
                 room,
                 Arc::new(RoomFloor::from_chain(self.node_id(), &chain)),
             );
-        Ok(room)
+        self.inner
+            .joins
+            .write()
+            .expect("join registry lock is not poisoned")
+            .insert(room, local_join);
+        Ok(ticket)
     }
 
     pub fn replay(&self, room: RoomId) -> Result<Replay, DaemonError> {
@@ -260,6 +372,7 @@ impl Daemon {
     pub async fn start(&self, addr: SocketAddr) -> Result<RunningServer, DaemonError> {
         let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
+        self.remember_addr(addr);
         let daemon = self.clone();
         let task = tokio::spawn(async move { daemon.serve_listener(listener).await });
         Ok(RunningServer { addr, task })
@@ -267,7 +380,23 @@ impl Daemon {
 
     pub async fn serve(&self, addr: SocketAddr) -> Result<(), DaemonError> {
         let listener = TcpListener::bind(addr).await?;
+        self.remember_addr(listener.local_addr()?);
         self.clone().serve_listener(listener).await
+    }
+
+    fn remember_addr(&self, mut addr: SocketAddr) {
+        if addr.ip().is_unspecified() {
+            addr.set_ip("127.0.0.1".parse().expect("loopback address is valid"));
+        }
+        let endpoint = format!("tcp://{addr}");
+        let mut addrs = self
+            .inner
+            .addrs
+            .write()
+            .expect("address registry lock is not poisoned");
+        if !addrs.contains(&endpoint) {
+            addrs.push(endpoint);
+        }
     }
 
     pub async fn sync_room_from(
@@ -275,15 +404,20 @@ impl Daemon {
         addr: SocketAddr,
         room: RoomId,
     ) -> Result<ChainState, DaemonError> {
-        timeout(SYNC_TIMEOUT, self.sync_room_from_inner(addr, room))
-            .await
-            .map_err(|_| DaemonError::SyncTimeout)?
+        timeout(
+            SYNC_TIMEOUT,
+            self.sync_room_from_inner(addr, room, None, None),
+        )
+        .await
+        .map_err(|_| DaemonError::SyncTimeout)?
     }
 
     async fn sync_room_from_inner(
         &self,
         addr: SocketAddr,
         room: RoomId,
+        token: Option<Hash32>,
+        expected_genesis: Option<Hash32>,
     ) -> Result<ChainState, DaemonError> {
         let mut stream = TcpStream::connect(addr).await?;
         write_message(&mut stream, &SwarmMsg::Hello(self.hello())).await?;
@@ -291,6 +425,13 @@ impl Daemon {
             .await?
             .ok_or(DaemonError::Protocol("peer closed before hello"))?;
         validate_hello(remote)?;
+        if let Some(token) = token {
+            write_message(
+                &mut stream,
+                &SwarmMsg::Auth(conch_core::consensus::Auth { room, token }),
+            )
+            .await?;
+        }
 
         loop {
             let message = read_message(&mut stream)
@@ -335,6 +476,12 @@ impl Daemon {
                 if record.scene.n != expected_n {
                     return Err(DaemonError::Protocol("get_scenes returned wrong height"));
                 }
+                if expected_n == 0
+                    && expected_genesis
+                        .is_some_and(|expected| hash_scene(&record.scene) != expected)
+                {
+                    return Err(DaemonError::BadTicket("genesis hash does not match g"));
+                }
                 self.install_record(room, record).await?;
             }
             let replay = self.replay(room)?;
@@ -350,6 +497,89 @@ impl Daemon {
                 "catch-up did not reach advertised head",
             ));
         }
+    }
+
+    pub async fn join_ticket(
+        &self,
+        ticket: Ticket,
+        role: JoinRole,
+    ) -> Result<ChainState, DaemonError> {
+        ticket.validate()?;
+        let room = ticket.id;
+        let daemon = self.clone();
+        let prepared_ticket = ticket.clone();
+        if let Some(chain) =
+            task::spawn_blocking(move || daemon.prepare_join(&prepared_ticket, role)).await??
+        {
+            return Ok(chain);
+        }
+
+        let endpoints = ticket
+            .trackers
+            .iter()
+            .chain(&ticket.peers)
+            .cloned()
+            .collect::<Vec<_>>();
+        for endpoint in endpoints {
+            let Some(authority) = endpoint.strip_prefix("tcp://") else {
+                continue;
+            };
+            let Ok(addresses) = tokio::net::lookup_host(authority).await else {
+                continue;
+            };
+            for addr in addresses {
+                let attempt = timeout(
+                    SYNC_TIMEOUT,
+                    self.sync_room_from_inner(addr, room, ticket.token, Some(ticket.genesis)),
+                )
+                .await;
+                let Ok(Ok(chain)) = attempt else {
+                    continue;
+                };
+                let replay = self.replay(room)?;
+                verify_ticket_replay(&ticket, &replay)?;
+                let store = self.store(room)?;
+                let canonical = canonical_ticket(&ticket, &replay)?;
+                task::spawn_blocking(move || write_ticket(&store, &canonical)).await??;
+                return Ok(chain);
+            }
+        }
+        Err(DaemonError::JoinUnavailable)
+    }
+
+    fn prepare_join(
+        &self,
+        ticket: &Ticket,
+        role: JoinRole,
+    ) -> Result<Option<ChainState>, DaemonError> {
+        let room = ticket.id;
+        if let Ok(replay) = self.replay(room) {
+            if replay.chain.head_n.is_some() {
+                verify_ticket_replay(ticket, &replay)?;
+                let store = self.store(room)?;
+                write_ticket(&store, &canonical_ticket(ticket, &replay)?)?;
+                let local_join = LocalJoin {
+                    role,
+                    token: ticket.token,
+                };
+                write_local_join(&store, &local_join)?;
+                self.inner
+                    .joins
+                    .write()
+                    .expect("join registry lock is not poisoned")
+                    .insert(room, local_join);
+                return Ok(Some(replay.chain));
+            }
+        }
+        let store = Store::open(self.room_path(room))?;
+        write_ticket(&store, ticket)?;
+        let local_join = LocalJoin {
+            role,
+            token: ticket.token,
+        };
+        write_local_join(&store, &local_join)?;
+        self.track_room(room)?;
+        Ok(None)
     }
 
     async fn serve_listener(self, listener: TcpListener) -> Result<(), DaemonError> {
@@ -369,6 +599,7 @@ impl Daemon {
     }
 
     async fn handle_connection(&self, mut stream: TcpStream) -> Result<(), DaemonError> {
+        let peer_addr = stream.peer_addr()?;
         let first: Value = read_frame(&mut stream)
             .await?
             .ok_or(DaemonError::Protocol("peer closed before hello"))?;
@@ -377,7 +608,7 @@ impl Daemon {
                 let hello = serde_json::from_value(first).map_err(FrameError::from)?;
                 self.handle_swarm_connection(stream, hello).await
             }
-            Some("attach") => {
+            Some("attach") if client_peer_allowed(peer_addr) => {
                 let attach = serde_json::from_value(first).map_err(FrameError::from)?;
                 self.handle_client_connection(stream, attach).await
             }
@@ -392,7 +623,7 @@ impl Daemon {
         mut stream: TcpStream,
         hello: SwarmMsg,
     ) -> Result<(), DaemonError> {
-        validate_hello(hello)?;
+        let peer = validate_hello(hello)?;
         write_message(&mut stream, &SwarmMsg::Hello(self.hello())).await?;
         let mut authed = BTreeSet::new();
         for have in self.haves(&authed)? {
@@ -442,11 +673,18 @@ impl Daemon {
                     let _ = self.install_record(record.scene.room, record).await;
                 }
                 SwarmMsg::Intent(intent) if self.room_authorized(intent.room, &authed)? => {
-                    self.receive_intent(intent).await?;
+                    let _ = self.receive_intent(intent).await;
                 }
                 SwarmMsg::Intent(_) => {}
                 SwarmMsg::Freeze(freeze) => {
                     if !self.room_authorized(freeze.room, &authed)? {
+                        continue;
+                    }
+                    let leader_is_peer = self.replay(freeze.room).is_ok_and(|replay| {
+                        replay.chain.roster.contains(&peer.node)
+                            && replay.consensus.leader_id == Some(peer.node)
+                    });
+                    if !leader_is_peer {
                         continue;
                     }
                     if let Some(close) = self.receive_freeze(freeze.room, freeze.grant_hash).await?
@@ -471,13 +709,29 @@ impl Daemon {
                 "attach must be the first client frame",
             ));
         };
+        self.inner
+            .agents
+            .write()
+            .expect("agent registry lock is not poisoned")
+            .insert(agent.clone());
         write_frame(
             &mut stream,
             &ClientReply::success(json!({ "agent": agent })),
         )
         .await?;
-        let Some(request) = read_frame::<_, ClientRequest>(&mut stream).await? else {
+        let Some(value) = read_frame::<_, Value>(&mut stream).await? else {
             return Ok(());
+        };
+        let request = match serde_json::from_value::<ClientRequest>(value) {
+            Ok(request) => request,
+            Err(error) => {
+                write_frame(
+                    &mut stream,
+                    &ClientReply::failure("invalid", error.to_string()),
+                )
+                .await?;
+                return Ok(());
+            }
         };
         let reply = self.execute_client(agent, request).await;
         write_frame(&mut stream, &reply).await?;
@@ -486,13 +740,24 @@ impl Daemon {
 
     async fn execute_client(&self, agent: AgentId, request: ClientRequest) -> ClientReply {
         let result = match request {
-            ClientRequest::Create { name } => {
+            ClientRequest::Create { name, stake, floor } => {
                 let daemon = self.clone();
-                match task::spawn_blocking(move || daemon.create_genesis(&name)).await {
-                    Ok(result) => result.map(|room| json!({ "id": room })),
+                match task::spawn_blocking(move || daemon.create_ticket(&name, stake, floor)).await
+                {
+                    Ok(result) => result.map(|ticket| {
+                        json!({
+                            "id": ticket.id,
+                            "magnet": ticket.to_magnet(),
+                            "ticket": ticket,
+                        })
+                    }),
                     Err(error) => Err(error.into()),
                 }
             }
+            ClientRequest::Join { ticket, role } => self
+                .join_ticket(ticket, role)
+                .await
+                .map(|chain| json!({ "id": chain.room, "role": role })),
             ClientRequest::WaitForFloor { room, timeout_secs } => {
                 self.client_wait_for_floor(agent, room, timeout_secs).await
             }
@@ -530,6 +795,17 @@ impl Daemon {
             }
             Err(DaemonError::Floor(FloorError::Timeout)) => {
                 ClientReply::failure("timeout", "wait-for-floor timed out")
+            }
+            Err(error @ DaemonError::Ticket(_)) | Err(error @ DaemonError::BadTicket(_)) => {
+                ClientReply::failure("bad_ticket", error.to_string())
+            }
+            Err(error @ DaemonError::JoinUnavailable)
+            | Err(error @ DaemonError::SyncTimeout)
+            | Err(error @ DaemonError::MutationUnavailable) => {
+                ClientReply::failure("unavailable", error.to_string())
+            }
+            Err(error @ DaemonError::Store(StoreError::SickHole(_))) => {
+                ClientReply::failure("sick", error.to_string())
             }
             Err(error) => ClientReply::failure("invalid", error.to_string()),
         }
@@ -594,7 +870,7 @@ impl Daemon {
         let _mutation = floor.mutation.lock().await;
         let replay = self.replay(room)?;
         let node = self.node_id();
-        if !replay.chain.roster.contains(&node) {
+        if !self.can_certify(room)? {
             return Err(FloorError::NotStaker.into());
         }
         let now = unix_timestamp();
@@ -610,13 +886,14 @@ impl Daemon {
             })
             .cloned();
         let replaced = existing.as_ref().map(|intent| intent.id);
-        let (id, ts) = match (kind, existing.as_ref()) {
-            (IntentKind::Wait, Some(intent)) => (intent.id, intent.ts),
+        let (id, ts, kind) = match (kind, existing.as_ref()) {
+            (IntentKind::Wait, Some(intent)) => (intent.id, intent.ts, intent.kind),
             (_, Some(intent)) => (
                 Hash32::from_bytes(random::<[u8; 32]>()),
                 now.max(intent.ts.saturating_add(1)),
+                kind,
             ),
-            _ => (Hash32::from_bytes(random::<[u8; 32]>()), now),
+            _ => (Hash32::from_bytes(random::<[u8; 32]>()), now, kind),
         };
         let mut intent = Intent {
             v: 1,
@@ -735,6 +1012,9 @@ impl Daemon {
         text: String,
         request_id: String,
     ) -> Result<Value, DaemonError> {
+        if !self.can_certify(room)? {
+            return Err(FloorError::NotStaker.into());
+        }
         let floor = self.floor(room)?;
         let _mutation = floor.mutation.lock().await;
         let mouth = Mouth {
@@ -755,6 +1035,9 @@ impl Daemon {
     }
 
     async fn client_yield(&self, agent: AgentId, room: RoomId) -> Result<Value, DaemonError> {
+        if !self.can_certify(room)? {
+            return Err(FloorError::NotStaker.into());
+        }
         let floor = self.floor(room)?;
         let _mutation = floor.mutation.lock().await;
         let mouth = Mouth {
@@ -887,10 +1170,8 @@ impl Daemon {
         let store = self.store(room)?;
         let replay = self.replay(room)?;
         let node = self.node_id();
-        if replay.chain.roster.as_slice() != [node] {
-            return Err(DaemonError::Protocol(
-                "local client mutation currently requires a singleton roster",
-            ));
+        if !self.can_certify(room)? || replay.chain.roster.as_slice() != [node] {
+            return Err(DaemonError::MutationUnavailable);
         }
         if let Some(pending) = replay.pending.clone() {
             if pending.n != replay.chain.head_n.expect("committed room has a head") + 1 {
@@ -1014,11 +1295,40 @@ impl Daemon {
 
     fn hello(&self) -> Hello {
         let node = self.node_id();
+        let agents = self
+            .inner
+            .agents
+            .read()
+            .expect("agent registry lock is not poisoned")
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let decl = self
+            .inner
+            .joins
+            .read()
+            .expect("join registry lock is not poisoned")
+            .iter()
+            .map(|(room, join)| {
+                Declaration::signed(
+                    *room,
+                    join.role,
+                    agents.clone(),
+                    unix_timestamp(),
+                    &self.inner.node_key,
+                )
+            })
+            .collect();
         Hello {
             node,
             r#pub: node,
-            addrs: Vec::new(),
-            decl: Vec::new(),
+            addrs: self
+                .inner
+                .addrs
+                .read()
+                .expect("address registry lock is not poisoned")
+                .clone(),
+            decl,
         }
     }
 
@@ -1274,7 +1584,21 @@ fn validate_hello(message: SwarmMsg) -> Result<Hello, DaemonError> {
     if hello.node != hello.r#pub {
         return Err(DaemonError::Protocol("hello node and pub do not match"));
     }
+    let mut rooms = BTreeSet::new();
+    if hello
+        .decl
+        .iter()
+        .any(|declaration| !rooms.insert(declaration.room) || !declaration.verify(hello.node))
+    {
+        return Err(DaemonError::Protocol(
+            "hello contains an invalid or duplicate declaration",
+        ));
+    }
     Ok(hello)
+}
+
+fn client_peer_allowed(peer: SocketAddr) -> bool {
+    peer.ip().is_loopback()
 }
 
 fn have_from_replay(room: RoomId, replay: &Replay) -> Result<HaveMessage, DaemonError> {
@@ -1336,11 +1660,102 @@ fn write_secret(path: &Path, bytes: &[u8; 32]) -> Result<(), DaemonError> {
     Ok(())
 }
 
+fn write_ticket(store: &Store, ticket: &Ticket) -> Result<(), DaemonError> {
+    let mut stripped = ticket.clone();
+    stripped.token = None;
+    write_json_atomic(&store.root().join("ticket.conch"), &stripped)
+}
+
+fn read_local_join(store: &Store) -> Result<Option<LocalJoin>, DaemonError> {
+    match fs::read(store.root().join("join.json")) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_local_join(store: &Store, join: &LocalJoin) -> Result<(), DaemonError> {
+    let path = store.root().join("join.json");
+    let temporary = path.with_extension(format!("tmp-{}", hex::encode(random::<[u8; 8]>())));
+    let bytes = serde_json::to_vec(join)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    fs::rename(&temporary, &path)?;
+    sync_dir(store.root())?;
+    Ok(())
+}
+
+fn verify_ticket_replay(ticket: &Ticket, replay: &Replay) -> Result<(), DaemonError> {
+    let genesis = replay
+        .history
+        .first()
+        .ok_or(DaemonError::BadTicket("peer did not provide genesis"))?;
+    if genesis.scene.n != 0
+        || genesis.scene.room != ticket.id
+        || hash_scene(&genesis.scene) != ticket.genesis
+    {
+        return Err(DaemonError::BadTicket(
+            "room id or genesis hash does not match",
+        ));
+    }
+    let Body::Genesis { token_sha256, .. } = &genesis.scene.body else {
+        return Err(DaemonError::BadTicket("height zero is not genesis"));
+    };
+    let ticket_token_sha256 = ticket
+        .token
+        .map(|token| Hash32::from_bytes(Sha256::digest(token.as_bytes()).into()));
+    if token_sha256 != &ticket_token_sha256 {
+        return Err(DaemonError::BadTicket(
+            "ticket token does not match genesis",
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_ticket(ticket: &Ticket, replay: &Replay) -> Result<Ticket, DaemonError> {
+    let genesis = replay
+        .history
+        .first()
+        .ok_or(DaemonError::BadTicket("peer did not provide genesis"))?;
+    let Body::Genesis {
+        name,
+        stake,
+        floor,
+        parent_room,
+        ..
+    } = &genesis.scene.body
+    else {
+        return Err(DaemonError::BadTicket("height zero is not genesis"));
+    };
+    let mut canonical = ticket.clone();
+    canonical.name = name.clone();
+    canonical.stake = stake.clone();
+    canonical.floor = floor.clone();
+    canonical.parent = *parent_room;
+    Ok(canonical)
+}
+
 fn read_take(store: &Store) -> Result<Option<TakeBuffer>, DaemonError> {
     for name in ["close_take.json", "take.json"] {
         let path = store.root().join(name);
         match fs::read(path) {
-            Ok(bytes) => return Ok(Some(serde_json::from_slice(&bytes)?)),
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(take) => return Ok(Some(take)),
+                Err(_) => {
+                    let path = store.root().join(name);
+                    fs::remove_file(&path)?;
+                    sync_dir(store.root())?;
+                    eprintln!("conchd: discarded invalid take file {}", path.display());
+                }
+            },
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
@@ -1480,5 +1895,28 @@ mod tests {
         assert_eq!(committed.scene, staged);
         assert_eq!(hash_scene(&committed.scene), hash);
         assert!(restarted.replay(room).unwrap().pending.is_none());
+    }
+
+    #[test]
+    fn client_protocol_is_loopback_only() {
+        assert!(client_peer_allowed("127.0.0.1:7421".parse().unwrap()));
+        assert!(client_peer_allowed("[::1]:7421".parse().unwrap()));
+        assert!(!client_peer_allowed("192.168.1.5:7421".parse().unwrap()));
+    }
+
+    #[test]
+    fn corrupt_ephemeral_floor_files_do_not_brick_restart() {
+        let data = TempDir::new().unwrap();
+        let daemon = Daemon::open(data.path()).unwrap();
+        let room = daemon.create_genesis("corrupt floor files").unwrap();
+        let root = daemon.store(room).unwrap().root().to_path_buf();
+        fs::write(root.join("take.json"), b"not json").unwrap();
+        fs::write(root.join("intents").join("bad.json"), b"not json").unwrap();
+        drop(daemon);
+
+        let restarted = Daemon::open(data.path()).unwrap();
+        assert_eq!(restarted.replay(room).unwrap().chain.head_n, Some(0));
+        assert!(!root.join("take.json").exists());
+        assert!(!root.join("intents").join("bad.json").exists());
     }
 }

@@ -126,10 +126,20 @@ impl Store {
             if !entry.file_type()?.is_file() {
                 continue;
             }
-            let intent: Intent = serde_json::from_slice(&fs::read(entry.path())?)?;
-            if entry.file_name().to_string_lossy() != format!("{}.json", intent.id) {
-                return Err(StoreError::InvalidIntentFile);
-            }
+            let bytes = fs::read(entry.path())?;
+            let intent = serde_json::from_slice::<Intent>(&bytes).ok();
+            let valid_name = intent.as_ref().is_some_and(|intent| {
+                entry.file_name().to_string_lossy() == format!("{}.json", intent.id)
+            });
+            let Some(intent) = intent.filter(|_| valid_name) else {
+                fs::remove_file(entry.path())?;
+                sync_dir(&self.root.join("intents"))?;
+                eprintln!(
+                    "conchd: discarded invalid intent file {}",
+                    entry.path().display()
+                );
+                continue;
+            };
             intents.push(intent);
         }
         intents.sort_by_key(|intent| (intent.ts, intent.id));

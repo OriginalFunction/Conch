@@ -1,5 +1,6 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::Path,
     process::Stdio,
     time::Instant,
 };
@@ -24,6 +25,7 @@ async fn two_wait_for_floor_processes_only_unblock_one() {
 
     let created = Command::new(binary)
         .args(["--node", &node, "create", "--name", "cli test"])
+        .current_dir(data.path())
         .output()
         .await
         .unwrap();
@@ -38,8 +40,8 @@ async fn two_wait_for_floor_processes_only_unblock_one() {
         .to_owned();
 
     let start = Instant::now();
-    let mut alpha = wait_command(binary, &node, &room, "alpha");
-    let mut beta = wait_command(binary, &node, &room, "beta");
+    let mut alpha = wait_command(binary, &node, &room, "alpha", data.path());
+    let mut beta = wait_command(binary, &node, &room, "beta", data.path());
     let (alpha, beta) = timeout(Duration::from_secs(4), async move {
         tokio::join!(alpha.output(), beta.output())
     })
@@ -61,28 +63,46 @@ async fn cli_speak_retry_yield_and_next_waiter() {
     let server = daemon.start(bind).await.unwrap();
     let mut node = format!("tcp://{}", server.addr());
     let binary = env!("CARGO_BIN_EXE_conch");
-    let room = create(binary, &node).await;
+    let room = create(binary, &node, data.path()).await;
 
-    let alpha = wait_command(binary, &node, &room, "alpha")
+    let alpha = wait_command(binary, &node, &room, "alpha", data.path())
         .output()
         .await
         .unwrap();
     assert!(alpha.status.success());
-    let beta = wait_command(binary, &node, &room, "beta")
+    let beta = wait_command(binary, &node, &room, "beta", data.path())
         .output()
         .await
         .unwrap();
     assert!(!beta.status.success(), "the live grant keeps beta queued");
 
     let request_id = "0123456789abcdef0123456789abcdef";
-    let first = speak(binary, &node, &room, "alpha", request_id, "hello").await;
+    let first = speak(
+        binary,
+        &node,
+        &room,
+        "alpha",
+        request_id,
+        "hello",
+        data.path(),
+    )
+    .await;
     server.abort();
     drop(server);
     drop(daemon);
     let daemon = Daemon::open(data.path()).unwrap();
     let server = daemon.start(bind).await.unwrap();
     node = format!("tcp://{}", server.addr());
-    let retry = speak(binary, &node, &room, "alpha", request_id, "ignored").await;
+    let retry = speak(
+        binary,
+        &node,
+        &room,
+        "alpha",
+        request_id,
+        "ignored",
+        data.path(),
+    )
+    .await;
     assert!(first.status.success());
     assert!(retry.status.success());
     assert_eq!(
@@ -95,6 +115,7 @@ async fn cli_speak_retry_yield_and_next_waiter() {
         &[
             "--node", &node, "--agent", "alpha", "--room", &room, "yield",
         ],
+        data.path(),
     )
     .await;
     assert!(
@@ -103,7 +124,7 @@ async fn cli_speak_retry_yield_and_next_waiter() {
         String::from_utf8_lossy(&yielded.stderr)
     );
 
-    let beta = wait_command(binary, &node, &room, "beta")
+    let beta = wait_command(binary, &node, &room, "beta", data.path())
         .output()
         .await
         .unwrap();
@@ -112,13 +133,27 @@ async fn cli_speak_retry_yield_and_next_waiter() {
         "beta receives the next committed grant"
     );
 
-    let late = speak(binary, &node, &room, "alpha", &"ab".repeat(16), "late").await;
+    let late = speak(
+        binary,
+        &node,
+        &room,
+        "alpha",
+        &"ab".repeat(16),
+        "late",
+        data.path(),
+    )
+    .await;
     assert!(!late.status.success());
     assert!(String::from_utf8_lossy(&late.stderr).contains("no_grant"));
 }
 
-async fn create(binary: &str, node: &str) -> String {
-    let created = run(binary, &["--node", node, "create", "--name", "cli test"]).await;
+async fn create(binary: &str, node: &str, cwd: &Path) -> String {
+    let created = run(
+        binary,
+        &["--node", node, "create", "--name", "cli test"],
+        cwd,
+    )
+    .await;
     assert!(
         created.status.success(),
         "{}",
@@ -137,6 +172,7 @@ async fn speak(
     agent: &str,
     request_id: &str,
     text: &str,
+    cwd: &Path,
 ) -> std::process::Output {
     let mut command = Command::new(binary);
     command
@@ -156,6 +192,7 @@ async fn speak(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    command.current_dir(cwd);
     let mut child = command.spawn().unwrap();
     child
         .stdin
@@ -167,11 +204,16 @@ async fn speak(
     child.wait_with_output().await.unwrap()
 }
 
-async fn run(binary: &str, arguments: &[&str]) -> std::process::Output {
-    Command::new(binary).args(arguments).output().await.unwrap()
+async fn run(binary: &str, arguments: &[&str], cwd: &Path) -> std::process::Output {
+    Command::new(binary)
+        .args(arguments)
+        .current_dir(cwd)
+        .output()
+        .await
+        .unwrap()
 }
 
-fn wait_command(binary: &str, node: &str, room: &str, agent: &str) -> Command {
+fn wait_command(binary: &str, node: &str, room: &str, agent: &str, cwd: &Path) -> Command {
     let mut command = Command::new(binary);
     command
         .args([
@@ -187,5 +229,6 @@ fn wait_command(binary: &str, node: &str, room: &str, agent: &str) -> Command {
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    command.current_dir(cwd);
     command
 }

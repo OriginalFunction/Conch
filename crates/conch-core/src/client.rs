@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::types::{AgentId, RoomId};
+use crate::{
+    ticket::{JoinRole, Ticket},
+    types::{AgentId, FloorConfig, RoomId, StakePolicy},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "typ", rename_all = "snake_case", deny_unknown_fields)]
@@ -11,6 +14,13 @@ pub enum ClientRequest {
     },
     Create {
         name: String,
+        stake: StakePolicy,
+        floor: FloorConfig,
+    },
+    Join {
+        ticket: Ticket,
+        #[serde(default)]
+        role: JoinRole,
     },
     WaitForFloor {
         room: RoomId,
