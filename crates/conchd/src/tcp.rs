@@ -449,7 +449,8 @@ impl Daemon {
                     if !self.room_authorized(freeze.room, &authed)? {
                         continue;
                     }
-                    if let Some(close) = self.receive_freeze(freeze.room, freeze.grant_hash)? {
+                    if let Some(close) = self.receive_freeze(freeze.room, freeze.grant_hash).await?
+                    {
                         write_message(&mut stream, &SwarmMsg::CloseTake(close)).await?;
                     }
                 }
@@ -486,7 +487,11 @@ impl Daemon {
     async fn execute_client(&self, agent: AgentId, request: ClientRequest) -> ClientReply {
         let result = match request {
             ClientRequest::Create { name } => {
-                self.create_genesis(&name).map(|room| json!({ "id": room }))
+                let daemon = self.clone();
+                match task::spawn_blocking(move || daemon.create_genesis(&name)).await {
+                    Ok(result) => result.map(|room| json!({ "id": room })),
+                    Err(error) => Err(error.into()),
+                }
             }
             ClientRequest::WaitForFloor { room, timeout_secs } => {
                 self.client_wait_for_floor(agent, room, timeout_secs).await
@@ -495,7 +500,7 @@ impl Daemon {
                 room,
                 text,
                 request_id,
-            } => self.client_speak(agent, room, &text, &request_id),
+            } => self.client_speak(agent, room, text, request_id).await,
             ClientRequest::Yield { room } => self.client_yield(agent, room).await,
             ClientRequest::RaiseHand { room } => self.client_raise_hand(agent, room).await,
             ClientRequest::History { room, from_n } => self.replay(room).and_then(|replay| {
@@ -642,11 +647,16 @@ impl Daemon {
             .cloned()
             .expect("upserted intent is present");
         let store = self.store(room)?;
-        store.write_intent(&stored)?;
-        if let Some(prior) = replaced.filter(|prior| *prior != id) {
-            store.remove_intent(prior)?;
-        }
-        self.maybe_grant_next_locked(room, &floor)?;
+        let prior = replaced.filter(|prior| *prior != id);
+        task::spawn_blocking(move || -> Result<(), StoreError> {
+            store.write_intent(&stored)?;
+            if let Some(prior) = prior {
+                store.remove_intent(prior)?;
+            }
+            Ok(())
+        })
+        .await??;
+        self.maybe_grant_next_locked(room, &floor).await?;
         Ok(id)
     }
 
@@ -675,32 +685,40 @@ impl Daemon {
             return Ok(());
         }
         let store = self.store(room)?;
-        store.write_intent(&intent)?;
-        if let Some(prior) = replaced.filter(|prior| *prior != intent.id) {
-            store.remove_intent(prior)?;
-        }
-        self.maybe_grant_next_locked(room, &floor)?;
+        let prior = replaced.filter(|prior| *prior != intent.id);
+        task::spawn_blocking(move || -> Result<(), StoreError> {
+            store.write_intent(&intent)?;
+            if let Some(prior) = prior {
+                store.remove_intent(prior)?;
+            }
+            Ok(())
+        })
+        .await??;
+        self.maybe_grant_next_locked(room, &floor).await?;
         Ok(())
     }
 
-    fn receive_freeze(
+    async fn receive_freeze(
         &self,
         room: RoomId,
         grant_hash: Hash32,
     ) -> Result<Option<CloseTake>, DaemonError> {
         let floor = self.floor(room)?;
-        let mut engine = floor.engine.lock().expect("floor lock is not poisoned");
-        if engine
-            .take()
-            .is_none_or(|take| take.grant_hash != grant_hash)
-        {
-            return Ok(None);
-        }
-        let frozen = engine.freeze(room, grant_hash)?;
-        write_take(
-            &self.store(room)?,
-            engine.take().expect("freeze preserves take"),
-        )?;
+        let _mutation = floor.mutation.lock().await;
+        let (frozen, take) = {
+            let mut engine = floor.engine.lock().expect("floor lock is not poisoned");
+            if engine
+                .take()
+                .is_none_or(|take| take.grant_hash != grant_hash)
+            {
+                return Ok(None);
+            }
+            let frozen = engine.freeze(room, grant_hash)?;
+            let take = engine.take().expect("freeze preserves take").clone();
+            (frozen, take)
+        };
+        let store = self.store(room)?;
+        task::spawn_blocking(move || write_take(&store, &take)).await??;
         Ok(Some(CloseTake {
             room,
             grant_hash,
@@ -710,22 +728,28 @@ impl Daemon {
         }))
     }
 
-    fn client_speak(
+    async fn client_speak(
         &self,
         agent: AgentId,
         room: RoomId,
-        text: &str,
-        request_id: &str,
+        text: String,
+        request_id: String,
     ) -> Result<Value, DaemonError> {
         let floor = self.floor(room)?;
+        let _mutation = floor.mutation.lock().await;
         let mouth = Mouth {
             agent,
             node: self.node_id(),
         };
-        let mut engine = floor.engine.lock().expect("floor lock is not poisoned");
-        let response = engine.speak(&mouth, text, request_id)?;
-        if let Some(take) = engine.take() {
-            write_take(&self.store(room)?, take)?;
+        let (response, take) = {
+            let mut engine = floor.engine.lock().expect("floor lock is not poisoned");
+            let response = engine.speak(&mouth, &text, &request_id)?;
+            let take = engine.take().cloned();
+            (response, take)
+        };
+        if let Some(take) = take {
+            let store = self.store(room)?;
+            task::spawn_blocking(move || write_take(&store, &take)).await??;
         }
         Ok(serde_json::to_value(response)?)
     }
@@ -737,7 +761,7 @@ impl Daemon {
             agent,
             node: self.node_id(),
         };
-        let frozen = {
+        let (frozen, take) = {
             let mut engine = floor.engine.lock().expect("floor lock is not poisoned");
             let take = engine.take().ok_or(FloorError::NoGrant)?;
             if take.holder != mouth {
@@ -745,12 +769,11 @@ impl Daemon {
             }
             let grant_hash = take.grant_hash;
             let frozen = engine.freeze(room, grant_hash)?;
-            write_take(
-                &self.store(room)?,
-                engine.take().expect("freeze preserves take"),
-            )?;
-            frozen
+            let take = engine.take().expect("freeze preserves take").clone();
+            (frozen, take)
         };
+        let store = self.store(room)?;
+        task::spawn_blocking(move || write_take(&store, &take)).await??;
         loop {
             self.commit_singleton_body(
                 room,
@@ -760,7 +783,8 @@ impl Daemon {
                     blobs: frozen.blobs.clone(),
                 },
                 &floor,
-            )?;
+            )
+            .await?;
             if self
                 .replay(room)?
                 .chain
@@ -773,7 +797,7 @@ impl Daemon {
             // A different already-accepted body committed first. Preserve it,
             // then close this still-live grant at the following height.
         }
-        self.maybe_grant_next_locked(room, &floor)?;
+        self.maybe_grant_next_locked(room, &floor).await?;
         Ok(serde_json::to_value(SpeakAck {
             ok: true,
             grant_hash: frozen.grant_hash,
@@ -803,7 +827,11 @@ impl Daemon {
         Ok(json!({ "node": self.node_id(), "rooms": rooms }))
     }
 
-    fn maybe_grant_next_locked(&self, room: RoomId, floor: &RoomFloor) -> Result<(), DaemonError> {
+    async fn maybe_grant_next_locked(
+        &self,
+        room: RoomId,
+        floor: &Arc<RoomFloor>,
+    ) -> Result<(), DaemonError> {
         loop {
             let replay = self.replay(room)?;
             if replay.chain.live_grant.is_some()
@@ -831,13 +859,26 @@ impl Daemon {
                     intent_id: intent.id,
                 },
                 floor,
-            )?;
+            )
+            .await?;
             // If the call first recovered some other pending body, loop and
             // propose the grant only after that exact accepted hash commits.
         }
     }
 
-    fn commit_singleton_body(
+    async fn commit_singleton_body(
+        &self,
+        room: RoomId,
+        body: Body,
+        floor: &Arc<RoomFloor>,
+    ) -> Result<CommittedScene, DaemonError> {
+        let daemon = self.clone();
+        let floor = Arc::clone(floor);
+        task::spawn_blocking(move || daemon.commit_singleton_body_blocking(room, body, &floor))
+            .await?
+    }
+
+    fn commit_singleton_body_blocking(
         &self,
         room: RoomId,
         body: Body,
@@ -1425,7 +1466,7 @@ mod tests {
         let restarted = Daemon::open(data.path()).unwrap();
         let floor = restarted.floor(room).unwrap();
         let committed = restarted
-            .commit_singleton_body(
+            .commit_singleton_body_blocking(
                 room,
                 Body::Membership {
                     stake: replay.chain.stake.unwrap(),
