@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#102924">
+    <title>Conch · room ledger</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='27' fill='%23102924' stroke='%23f4d9bf' stroke-width='5'/%3E%3Ctext x='32' y='43' text-anchor='middle' font-family='serif' font-style='italic' font-size='36' fill='%23f4d9bf'%3EC%3C/text%3E%3C/svg%3E">
+    <link rel="stylesheet" href="/ui/app.css">
+  </head>
+  <body>
+    <header class="masthead">
+      <a class="brand" href="/ui/" aria-label="Conch home">
+        <span class="brand-mark" aria-hidden="true">C</span>
+        <span><strong>Conch</strong><small>one floor, one history</small></span>
+      </a>
+      <div class="connection"><span id="connection-dot"></span><span id="connection-label">Connecting</span></div>
+    </header>
+
+    <div class="shell">
+      <aside class="sidebar">
+        <section>
+          <p class="eyebrow">Current room</p>
+          <h1 id="room-name">No room open</h1>
+          <dl class="facts">
+            <div><dt>Room</dt><dd id="room-id">—</dd></div>
+            <div><dt>This node</dt><dd id="node-id">—</dd></div>
+            <div><dt>Wrapped head</dt><dd id="head-number">—</dd></div>
+          </dl>
+        </section>
+
+        <section class="join-panel">
+          <p class="eyebrow">Open or join</p>
+          <label for="ticket-source">Ticket, magnet, or URL</label>
+          <textarea id="ticket-source" rows="4" placeholder="Paste a .conch JSON object or conch:1:… magnet"></textarea>
+          <div class="join-row">
+            <select id="join-role" aria-label="Join role">
+              <option value="stake">Stake</option>
+              <option value="observe">Observe</option>
+            </select>
+            <button id="join-button" class="secondary">Join room</button>
+          </div>
+          <p id="join-error" class="error" role="alert"></p>
+        </section>
+      </aside>
+
+      <main>
+        <section class="floor-bar" aria-live="polite">
+          <div>
+            <p class="eyebrow">The floor</p>
+            <p id="floor-status">Open a room to see who holds Conch.</p>
+          </div>
+          <button id="take-button" class="secondary" disabled>Raise hand</button>
+        </section>
+
+        <section id="transcript" class="transcript" aria-label="Wrapped transcript">
+          <div class="empty-state">
+            <span aria-hidden="true">◎</span>
+            <h2>The ledger is quiet</h2>
+            <p>Join a room. Only wrapped scenes will appear here.</p>
+          </div>
+        </section>
+
+        <section id="draft-preview" class="draft-preview" hidden>
+          <span>Live draft · unverified</span>
+          <p id="draft-text"></p>
+        </section>
+
+        <section class="composer" aria-label="Speak while holding Conch">
+          <label for="speech">Your take</label>
+          <textarea id="speech" rows="4" disabled placeholder="You can write when this human holds the floor."></textarea>
+          <div class="composer-actions">
+            <p id="compose-hint">The wrapped grant controls this composer.</p>
+            <div>
+              <button id="yield-button" class="secondary" disabled>Yield</button>
+              <button id="wrap-button" disabled>Wrap &amp; yield</button>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <template id="scene-template">
+      <article class="scene">
+        <div class="scene-index"></div>
+        <div class="scene-content">
+          <header><strong></strong><time></time></header>
+          <p></p>
+          <footer></footer>
+        </div>
+      </article>
+    </template>
+    <script src="/ui/app.js" defer></script>
+  </body>
+</html>

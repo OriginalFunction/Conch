@@ -6,7 +6,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         ConnectInfo, Path, Query, State,
     },
-    http::{header, HeaderMap, Response, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Response, StatusCode},
     response::IntoResponse,
     routing::get,
     Json, Router,
@@ -23,7 +23,12 @@ use tokio_tungstenite::{
     connect_async, tungstenite::Message as TungsteniteMessage, MaybeTlsStream, WebSocketStream,
 };
 
-use conch_core::{frame, ticket::Ticket, types::RoomId};
+use conch_core::{
+    client::ClientReply,
+    frame,
+    ticket::Ticket,
+    types::{Hash32, RoomId},
+};
 
 use crate::tcp::{read_frame, ConnectionProtocol, Daemon, DaemonError};
 
@@ -103,7 +108,43 @@ fn router(daemon: Daemon) -> Router {
         .route("/history/{id}", get(get_history))
         .route("/swarm", get(ws_swarm))
         .route("/client", get(ws_client))
+        .route("/", get(index))
+        .route("/ui/", get(index))
+        .route("/ui/app.js", get(app_js))
+        .route("/ui/app.css", get(app_css))
         .with_state(daemon)
+}
+
+async fn index() -> Response<Body> {
+    static_asset(
+        include_str!("../../../ui/index.html"),
+        "text/html; charset=utf-8",
+    )
+}
+
+async fn app_js() -> Response<Body> {
+    static_asset(
+        include_str!("../../../ui/app.js"),
+        "text/javascript; charset=utf-8",
+    )
+}
+
+async fn app_css() -> Response<Body> {
+    static_asset(
+        include_str!("../../../ui/app.css"),
+        "text/css; charset=utf-8",
+    )
+}
+
+fn static_asset(contents: &'static str, content_type: &'static str) -> Response<Body> {
+    let mut response = Response::new(Body::from(contents));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
 }
 
 async fn get_ticket(
@@ -138,23 +179,53 @@ async fn get_history(
 }
 
 async fn ws_swarm(State(daemon): State<Daemon>, upgrade: WebSocketUpgrade) -> impl IntoResponse {
-    upgrade.on_upgrade(move |socket| websocket_bridge(socket, daemon, ConnectionProtocol::Swarm))
+    upgrade
+        .on_upgrade(move |socket| websocket_bridge(socket, daemon, ConnectionProtocol::Swarm, None))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ClientAccess {
+    room: Option<RoomId>,
+    token: Option<Hash32>,
 }
 
 async fn ws_client(
     State(daemon): State<Daemon>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(access): Query<ClientAccess>,
     upgrade: WebSocketUpgrade,
 ) -> Response<Body> {
-    if !peer.ip().is_loopback() {
-        return StatusCode::FORBIDDEN.into_response();
-    }
+    let allowed_room = if peer.ip().is_loopback() {
+        None
+    } else {
+        let Some(room) = access.room else {
+            return StatusCode::FORBIDDEN.into_response();
+        };
+        match daemon.token_sha256(room) {
+            Ok(None) => Some(room),
+            Ok(Some(_))
+                if access
+                    .token
+                    .is_some_and(|token| daemon.authenticate(room, token).unwrap_or(false)) =>
+            {
+                Some(room)
+            }
+            _ => return StatusCode::FORBIDDEN.into_response(),
+        }
+    };
     upgrade
-        .on_upgrade(move |socket| websocket_bridge(socket, daemon, ConnectionProtocol::Client))
+        .on_upgrade(move |socket| {
+            websocket_bridge(socket, daemon, ConnectionProtocol::Client, allowed_room)
+        })
         .into_response()
 }
 
-async fn websocket_bridge(mut socket: WebSocket, daemon: Daemon, protocol: ConnectionProtocol) {
+async fn websocket_bridge(
+    mut socket: WebSocket,
+    daemon: Daemon,
+    protocol: ConnectionProtocol,
+    allowed_room: Option<RoomId>,
+) {
     let (bridge, daemon_stream) = duplex(BRIDGE_CAPACITY);
     let (mut bridge_reader, mut bridge_writer) = split(bridge);
     let daemon_task = tokio::spawn(async move {
@@ -168,6 +239,21 @@ async fn websocket_bridge(mut socket: WebSocket, daemon: Daemon, protocol: Conne
                 match message {
                     Message::Text(text) => {
                         let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else { break };
+                        if let Some(room) = allowed_room {
+                            let expected = room.to_string();
+                            if value.get("typ").and_then(Value::as_str) != Some("attach")
+                                && value.get("room").and_then(Value::as_str)
+                                    != Some(expected.as_str())
+                            {
+                                let error = ClientReply::failure(
+                                    "unauthorized",
+                                    "WebSocket is authorized for a different room",
+                                );
+                                let Ok(text) = serde_json::to_string(&error) else { break };
+                                if socket.send(Message::Text(text.into())).await.is_err() { break; }
+                                continue;
+                            }
+                        }
                         let Ok(encoded) = frame::encode(&value) else { break };
                         if bridge_writer.write_all(&encoded).await.is_err() { break; }
                     }

@@ -80,11 +80,13 @@ async fn ws_client_and_tcp_expose_the_same_commit_hashes() {
         .unwrap();
     socket
         .send(json_message(&ClientRequest::Attach {
-            agent: AgentId::new("local").unwrap(),
+            agent: AgentId::new("human:operator").unwrap(),
         }))
         .await
         .unwrap();
-    assert!(next_reply(&mut socket).await.ok);
+    let attached = next_reply(&mut socket).await;
+    assert!(attached.ok);
+    assert_eq!(attached.data.unwrap()["agent"], "human:operator");
     socket
         .send(json_message(&ClientRequest::History { room, from_n: 0 }))
         .await
@@ -92,6 +94,22 @@ async fn ws_client_and_tcp_expose_the_same_commit_hashes() {
     let ws_history = next_reply(&mut socket).await;
     assert!(ws_history.ok);
     assert_eq!(ws_history.data, tcp_history.data);
+}
+
+#[tokio::test]
+async fn ui_html_is_embedded_and_served_at_root_and_ui() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let server = daemon.start_http(loopback()).await.unwrap();
+
+    for path in ["/", "/ui/"] {
+        let response = http_get(server.addr(), path, None).await;
+        assert_eq!(response.0, 200);
+        let html = String::from_utf8(response.1).unwrap();
+        assert!(html.contains("Conch"));
+        assert!(html.contains("id=\"transcript\""));
+        assert!(html.contains("id=\"speech\""));
+    }
 }
 
 #[tokio::test]

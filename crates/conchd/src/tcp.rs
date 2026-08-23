@@ -813,7 +813,7 @@ impl Daemon {
             .insert(agent.clone());
         write_frame(
             &mut stream,
-            &ClientReply::success(json!({ "agent": agent })),
+            &ClientReply::success(json!({ "agent": agent, "node": self.node_id() })),
         )
         .await?;
         while let Some(value) = read_frame::<_, Value>(&mut stream).await? {
