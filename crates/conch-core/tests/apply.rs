@@ -270,7 +270,7 @@ fn precert_grant_requires_the_deterministic_queue_head() {
     let fixture = Fixture::new();
     let state = committed_genesis(&fixture);
     let target = fixture.signed_intent(9, 1_766_700_020);
-    let earlier = fixture.signed_intent_for(&fixture.other_key, "claude", 8, 1_766_700_010);
+    let earlier = fixture.signed_intent_for(&fixture.creator_key, "claude", 8, 1_766_700_010);
     let scene = grant_scene(&fixture, &state, &target);
 
     assert!(matches!(
@@ -285,6 +285,26 @@ fn precert_grant_requires_the_deterministic_queue_head() {
         ),
         Err(ApplyError::IntentNotQueueHead)
     ));
+}
+
+#[test]
+fn precert_queue_ignores_intents_from_non_roster_nodes() {
+    let fixture = Fixture::new();
+    let state = committed_genesis(&fixture);
+    let target = fixture.signed_intent(9, 1_766_700_020);
+    let observer = fixture.signed_intent_for(&fixture.other_key, "claude", 8, 1_766_700_010);
+    let scene = grant_scene(&fixture, &state, &target);
+
+    assert!(apply(
+        &state,
+        &scene,
+        None,
+        ApplyMode::Precert(&ApplyResources {
+            intents: vec![target, observer],
+            blobs: BTreeMap::new(),
+        })
+    )
+    .is_ok());
 }
 
 #[test]
@@ -540,6 +560,20 @@ fn optional_hashed_fields_reject_explicit_null() {
             "floor": FloorConfig::stick(30),
             "closes_grant": null
         }
+    });
+
+    assert!(serde_json::from_value::<Scene>(value).is_err());
+}
+
+#[test]
+fn speech_rejects_present_but_empty_blobs_array() {
+    let fixture = Fixture::new();
+    let mut value = serde_json::to_value(fixture.genesis()).unwrap();
+    value["body"] = serde_json::json!({
+        "type": "speech",
+        "closes_grant": Hash32::from_bytes([7; 32]),
+        "text": "done",
+        "blobs": []
     });
 
     assert!(serde_json::from_value::<Scene>(value).is_err());

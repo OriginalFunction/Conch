@@ -317,7 +317,11 @@ pub enum Body {
     Speech {
         closes_grant: Hash32,
         text: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "deserialize_non_empty_vec"
+        )]
         blobs: Vec<BlobRef>,
     },
     Breakout {
@@ -411,6 +415,13 @@ pub struct CommitProof {
     pub rpc_term: u64,
     pub leader: NodeId,
     pub certs: Vec<Cert>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommittedScene {
+    pub scene: Scene,
+    pub commit_proof: CommitProof,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -535,4 +546,18 @@ where
     T: Deserialize<'de>,
 {
     T::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_non_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    let values = Vec::<T>::deserialize(deserializer)?;
+    if values.is_empty() {
+        return Err(de::Error::custom(
+            "optional array must be omitted when empty",
+        ));
+    }
+    Ok(values)
 }

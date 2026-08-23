@@ -15,7 +15,9 @@ use crate::{
     apply::{apply, ApplyError, ApplyMode, ApplyResources},
     consensus::{advance_term, AdvanceSource},
     encoding::{cert_digest, scene_hash, verify},
-    types::{CertSigner, ChainState, CommitProof, ConsensusState, Hash32, Pending, Scene},
+    types::{
+        CertSigner, ChainState, CommitProof, CommittedScene, ConsensusState, Hash32, Pending, Scene,
+    },
 };
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -96,7 +98,7 @@ impl Store {
             .expect("a successful commit always produces a head hash");
         self.reject_conflicting_scene(scene.n, hash)?;
 
-        let stored = StoredScene {
+        let stored = CommittedScene {
             scene: scene.clone(),
             commit_proof: proof.clone(),
         };
@@ -153,6 +155,8 @@ impl Store {
                 let hash = Hash32::from_bytes(scene_hash(
                     &serde_json::to_value(&stored.scene).expect("typed scene is serializable"),
                 ));
+                // A candidate that cannot pass deterministic replay is treated
+                // as absent and re-leechable, like a torn/unreadable file.
                 let Ok(next) = apply(
                     &chain,
                     &stored.scene,
@@ -214,8 +218,8 @@ impl Store {
         })
     }
 
-    fn scan_scene_files(&self) -> Result<BTreeMap<u64, Vec<StoredScene>>, StoreError> {
-        let mut scenes: BTreeMap<u64, Vec<StoredScene>> = BTreeMap::new();
+    fn scan_scene_files(&self) -> Result<BTreeMap<u64, Vec<CommittedScene>>, StoreError> {
+        let mut scenes: BTreeMap<u64, Vec<CommittedScene>> = BTreeMap::new();
         for entry in fs::read_dir(self.root.join("scenes"))? {
             let Ok(entry) = entry else {
                 continue;
@@ -229,7 +233,7 @@ impl Store {
             if bytes.is_empty() {
                 continue;
             }
-            let Ok(stored) = serde_json::from_slice::<StoredScene>(&bytes) else {
+            let Ok(stored) = serde_json::from_slice::<CommittedScene>(&bytes) else {
                 continue;
             };
             let actual_hash = Hash32::from_bytes(scene_hash(
@@ -278,13 +282,6 @@ impl Store {
             blobs,
         })
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StoredScene {
-    scene: Scene,
-    commit_proof: CommitProof,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

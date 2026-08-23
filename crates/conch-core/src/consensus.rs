@@ -1,7 +1,10 @@
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use crate::types::ConsensusRole;
-use crate::types::{CommitProof, ConsensusState, Hash32, NodeId, Pending};
+use crate::types::{
+    Cert, CommitProof, ConsensusState, Hash32, NodeId, Pending, RoomId, Scene, SignatureBytes,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tail {
@@ -10,7 +13,8 @@ pub struct Tail {
     pub last_hash: Hash32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Have {
     pub n: u64,
     pub hash: Hash32,
@@ -23,6 +27,155 @@ pub struct HaveObservation {
     /// Informational only. This value must not be passed to `advance_term`
     /// until a corresponding proof is fetched, verified, and installed.
     pub advertised_rpc: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestVote {
+    pub room: RoomId,
+    pub rpc_term: u64,
+    pub candidate: NodeId,
+    pub last_n: u64,
+    pub last_hash: Hash32,
+    pub last_rpc: u64,
+    pub sig: SignatureBytes,
+}
+
+impl RequestVote {
+    pub fn tail(&self) -> Tail {
+        Tail {
+            last_rpc: self.last_rpc,
+            last_n: self.last_n,
+            last_hash: self.last_hash,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Vote {
+    pub room: RoomId,
+    pub rpc_term: u64,
+    pub voter: NodeId,
+    pub candidate: NodeId,
+    pub last_n: u64,
+    pub last_hash: Hash32,
+    pub last_rpc: u64,
+    pub grant: bool,
+    pub sig: SignatureBytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Append {
+    pub room: RoomId,
+    pub rpc_term: u64,
+    pub leader: NodeId,
+    pub prev_n: u64,
+    pub prev_hash: Hash32,
+    pub scene: Scene,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CertMessage {
+    pub room: RoomId,
+    pub n: u64,
+    pub hash: Hash32,
+    pub rpc_term: u64,
+    pub leader: NodeId,
+    pub node: NodeId,
+    pub sig: SignatureBytes,
+}
+
+impl CertMessage {
+    pub fn as_cert(&self) -> Cert {
+        Cert::node(self.node, self.sig)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommitMessage {
+    pub room: RoomId,
+    pub n: u64,
+    pub hash: Hash32,
+    pub rpc_term: u64,
+    pub leader: NodeId,
+    pub certs: Vec<Cert>,
+    pub scene: Scene,
+}
+
+impl CommitMessage {
+    pub fn proof(&self) -> CommitProof {
+        CommitProof {
+            rpc_term: self.rpc_term,
+            leader: self.leader,
+            certs: self.certs.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Heartbeat {
+    pub room: RoomId,
+    pub rpc_term: u64,
+    pub leader: NodeId,
+    pub n: u64,
+    pub hash: Hash32,
+    pub have_rpc: u64,
+}
+
+impl Heartbeat {
+    pub fn have(&self) -> Have {
+        Have {
+            n: self.n,
+            hash: self.hash,
+            rpc_term: self.have_rpc,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Nack {
+    pub room: RoomId,
+    pub have_n: u64,
+    pub have_hash: Hash32,
+    pub have_rpc: u64,
+}
+
+impl Nack {
+    pub fn have(&self) -> Have {
+        Have {
+            n: self.have_n,
+            hash: self.have_hash,
+            rpc_term: self.have_rpc,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GetScenes {
+    pub room: RoomId,
+    pub from_n: u64,
+    pub to_n: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "typ", rename_all = "snake_case")]
+pub enum SwarmMsg {
+    RequestVote(RequestVote),
+    Vote(Vote),
+    Append(Append),
+    Cert(CertMessage),
+    Commit(CommitMessage),
+    Heartbeat(Heartbeat),
+    Nack(Nack),
+    GetScenes(GetScenes),
+    Scene(crate::types::CommittedScene),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

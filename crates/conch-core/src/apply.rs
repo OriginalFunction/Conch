@@ -117,6 +117,11 @@ pub enum ApplyError {
     StaleConflictingCommit,
 }
 
+/// Applies one deterministic ledger transition.
+///
+/// For a scene below `state.head_n`, callers resolve idempotency against their
+/// committed scene store; the reducer only has the current head hash and
+/// therefore reports [`ApplyError::StaleConflictingCommit`].
 pub fn apply(
     state: &ChainState,
     scene: &Scene,
@@ -220,28 +225,15 @@ fn validate_body(state: &ChainState, scene: &Scene) -> Result<(), ApplyError> {
             }
             validate_floor_config(floor)?;
         }
-        Body::Grant {
-            to,
-            reason,
-            intent_id,
-        } => {
+        Body::Grant { to, intent_id, .. } => {
             if !scene.roster.contains(&to.node) {
                 return Err(ApplyError::GrantTargetNotRoster);
             }
             if state.consumed_intents.contains(intent_id) {
                 return Err(ApplyError::ConsumedIntent);
             }
-            let reason_matches_mode = matches!(
-                (state.floor_mode, reason),
-                (Some(FloorMode::Stick), crate::types::GrantReason::Queue)
-                    | (
-                        Some(FloorMode::Moderator),
-                        crate::types::GrantReason::Moderator
-                    )
-            );
-            if !state.is_empty() && !reason_matches_mode {
-                return Err(ApplyError::InvalidFloorTransition);
-            }
+            // `reason` records proposal provenance. §10 does not make it a
+            // reducer validity condition; the leader path chooses it per §12.
         }
         Body::Speech { blobs, .. } => validate_blob_refs(blobs)?,
         Body::Breakout { auto_join, .. } => {
@@ -390,6 +382,7 @@ fn validate_grant_intent(
     for intent in &resources.intents {
         if intent.room != scene.room
             || intent.v != 1
+            || !scene.roster.contains(&intent.node)
             || state.consumed_intents.contains(&intent.id)
             || scene.ts >= intent.exp
             || validate_intent(intent, scene.room).is_err()
