@@ -104,6 +104,7 @@ pub struct TestNode {
     pub sent_appends: Vec<(u64, Hash32)>,
     pub active: bool,
     won_term: Option<u64>,
+    retirement_ticks: Option<u8>,
 }
 
 pub struct Cluster {
@@ -142,6 +143,7 @@ impl Cluster {
                 sent_appends: Vec::new(),
                 active: true,
                 won_term: None,
+                retirement_ticks: None,
             });
         }
         let links = vec![vec![true; node_count]; node_count];
@@ -230,6 +232,11 @@ impl Cluster {
                 }
             }
         }
+        for index in 0..self.nodes.len() {
+            if self.nodes[index].retirement_ticks.is_some() {
+                self.maybe_finish_self_removal(index, true);
+            }
+        }
         Ok(())
     }
 
@@ -239,7 +246,25 @@ impl Cluster {
             node.consensus.leader_id = None;
             node.consensus.role = ConsensusRole::Follower;
             node.won_term = None;
+            node.retirement_ticks = None;
         }
+    }
+
+    pub fn restart(&mut self, index: usize) -> Result<(), ClusterError> {
+        let node = self.nodes.get_mut(index).ok_or(ClusterError::UnknownNode)?;
+        let replay = node.store.load_replay()?;
+        node.chain = replay.chain;
+        node.consensus = replay.consensus;
+        node.consensus.role = ConsensusRole::Follower;
+        node.consensus.leader_id = None;
+        node.pending = replay.pending;
+        node.head_proof = replay.head_proof;
+        node.history = replay.history;
+        node.sent_appends.clear();
+        node.active = true;
+        node.won_term = None;
+        node.retirement_ticks = None;
+        Ok(())
     }
 
     pub fn campaign(&mut self, candidate_index: usize) -> Result<CampaignOutcome, ClusterError> {
@@ -253,9 +278,11 @@ impl Cluster {
             return Err(ClusterError::NotLeader);
         }
         let local_tail = self.node_tail(candidate_index)?;
+        let committed_roster = self.nodes[candidate_index].chain.roster.clone();
         let term = begin_campaign(
             &mut self.nodes[candidate_index].consensus,
             candidate_id,
+            &committed_roster,
             local_tail,
         )?;
         self.nodes[candidate_index]
@@ -466,6 +493,11 @@ impl Cluster {
             self.commit_node(recipient, &append.scene, &proof)?;
         }
 
+        if !self.nodes[leader_index].chain.roster.contains(&leader_id) {
+            self.nodes[leader_index].retirement_ticks = Some(0);
+            self.maybe_finish_self_removal(leader_index, false);
+        }
+
         Ok(AppendOutcome::Committed { hash, rpc_term })
     }
 
@@ -615,16 +647,35 @@ impl Cluster {
         if rpc_term == 0 {
             return Err(ClusterError::InvalidInjectedTerm);
         }
-        self.ensure_active(peer_index)?;
-        let scene = self.membership_scene(peer_index, rpc_term);
+        self.inject_verified_commit(peer_index, &[peer_index], rpc_term)
+    }
+
+    pub fn inject_verified_commit(
+        &mut self,
+        proposer_index: usize,
+        recipients: &[usize],
+        rpc_term: u64,
+    ) -> Result<Hash32, ClusterError> {
+        if rpc_term == 0 {
+            return Err(ClusterError::InvalidInjectedTerm);
+        }
+        self.ensure_active(proposer_index)?;
+        let scene = self.membership_scene(proposer_index, rpc_term);
         let signer_indices: Vec<_> = scene
             .roster
             .iter()
             .filter_map(|node| self.index_of(*node))
             .collect();
-        let proof = self.make_proof(&scene, rpc_term, self.nodes[peer_index].id, &signer_indices);
+        let proof = self.make_proof(
+            &scene,
+            rpc_term,
+            self.nodes[proposer_index].id,
+            &signer_indices,
+        );
         let hash = hash_scene(&scene);
-        self.commit_node(peer_index, &scene, &proof)?;
+        for &recipient in recipients {
+            self.commit_node(recipient, &scene, &proof)?;
+        }
         Ok(hash)
     }
 
@@ -1035,6 +1086,34 @@ impl Cluster {
             self.commit_node(recipient_index, &record.scene, &record.commit_proof)?;
         }
         Ok(())
+    }
+
+    fn maybe_finish_self_removal(&mut self, leader_index: usize, advance_tick: bool) {
+        let hash = self.nodes[leader_index]
+            .chain
+            .head_hash
+            .expect("retiring leader has committed removal");
+        let next_roster = self.nodes[leader_index].chain.roster.clone();
+        let acknowledgements = next_roster
+            .iter()
+            .filter(|node_id| {
+                self.index_of(**node_id).is_some_and(|index| {
+                    self.nodes[index].active && self.nodes[index].chain.head_hash == Some(hash)
+                })
+            })
+            .count();
+        let elapsed = self.nodes[leader_index]
+            .retirement_ticks
+            .unwrap_or_default();
+        if acknowledgements >= majority(next_roster.len()) || elapsed >= 6 {
+            let node = &mut self.nodes[leader_index];
+            node.consensus.role = ConsensusRole::Follower;
+            node.consensus.leader_id = None;
+            node.won_term = None;
+            node.retirement_ticks = None;
+        } else if advance_tick {
+            self.nodes[leader_index].retirement_ticks = Some(elapsed + 1);
+        }
     }
 }
 

@@ -201,6 +201,8 @@ pub enum ConsensusError {
     MissingTail,
     #[error("consensus term overflow")]
     TermOverflow,
+    #[error("node is not in the committed roster")]
+    NotInRoster,
 }
 
 /// Apply the v1.6 term floor. A `true` result is the demotion signal: callers
@@ -265,12 +267,17 @@ pub fn up_to_date(candidate: &Tail, voter: &Tail) -> bool {
 }
 
 /// Begin a campaign in a term strictly above both persistent term and tail.
-/// The caller must fsync the returned self-vote before sending request_vote.
+/// Removed nodes and observers cannot enter candidate state. The caller must
+/// fsync the returned self-vote before sending request_vote.
 pub fn begin_campaign(
     state: &mut ConsensusState,
     self_node: NodeId,
+    committed_roster: &[NodeId],
     local_tail: Tail,
 ) -> Result<u64, ConsensusError> {
+    if !committed_roster.contains(&self_node) {
+        return Err(ConsensusError::NotInRoster);
+    }
     let next = state
         .current_term
         .max(local_tail.last_rpc)

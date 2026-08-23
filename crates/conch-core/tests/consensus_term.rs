@@ -75,6 +75,7 @@ fn proof_100_raises_current_term_before_campaign() {
         begin_campaign(
             &mut state,
             node(1),
+            &[node(1)],
             Tail {
                 last_rpc: 100,
                 last_n: 7,
@@ -176,6 +177,7 @@ fn campaign_is_strictly_above_current_term_and_tail() {
     let term = begin_campaign(
         &mut state,
         self_node,
+        &[self_node],
         Tail {
             last_rpc: 20,
             last_n: 7,
@@ -189,4 +191,24 @@ fn campaign_is_strictly_above_current_term_and_tail() {
     assert_eq!(state.voted_for, Some(self_node));
     assert_eq!(state.leader_id, None);
     assert_eq!(state.role, ConsensusRole::Candidate);
+}
+
+#[test]
+fn removed_node_cannot_begin_campaign() {
+    let self_node = node(1);
+    let mut state = ConsensusState::default();
+    let before = state.clone();
+
+    assert!(begin_campaign(
+        &mut state,
+        self_node,
+        &[node(2)],
+        Tail {
+            last_rpc: 1,
+            last_n: 0,
+            last_hash: Hash32::from_bytes([7; 32]),
+        },
+    )
+    .is_err());
+    assert_eq!(state, before);
 }

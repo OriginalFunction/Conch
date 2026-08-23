@@ -46,6 +46,7 @@ pub struct Replay {
     pub consensus: ConsensusState,
     pub pending: Option<Pending>,
     pub head_proof: Option<CommitProof>,
+    pub history: Vec<CommittedScene>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,9 +149,10 @@ impl Store {
 
         let mut chain = ChainState::empty();
         let mut head_proof = None;
+        let mut history = Vec::new();
         let mut expected_n = 0_u64;
         while let Some(at_height) = candidates.remove(&expected_n) {
-            let mut accepted: Option<(ChainState, CommitProof, Hash32)> = None;
+            let mut accepted: Option<(ChainState, CommittedScene, Hash32)> = None;
             for stored in at_height {
                 let hash = Hash32::from_bytes(scene_hash(
                     &serde_json::to_value(&stored.scene).expect("typed scene is serializable"),
@@ -170,14 +172,15 @@ impl Store {
                         return Err(StoreError::ConflictingScenes(expected_n));
                     }
                 } else {
-                    accepted = Some((next, stored.commit_proof, hash));
+                    accepted = Some((next, stored, hash));
                 }
             }
-            let Some((next, proof, _)) = accepted else {
+            let Some((next, stored, _)) = accepted else {
                 break;
             };
             chain = next;
-            head_proof = Some(proof);
+            head_proof = Some(stored.commit_proof.clone());
+            history.push(stored);
             expected_n += 1;
         }
 
@@ -215,6 +218,7 @@ impl Store {
             consensus,
             pending,
             head_proof,
+            history,
         })
     }
 
