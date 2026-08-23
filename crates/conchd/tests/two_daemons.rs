@@ -130,6 +130,34 @@ async fn malformed_client_request_gets_an_invalid_reply() {
     assert_eq!(reply.error.unwrap().code, "invalid");
 }
 
+#[tokio::test]
+async fn listen_file_and_advertise_feed_new_tickets() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    daemon.advertise("tcp://conch.example.test:7421").unwrap();
+    daemon.advertise("wss://conch.example.test/swarm").unwrap();
+    let tcp = daemon.start(loopback()).await.unwrap();
+    let http = daemon.start_http(loopback()).await.unwrap();
+    let listen: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(data.path().join("listen.json")).unwrap()).unwrap();
+    assert!(listen["tcp"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|endpoint| endpoint == &format!("tcp://{}", tcp.addr())));
+    assert!(listen["swarm"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|endpoint| endpoint == &format!("ws://{}/swarm", http.addr())));
+
+    let ticket = daemon
+        .create_ticket("advertised", StakePolicy::default(), FloorConfig::stick(30))
+        .unwrap();
+    assert_eq!(ticket.peers[0], "tcp://conch.example.test:7421");
+    assert_eq!(ticket.trackers[0], "wss://conch.example.test/swarm");
+}
+
 fn loopback() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
 }

@@ -221,6 +221,19 @@ pub struct CloseTake {
     pub blobs: Vec<BlobRef>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GetBlob {
+    pub sha256: Hash32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobMeta {
+    pub sha256: Hash32,
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "typ", rename_all = "snake_case")]
 pub enum SwarmMsg {
@@ -240,6 +253,8 @@ pub enum SwarmMsg {
     Intent(Intent),
     Freeze(Freeze),
     CloseTake(CloseTake),
+    GetBlob(GetBlob),
+    BlobMeta(BlobMeta),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

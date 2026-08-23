@@ -169,6 +169,7 @@ impl Server {
                 ClientRequest::History {
                     room: room()?,
                     from_n: arguments.optional_u64("from").unwrap_or(0),
+                    follow: false,
                 },
                 None,
             ),

@@ -12,21 +12,22 @@ use conch_core::{
     apply::{apply, ApplyMode},
     client::{ClientReply, ClientRequest},
     consensus::{
-        advance_term, begin_campaign, tail, AdvanceSource, CloseTake, ConsensusError, GetScenes,
-        HaveMessage, Hello, SwarmMsg,
+        advance_term, begin_campaign, tail, up_to_date, AdvanceSource, Append, BlobMeta,
+        CertMessage, CloseTake, ConsensusError, GetScenes, HaveMessage, Hello, Nack, RequestVote,
+        SwarmMsg, Vote,
     },
     disk::{Replay, Store, StoreError},
-    encoding::{cert_digest, scene_hash, sign},
+    encoding::{cert_digest, scene_hash, sign, signed_object_digest, verify},
     floor::{FloorEngine, FloorError, SpeakAck, TakeBuffer, TakePhase},
     frame::{self, FrameError, MAX_FRAME_BYTES},
-    ticket::{Declaration, JoinRole, Ticket, TicketError},
+    ticket::{eligible, Declaration, JoinRole, Ticket, TicketError},
     types::{
-        AgentId, BlobRef, Body, Cert, ChainState, CommitProof, CommittedScene, ConsensusRole,
-        ConsensusState, FloorConfig, FloorMode, GrantReason, Hash32, Intent, IntentKind, Mouth,
-        NodeId, RoomId, Scene, SignatureBytes, StakePolicy,
+        AgentId, BlobRef, Body, Cert, CertSigner, ChainState, CommitProof, CommittedScene,
+        ConsensusRole, ConsensusState, FloorConfig, FloorMode, GrantReason, Hash32, Intent,
+        IntentKind, Mouth, NodeId, Pending, RoomId, Scene, SignatureBytes, StakePolicy,
     },
 };
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::random;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
@@ -83,6 +84,10 @@ pub enum DaemonError {
     NotModerator,
     #[error("a roster member cannot join as an observer before it is removed")]
     InvalidJoinRole,
+    #[error("invalid advertised endpoint: {0}")]
+    InvalidEndpoint(String),
+    #[error("a verified peer already committed a newer head")]
+    RecoveredHead,
 }
 
 #[derive(Clone)]
@@ -100,6 +105,7 @@ struct Inner {
     agents: RwLock<BTreeSet<AgentId>>,
     addrs: RwLock<Vec<String>>,
     trackers: RwLock<Vec<String>>,
+    peers: RwLock<BTreeMap<NodeId, Vec<String>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -110,10 +116,23 @@ struct LocalJoin {
     token: Option<Hash32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListenConfig {
+    tcp: Vec<String>,
+    swarm: Vec<String>,
+}
+
 struct RoomFloor {
     engine: Mutex<FloorEngine>,
     mutation: AsyncMutex<()>,
     changed: Notify,
+}
+
+enum AppendResponse {
+    Cert(CertMessage),
+    Nack(Nack),
+    Refused,
 }
 
 pub struct RunningServer {
@@ -154,6 +173,10 @@ impl Daemon {
         let mut replays = BTreeMap::new();
         let mut floors = BTreeMap::new();
         let mut joins = BTreeMap::new();
+        let peers = fs::read(data_dir.join("peers.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
         for entry in fs::read_dir(data_dir.join("rooms"))? {
             let Ok(entry) = entry else {
                 continue;
@@ -204,6 +227,7 @@ impl Daemon {
                 agents: RwLock::new(BTreeSet::new()),
                 addrs: RwLock::new(Vec::new()),
                 trackers: RwLock::new(Vec::new()),
+                peers: RwLock::new(peers),
             }),
         })
     }
@@ -401,6 +425,7 @@ impl Daemon {
             .write()
             .expect("join registry lock is not poisoned")
             .insert(room, local_join);
+        self.write_current_room(room)?;
         Ok(ticket)
     }
 
@@ -415,7 +440,7 @@ impl Daemon {
     pub async fn start(&self, addr: SocketAddr) -> Result<RunningServer, DaemonError> {
         let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
-        self.remember_addr(addr);
+        self.remember_addr(addr)?;
         let daemon = self.clone();
         let task = tokio::spawn(async move { daemon.serve_listener(listener).await });
         Ok(RunningServer { addr, task })
@@ -423,11 +448,11 @@ impl Daemon {
 
     pub async fn serve(&self, addr: SocketAddr) -> Result<(), DaemonError> {
         let listener = TcpListener::bind(addr).await?;
-        self.remember_addr(listener.local_addr()?);
+        self.remember_addr(listener.local_addr()?)?;
         self.clone().serve_listener(listener).await
     }
 
-    fn remember_addr(&self, mut addr: SocketAddr) {
+    fn remember_addr(&self, mut addr: SocketAddr) -> Result<(), DaemonError> {
         if addr.ip().is_unspecified() {
             addr.set_ip("127.0.0.1".parse().expect("loopback address is valid"));
         }
@@ -440,9 +465,11 @@ impl Daemon {
         if !addrs.contains(&endpoint) {
             addrs.push(endpoint);
         }
+        drop(addrs);
+        self.persist_listen()
     }
 
-    pub(crate) fn remember_http_addr(&self, mut addr: SocketAddr) {
+    pub(crate) fn remember_http_addr(&self, mut addr: SocketAddr) -> Result<(), DaemonError> {
         if addr.ip().is_unspecified() {
             addr.set_ip("127.0.0.1".parse().expect("loopback address is valid"));
         }
@@ -455,6 +482,69 @@ impl Daemon {
         if !trackers.contains(&endpoint) {
             trackers.push(endpoint);
         }
+        drop(trackers);
+        self.persist_listen()
+    }
+
+    pub fn advertise(&self, endpoint: &str) -> Result<(), DaemonError> {
+        let target = if endpoint.starts_with("tcp://") || endpoint.starts_with("tcps://") {
+            &self.inner.addrs
+        } else if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+            &self.inner.trackers
+        } else {
+            return Err(DaemonError::InvalidEndpoint(endpoint.to_owned()));
+        };
+        let mut endpoints = target.write().expect("endpoint lock is not poisoned");
+        let endpoint = endpoint.to_owned();
+        if !endpoints.contains(&endpoint) {
+            endpoints.push(endpoint);
+        }
+        drop(endpoints);
+        self.persist_listen()
+    }
+
+    fn persist_listen(&self) -> Result<(), DaemonError> {
+        let listen = ListenConfig {
+            tcp: self
+                .inner
+                .addrs
+                .read()
+                .expect("address registry lock is not poisoned")
+                .clone(),
+            swarm: self
+                .inner
+                .trackers
+                .read()
+                .expect("tracker registry lock is not poisoned")
+                .clone(),
+        };
+        write_json_atomic(&self.inner.data_dir.join("listen.json"), &listen)
+    }
+
+    fn remember_peer(&self, hello: &Hello) -> Result<(), DaemonError> {
+        if hello.node == self.node_id() || hello.addrs.is_empty() {
+            return Ok(());
+        }
+        let mut peers = self.inner.peers.write().expect("peer lock is not poisoned");
+        let endpoints = peers.entry(hello.node).or_default();
+        for endpoint in &hello.addrs {
+            if !endpoints.contains(endpoint) {
+                endpoints.push(endpoint.clone());
+            }
+        }
+        let snapshot = peers.clone();
+        drop(peers);
+        write_json_atomic(&self.inner.data_dir.join("peers.json"), &snapshot)
+    }
+
+    fn peer_endpoints(&self, node: NodeId) -> Vec<String> {
+        self.inner
+            .peers
+            .read()
+            .expect("peer lock is not poisoned")
+            .get(&node)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub async fn sync_room_from(
@@ -496,7 +586,8 @@ impl Daemon {
         let remote = read_message(&mut stream)
             .await?
             .ok_or(DaemonError::Protocol("peer closed before hello"))?;
-        validate_hello(remote)?;
+        let remote = validate_hello(remote)?;
+        self.remember_peer(&remote)?;
         if let Some(token) = token {
             write_message(
                 &mut stream,
@@ -537,6 +628,9 @@ impl Daemon {
                 let record = loop {
                     match read_message(&mut stream).await? {
                         Some(SwarmMsg::Scene(record)) if record.scene.room == room => break record,
+                        Some(SwarmMsg::BlobMeta(meta)) => {
+                            self.receive_blob_into(room, meta, &mut stream).await?;
+                        }
                         Some(_) => continue,
                         None => {
                             return Err(DaemonError::Protocol(
@@ -578,6 +672,59 @@ impl Daemon {
         }
     }
 
+    async fn receive_blob_into(
+        &self,
+        room: RoomId,
+        meta: BlobMeta,
+        stream: &mut (impl AsyncRead + Unpin),
+    ) -> Result<(), DaemonError> {
+        if meta.bytes > MAX_BLOB_BYTES {
+            return Err(DaemonError::Protocol("blob exceeds the 32 MiB limit"));
+        }
+        let length = stream.read_u32().await? as u64;
+        if length != meta.bytes {
+            return Err(DaemonError::Protocol(
+                "blob frame length does not match metadata",
+            ));
+        }
+        let mut bytes = vec![0_u8; length as usize];
+        stream.read_exact(&mut bytes).await?;
+        let actual = Hash32::from_bytes(Sha256::digest(&bytes).into());
+        if actual != meta.sha256 {
+            return Err(DaemonError::Protocol("blob digest does not match metadata"));
+        }
+        self.store(room)?.put_blob(&bytes)?;
+        Ok(())
+    }
+
+    async fn send_scene_blobs(
+        &self,
+        stream: &mut (impl AsyncWrite + Unpin),
+        scene: &Scene,
+    ) -> Result<(), DaemonError> {
+        let store = self.store(scene.room)?;
+        for blob in scene_blobs(scene) {
+            let bytes = store.read_blob(blob.sha256)?;
+            if bytes.len() as u64 != blob.bytes
+                || Hash32::from_bytes(Sha256::digest(&bytes).into()) != blob.sha256
+            {
+                return Err(DaemonError::Protocol("local blob failed verification"));
+            }
+            write_message(
+                stream,
+                &SwarmMsg::BlobMeta(BlobMeta {
+                    sha256: blob.sha256,
+                    bytes: blob.bytes,
+                }),
+            )
+            .await?;
+            stream.write_u32(bytes.len() as u32).await?;
+            stream.write_all(&bytes).await?;
+            stream.flush().await?;
+        }
+        Ok(())
+    }
+
     pub async fn join_ticket(
         &self,
         ticket: Ticket,
@@ -591,6 +738,7 @@ impl Daemon {
         if let Some(chain) =
             task::spawn_blocking(move || daemon.prepare_join(&prepared_ticket, role)).await??
         {
+            self.write_current_room(room)?;
             return Ok(chain);
         }
 
@@ -628,6 +776,7 @@ impl Daemon {
                         let store = self.store(room)?;
                         let canonical = canonical_ticket(&ticket, &replay)?;
                         task::spawn_blocking(move || write_ticket(&store, &canonical)).await??;
+                        self.write_current_room(room)?;
                         return Ok(chain);
                     }
                     Ok(Err(error @ DaemonError::BadTicket(_))) => pinned_failure = Some(error),
@@ -671,6 +820,7 @@ impl Daemon {
                 let store = self.store(room)?;
                 let canonical = canonical_ticket(&ticket, &replay)?;
                 task::spawn_blocking(move || write_ticket(&store, &canonical)).await??;
+                self.write_current_room(room)?;
                 return Ok(chain);
             }
         }
@@ -748,6 +898,10 @@ impl Daemon {
         Ok(())
     }
 
+    fn write_current_room(&self, room: RoomId) -> Result<(), DaemonError> {
+        write_json_atomic(&self.inner.data_dir.join("current-room"), &room)
+    }
+
     async fn serve_listener(self, listener: TcpListener) -> Result<(), DaemonError> {
         let mut connections = JoinSet::new();
         loop {
@@ -815,8 +969,11 @@ impl Daemon {
         hello: SwarmMsg,
     ) -> Result<(), DaemonError> {
         let peer = validate_hello(hello)?;
+        self.remember_peer(&peer)?;
         write_message(&mut stream, &SwarmMsg::Hello(self.hello())).await?;
+        let _ = self.admit_declared_stakers(&peer).await;
         let mut authed = BTreeSet::new();
+        let mut offered_blobs = BTreeMap::new();
         for have in self.haves(&authed)? {
             write_message(&mut stream, &SwarmMsg::Have(have)).await?;
         }
@@ -843,7 +1000,68 @@ impl Daemon {
                     for record in replay.history.iter().filter(|record| {
                         record.scene.n >= request.from_n && record.scene.n <= request.to_n
                     }) {
+                        self.send_scene_blobs(&mut stream, &record.scene).await?;
                         write_message(&mut stream, &SwarmMsg::Scene(record.clone())).await?;
+                    }
+                }
+                SwarmMsg::BlobMeta(meta) => {
+                    if meta.bytes > MAX_BLOB_BYTES {
+                        return Err(DaemonError::Protocol("blob exceeds the 32 MiB limit"));
+                    }
+                    let length = stream.read_u32().await? as u64;
+                    if length != meta.bytes {
+                        return Err(DaemonError::Protocol(
+                            "blob frame length does not match metadata",
+                        ));
+                    }
+                    let mut bytes = vec![0_u8; length as usize];
+                    stream.read_exact(&mut bytes).await?;
+                    let actual = Hash32::from_bytes(Sha256::digest(&bytes).into());
+                    if actual != meta.sha256 {
+                        return Err(DaemonError::Protocol("blob digest does not match metadata"));
+                    }
+                    offered_blobs.insert(meta.sha256, bytes);
+                }
+                SwarmMsg::RequestVote(request) => {
+                    let declared = peer
+                        .decl
+                        .iter()
+                        .any(|declaration| declaration.room == request.room);
+                    if declared
+                        && self.room_authorized(request.room, &authed)?
+                        && request.candidate == peer.node
+                    {
+                        if let Some(vote) = self.accept_request_vote(&request)? {
+                            write_message(&mut stream, &SwarmMsg::Vote(vote)).await?;
+                        }
+                    }
+                }
+                SwarmMsg::Append(append) => {
+                    let declared = peer
+                        .decl
+                        .iter()
+                        .any(|declaration| declaration.room == append.room);
+                    if declared
+                        && self.room_authorized(append.room, &authed)?
+                        && append.leader == peer.node
+                    {
+                        let store = self.store(append.room)?;
+                        for blob in scene_blobs(&append.scene) {
+                            if store.read_blob(blob.sha256).is_err() {
+                                if let Some(bytes) = offered_blobs.remove(&blob.sha256) {
+                                    store.put_blob(&bytes)?;
+                                }
+                            }
+                        }
+                        match self.accept_append_with_role(&append, false)? {
+                            AppendResponse::Cert(cert) => {
+                                write_message(&mut stream, &SwarmMsg::Cert(cert)).await?;
+                            }
+                            AppendResponse::Nack(nack) => {
+                                write_message(&mut stream, &SwarmMsg::Nack(nack)).await?;
+                            }
+                            AppendResponse::Refused => {}
+                        }
                     }
                 }
                 SwarmMsg::Scene(record) => {
@@ -855,6 +1073,14 @@ impl Daemon {
                 SwarmMsg::Commit(commit) => {
                     if !self.room_authorized(commit.room, &authed)? {
                         continue;
+                    }
+                    let store = self.store(commit.room)?;
+                    for blob in scene_blobs(&commit.scene) {
+                        if store.read_blob(blob.sha256).is_err() {
+                            if let Some(bytes) = offered_blobs.remove(&blob.sha256) {
+                                store.put_blob(&bytes)?;
+                            }
+                        }
                     }
                     let proof = commit.proof();
                     let record = CommittedScene {
@@ -896,6 +1122,195 @@ impl Daemon {
         Ok(())
     }
 
+    fn accept_request_vote(&self, request: &RequestVote) -> Result<Option<Vote>, DaemonError> {
+        let room = request.room;
+        let stakes = self
+            .inner
+            .joins
+            .read()
+            .expect("join registry lock is not poisoned")
+            .get(&room)
+            .is_some_and(|join| join.role == JoinRole::Stake);
+        let store = self.store(room)?;
+        let entry = self.replay_entry(room)?;
+        let mut replay = entry.lock().expect("replay lock is not poisoned");
+        let node = self.node_id();
+        if !stakes
+            || !replay.chain.roster.contains(&node)
+            || !replay.chain.roster.contains(&request.candidate)
+            || !valid_request_vote(request)
+        {
+            return Ok(None);
+        }
+        if request.rpc_term > replay.consensus.current_term {
+            let pending = replay.pending.clone();
+            let head_proof = replay.head_proof.clone();
+            if advance_term(
+                &mut replay.consensus,
+                pending.as_ref(),
+                head_proof.as_ref(),
+                AdvanceSource::RosterMessage(request.rpc_term),
+            ) {
+                store.write_consensus(&replay.consensus)?;
+            }
+        }
+        if request.rpc_term != replay.consensus.current_term
+            || replay
+                .consensus
+                .voted_for
+                .is_some_and(|voted| voted != request.candidate)
+        {
+            return Ok(None);
+        }
+        let local_tail = tail(
+            replay.pending.as_ref(),
+            replay.chain.head_n.zip(replay.chain.head_hash),
+            replay.head_proof.as_ref(),
+        )?;
+        if !up_to_date(&request.tail(), &local_tail) {
+            return Ok(None);
+        }
+        replay.consensus.voted_for = Some(request.candidate);
+        replay.consensus.role = ConsensusRole::Follower;
+        replay.consensus.leader_id = None;
+        store.write_consensus(&replay.consensus)?;
+        let mut vote = Vote {
+            room,
+            rpc_term: request.rpc_term,
+            voter: node,
+            candidate: request.candidate,
+            last_n: local_tail.last_n,
+            last_hash: local_tail.last_hash,
+            last_rpc: local_tail.last_rpc,
+            grant: true,
+            sig: SignatureBytes::from_bytes([0; 64]),
+        };
+        vote.sig = SignatureBytes::from_bytes(sign(
+            &self.inner.node_key,
+            &signed_object_digest(&serde_json::to_value(&vote)?),
+        ));
+        Ok(Some(vote))
+    }
+
+    fn accept_append_with_role(
+        &self,
+        append: &Append,
+        preserve_leader: bool,
+    ) -> Result<AppendResponse, DaemonError> {
+        let room = append.room;
+        let stakes = self
+            .inner
+            .joins
+            .read()
+            .expect("join registry lock is not poisoned")
+            .get(&room)
+            .is_some_and(|join| join.role == JoinRole::Stake);
+        let store = self.store(room)?;
+        let floor = self.floor(room)?;
+        let entry = self.replay_entry(room)?;
+        let mut replay = entry.lock().expect("replay lock is not poisoned");
+        let node = self.node_id();
+        if !stakes
+            || !replay.chain.roster.contains(&node)
+            || !replay.chain.roster.contains(&append.leader)
+            || append.scene.room != room
+        {
+            return Ok(AppendResponse::Refused);
+        }
+        if append.rpc_term > replay.consensus.current_term {
+            let pending = replay.pending.clone();
+            let head_proof = replay.head_proof.clone();
+            if advance_term(
+                &mut replay.consensus,
+                pending.as_ref(),
+                head_proof.as_ref(),
+                AdvanceSource::RosterMessage(append.rpc_term),
+            ) {
+                store.write_consensus(&replay.consensus)?;
+            }
+        }
+        if append.rpc_term != replay.consensus.current_term {
+            return Ok(AppendResponse::Refused);
+        }
+        if !preserve_leader {
+            replay.consensus.role = ConsensusRole::Follower;
+            replay.consensus.leader_id = Some(append.leader);
+        }
+        if replay.chain.head_n != Some(append.prev_n)
+            || replay.chain.head_hash != Some(append.prev_hash)
+        {
+            let have = have_from_replay(room, &replay)?;
+            return Ok(AppendResponse::Nack(Nack {
+                room,
+                have_n: have.n,
+                have_hash: have.hash,
+                have_rpc: have.rpc_term,
+            }));
+        }
+
+        let hash = hash_scene(&append.scene);
+        if let Some(pending) = &replay.pending {
+            if pending.hash == hash {
+                if append.rpc_term < pending.accepted_rpc_term
+                    || (append.rpc_term == pending.accepted_rpc_term
+                        && append.leader != pending.accepted_leader)
+                {
+                    return Ok(AppendResponse::Refused);
+                }
+                if append.rpc_term == pending.accepted_rpc_term {
+                    return Ok(AppendResponse::Cert(cert_message_from_pending(pending)?));
+                }
+            } else if append.rpc_term <= pending.accepted_rpc_term {
+                return Ok(AppendResponse::Refused);
+            }
+        }
+        let carry_forward = replay
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.hash == hash);
+        if !carry_forward {
+            let mut resources = store.load_blob_inventory()?;
+            resources.intents = floor
+                .engine
+                .lock()
+                .expect("floor lock is not poisoned")
+                .intents()
+                .cloned()
+                .collect();
+            apply(
+                &replay.chain,
+                &append.scene,
+                None,
+                ApplyMode::Precert(&resources),
+            )?;
+        }
+        let digest = cert_digest(
+            &room,
+            append.scene.n,
+            hash.as_bytes(),
+            append.rpc_term,
+            &append.leader,
+            &node,
+        );
+        let cert = Cert::node(
+            node,
+            SignatureBytes::from_bytes(sign(&self.inner.node_key, &digest)),
+        );
+        let pending = Pending {
+            n: append.scene.n,
+            hash,
+            scene: append.scene.clone(),
+            accepted_rpc_term: append.rpc_term,
+            accepted_leader: append.leader,
+            cert,
+        };
+        store.write_consensus(&replay.consensus)?;
+        store.write_pending(&pending)?;
+        let message = cert_message_from_pending(&pending)?;
+        replay.pending = Some(pending);
+        Ok(AppendResponse::Cert(message))
+    }
+
     async fn handle_client_connection(
         &self,
         mut stream: impl AsyncRead + AsyncWrite + Unpin + Send,
@@ -928,6 +1343,14 @@ impl Daemon {
                     continue;
                 }
             };
+            if let ClientRequest::History {
+                room,
+                from_n,
+                follow: true,
+            } = request
+            {
+                return self.stream_history(&mut stream, room, from_n).await;
+            }
             let reply = if let ClientRequest::PutBlob { room, name, bytes } = request {
                 if bytes > MAX_BLOB_BYTES {
                     ClientReply::failure("invalid", "blob exceeds the 32 MiB limit")
@@ -951,6 +1374,43 @@ impl Daemon {
                 self.execute_client(agent.clone(), request).await
             };
             write_frame(&mut stream, &reply).await?;
+        }
+        Ok(())
+    }
+
+    async fn admit_declared_stakers(&self, peer: &Hello) -> Result<(), DaemonError> {
+        for declaration in &peer.decl {
+            if declaration.role != JoinRole::Stake {
+                continue;
+            }
+            let Ok(floor) = self.floor(declaration.room) else {
+                continue;
+            };
+            let _mutation = floor.mutation.lock().await;
+            let replay = self.replay(declaration.room)?;
+            let Some(policy) = replay.chain.stake.as_ref() else {
+                continue;
+            };
+            if replay.chain.live_grant.is_some()
+                || replay.chain.roster.contains(&peer.node)
+                || !eligible(policy, peer.node, declaration.role, &declaration.agents)
+            {
+                continue;
+            }
+            let mut next_roster = replay.chain.roster.clone();
+            next_roster.push(peer.node);
+            next_roster.sort_unstable();
+            self.commit_singleton_body(
+                declaration.room,
+                Body::ViewChange {
+                    add: vec![peer.node],
+                    remove: Vec::new(),
+                    next_roster,
+                    closes_grant: None,
+                },
+                &floor,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1010,7 +1470,11 @@ impl Daemon {
             ClientRequest::PutBlob { .. } => Err(DaemonError::Protocol(
                 "put_blob requires a following raw frame",
             )),
-            ClientRequest::History { room, from_n } => self.replay(room).and_then(|replay| {
+            ClientRequest::History {
+                room,
+                from_n,
+                follow: false,
+            } => self.replay(room).and_then(|replay| {
                 serde_json::to_value(
                     replay
                         .history
@@ -1022,9 +1486,45 @@ impl Daemon {
             }),
             ClientRequest::Status { room } => self.client_status(room),
             ClientRequest::Attach { .. } => Err(DaemonError::Protocol("duplicate attach")),
+            ClientRequest::History { follow: true, .. } => {
+                Err(DaemonError::Protocol("follow must use the streaming path"))
+            }
         };
 
         result.map_or_else(client_error_reply, ClientReply::success)
+    }
+
+    async fn stream_history(
+        &self,
+        stream: &mut (impl AsyncWrite + Unpin),
+        room: RoomId,
+        mut from_n: u64,
+    ) -> Result<(), DaemonError> {
+        let floor = self.floor(room)?;
+        loop {
+            let changed = floor.changed.notified();
+            let records = self
+                .replay(room)?
+                .history
+                .into_iter()
+                .filter(|record| record.scene.n >= from_n)
+                .collect::<Vec<_>>();
+            if records.is_empty() {
+                changed.await;
+                continue;
+            }
+            from_n = records
+                .last()
+                .expect("non-empty history batch")
+                .scene
+                .n
+                .saturating_add(1);
+            write_frame(
+                stream,
+                &ClientReply::success(serde_json::to_value(records)?),
+            )
+            .await?;
+        }
     }
 
     async fn client_wait_for_floor(
@@ -1327,23 +1827,74 @@ impl Daemon {
 
     async fn client_leave(
         &self,
-        _agent: AgentId,
+        agent: AgentId,
         room: RoomId,
-        _vacate: bool,
+        vacate: bool,
     ) -> Result<Value, DaemonError> {
-        let replay = self.replay(room)?;
-        if replay.chain.roster.contains(&self.node_id()) {
-            return Err(DaemonError::MutationUnavailable);
+        let floor = self.floor(room)?;
+        let _mutation = floor.mutation.lock().await;
+        let mut replay = self.replay(room)?;
+        let node = self.node_id();
+        if replay.chain.roster.contains(&node) {
+            if let Some(grant) = replay.chain.live_grant.clone() {
+                let mouth = Mouth { agent, node };
+                if !vacate || grant.to != mouth {
+                    return Err(DaemonError::MutationUnavailable);
+                }
+                let (frozen, take) = {
+                    let mut engine = floor.engine.lock().expect("floor lock is not poisoned");
+                    let frozen = engine.freeze(room, grant.hash)?;
+                    let take = engine.take().expect("freeze preserves take").clone();
+                    (frozen, take)
+                };
+                let store = self.store(room)?;
+                task::spawn_blocking(move || write_take(&store, &take)).await??;
+                self.commit_singleton_body(
+                    room,
+                    Body::Speech {
+                        closes_grant: frozen.grant_hash,
+                        text: frozen.text,
+                        blobs: frozen.blobs,
+                    },
+                    &floor,
+                )
+                .await?;
+                replay = self.replay(room)?;
+            }
+            let mut next_roster = replay.chain.roster.clone();
+            next_roster.retain(|member| *member != node);
+            if next_roster.is_empty() {
+                return Err(DaemonError::MutationUnavailable);
+            }
+            let record = self
+                .commit_singleton_body(
+                    room,
+                    Body::ViewChange {
+                        add: Vec::new(),
+                        remove: vec![node],
+                        next_roster,
+                        closes_grant: None,
+                    },
+                    &floor,
+                )
+                .await?;
+            let join = LocalJoin {
+                role: JoinRole::Observe,
+                token: self.room_token(room),
+            };
+            let store = self.store(room)?;
+            let persisted = join.clone();
+            task::spawn_blocking(move || write_local_join(&store, &persisted)).await??;
+            self.inner
+                .joins
+                .write()
+                .expect("join registry lock is not poisoned")
+                .insert(room, join);
+            return Ok(serde_json::to_value(record.scene)?);
         }
         let join = LocalJoin {
             role: JoinRole::Observe,
-            token: self
-                .inner
-                .joins
-                .read()
-                .expect("join registry lock is not poisoned")
-                .get(&room)
-                .and_then(|join| join.token),
+            token: self.room_token(room),
         };
         let store = self.store(room)?;
         let persisted = join.clone();
@@ -1394,8 +1945,21 @@ impl Daemon {
                     && !replay.chain.consumed_intents.contains(&intent.id)
             })
             .cloned();
+        let accepted_intent =
+            replay
+                .pending
+                .as_ref()
+                .and_then(|pending| match &pending.scene.body {
+                    Body::Grant { to, intent_id, .. } if to.agent == agent && to.node == node => {
+                        Some(*intent_id)
+                    }
+                    _ => None,
+                });
         let replaced = existing.as_ref().map(|intent| intent.id);
         let (id, ts, kind) = match (kind, existing.as_ref()) {
+            (_, Some(intent)) if accepted_intent == Some(intent.id) => {
+                (intent.id, intent.ts, intent.kind)
+            }
             (IntentKind::Wait, Some(intent)) => (intent.id, intent.ts, intent.kind),
             (_, Some(intent)) => (
                 Hash32::from_bytes(random::<[u8; 32]>()),
@@ -1434,6 +1998,7 @@ impl Daemon {
             .expect("upserted intent is present");
         let store = self.store(room)?;
         let prior = replaced.filter(|prior| *prior != id);
+        let gossip = stored.clone();
         task::spawn_blocking(move || -> Result<(), StoreError> {
             store.write_intent(&stored)?;
             if let Some(prior) = prior {
@@ -1442,6 +2007,7 @@ impl Daemon {
             Ok(())
         })
         .await??;
+        self.broadcast_intent(&gossip).await;
         self.maybe_grant_next_locked(room, &floor).await?;
         Ok(id)
     }
@@ -1480,8 +2046,31 @@ impl Daemon {
             Ok(())
         })
         .await??;
-        self.maybe_grant_next_locked(room, &floor).await?;
+        let replay = self.replay(room)?;
+        if replay.consensus.role == ConsensusRole::Leader
+            && replay.consensus.leader_id == Some(self.node_id())
+        {
+            self.maybe_grant_next_locked(room, &floor).await?;
+        }
         Ok(())
+    }
+
+    async fn broadcast_intent(&self, intent: &Intent) {
+        let Ok(replay) = self.replay(intent.room) else {
+            return;
+        };
+        for peer in replay
+            .chain
+            .roster
+            .iter()
+            .copied()
+            .filter(|peer| *peer != self.node_id())
+        {
+            let Ok(mut stream) = self.connect_known_peer(peer, intent.room).await else {
+                continue;
+            };
+            let _ = write_message(&mut stream, &SwarmMsg::Intent(intent.clone())).await;
+        }
     }
 
     async fn receive_freeze(
@@ -1631,6 +2220,13 @@ impl Daemon {
             {
                 return Ok(());
             }
+            if replay
+                .consensus
+                .leader_id
+                .is_some_and(|leader| leader != self.node_id())
+            {
+                return Ok(());
+            }
             let intent = floor
                 .engine
                 .lock()
@@ -1664,10 +2260,414 @@ impl Daemon {
         body: Body,
         floor: &Arc<RoomFloor>,
     ) -> Result<CommittedScene, DaemonError> {
-        let daemon = self.clone();
-        let floor = Arc::clone(floor);
-        task::spawn_blocking(move || daemon.commit_singleton_body_blocking(room, body, &floor))
-            .await?
+        loop {
+            if self.replay(room)?.chain.roster.len() == 1 {
+                let daemon = self.clone();
+                let floor = Arc::clone(floor);
+                let body = body.clone();
+                return task::spawn_blocking(move || {
+                    daemon.commit_singleton_body_blocking(room, body, &floor)
+                })
+                .await?;
+            }
+            match self
+                .commit_distributed_body(room, body.clone(), floor)
+                .await
+            {
+                Err(DaemonError::RecoveredHead) => continue,
+                result => return result,
+            }
+        }
+    }
+
+    async fn commit_distributed_body(
+        &self,
+        room: RoomId,
+        body: Body,
+        floor: &RoomFloor,
+    ) -> Result<CommittedScene, DaemonError> {
+        if !self.can_certify(room)? {
+            return Err(FloorError::NotStaker.into());
+        }
+        let node = self.node_id();
+        let rpc_term = self.ensure_network_leader(room).await?;
+        let replay = self.replay(room)?;
+        if replay.consensus.current_term != rpc_term
+            || replay.consensus.role != ConsensusRole::Leader
+            || replay.consensus.leader_id != Some(node)
+        {
+            return Err(DaemonError::MutationUnavailable);
+        }
+
+        for peer in replay
+            .chain
+            .roster
+            .iter()
+            .copied()
+            .filter(|peer| *peer != node)
+        {
+            if let Ok(Some(have)) = self.probe_peer(peer, room).await {
+                let local_n = replay.chain.head_n.expect("committed room has a head");
+                let resolves_pending = replay
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| have.n == pending.n && have.hash == pending.hash);
+                if have.n > local_n || resolves_pending {
+                    self.sync_from_known_peer(peer, room).await?;
+                    return Err(DaemonError::RecoveredHead);
+                }
+            }
+        }
+
+        let scene = replay.pending.as_ref().map_or_else(
+            || Scene {
+                v: 1,
+                room,
+                n: replay.chain.head_n.expect("non-genesis scene has head") + 1,
+                term: rpc_term,
+                parent: replay.chain.head_hash,
+                roster: replay.chain.roster.clone(),
+                leader: node,
+                ts: unix_timestamp(),
+                body,
+                certs: Vec::new(),
+            },
+            |pending| pending.scene.clone(),
+        );
+        let append = Append {
+            room,
+            rpc_term,
+            leader: node,
+            prev_n: replay.chain.head_n.expect("committed room has a head"),
+            prev_hash: replay.chain.head_hash.expect("committed room has a hash"),
+            scene: scene.clone(),
+        };
+        let self_cert = match self.accept_append_with_role(&append, true)? {
+            AppendResponse::Cert(cert) => cert,
+            _ => return Err(DaemonError::MutationUnavailable),
+        };
+        let mut certs = BTreeMap::from([(self_cert.node, self_cert)]);
+        for peer in scene.roster.iter().copied().filter(|peer| *peer != node) {
+            let Ok(response) = self.send_append(peer, &append).await else {
+                continue;
+            };
+            match response {
+                AppendResponse::Cert(cert) if valid_cert_message(&cert, &scene, rpc_term, node) => {
+                    certs.entry(cert.node).or_insert(cert);
+                }
+                AppendResponse::Nack(nack) if nack.have_n > append.prev_n => {
+                    self.sync_from_known_peer(peer, room).await?;
+                    return Err(DaemonError::RecoveredHead);
+                }
+                AppendResponse::Nack(_) | AppendResponse::Refused | AppendResponse::Cert(_) => {}
+            }
+        }
+        if certs.len() < majority(scene.roster.len()) {
+            self.demote_local_leader(room)?;
+            return Err(DaemonError::MutationUnavailable);
+        }
+        let current = self.replay(room)?;
+        if current.consensus.current_term != rpc_term
+            || current.consensus.role != ConsensusRole::Leader
+            || current.consensus.leader_id != Some(node)
+        {
+            return Err(DaemonError::MutationUnavailable);
+        }
+        let proof = CommitProof {
+            rpc_term,
+            leader: node,
+            certs: certs.values().map(CertMessage::as_cert).collect(),
+        };
+        let store = self.store(room)?;
+        let chain = store.persist_committed_scene(&current.chain, &scene, &proof)?;
+        store.unlink_pending_if_stale(chain.head_n)?;
+        let record = CommittedScene {
+            scene: scene.clone(),
+            commit_proof: proof.clone(),
+        };
+        self.finish_singleton_commit(
+            room,
+            &store,
+            chain.clone(),
+            record.clone(),
+            current.consensus,
+            floor,
+        )?;
+        let commit = conch_core::consensus::CommitMessage {
+            room,
+            n: scene.n,
+            hash: hash_scene(&scene),
+            rpc_term,
+            leader: node,
+            certs: proof.certs,
+            scene,
+        };
+        for peer in current
+            .chain
+            .roster
+            .iter()
+            .copied()
+            .filter(|peer| *peer != node)
+        {
+            let _ = self.push_commit(peer, &commit).await;
+        }
+        if !chain.roster.contains(&node) {
+            self.demote_local_leader(room)?;
+        }
+        Ok(record)
+    }
+
+    async fn ensure_network_leader(&self, room: RoomId) -> Result<u64, DaemonError> {
+        let replay = self.replay(room)?;
+        let node = self.node_id();
+        if replay.consensus.role == ConsensusRole::Leader
+            && replay.consensus.leader_id == Some(node)
+            && replay.chain.roster.contains(&node)
+        {
+            return Ok(replay.consensus.current_term);
+        }
+        let store = self.store(room)?;
+        let local_tail = tail(
+            replay.pending.as_ref(),
+            replay.chain.head_n.zip(replay.chain.head_hash),
+            replay.head_proof.as_ref(),
+        )?;
+        let mut consensus = replay.consensus;
+        let rpc_term = begin_campaign(&mut consensus, node, &replay.chain.roster, local_tail)?;
+        store.write_consensus(&consensus)?;
+        {
+            let entry = self.replay_entry(room)?;
+            entry.lock().expect("replay lock is not poisoned").consensus = consensus;
+        }
+        let mut request = RequestVote {
+            room,
+            rpc_term,
+            candidate: node,
+            last_n: local_tail.last_n,
+            last_hash: local_tail.last_hash,
+            last_rpc: local_tail.last_rpc,
+            sig: SignatureBytes::from_bytes([0; 64]),
+        };
+        request.sig = SignatureBytes::from_bytes(sign(
+            &self.inner.node_key,
+            &signed_object_digest(&serde_json::to_value(&request)?),
+        ));
+        let mut votes = BTreeSet::from([node]);
+        for peer in replay
+            .chain
+            .roster
+            .iter()
+            .copied()
+            .filter(|peer| *peer != node)
+        {
+            if let Ok(Some(vote)) = self.request_vote(peer, &request).await {
+                if valid_vote(&vote, &replay.chain.roster, node, rpc_term) {
+                    votes.insert(vote.voter);
+                }
+            }
+        }
+        if votes.len() < majority(replay.chain.roster.len()) {
+            return Err(DaemonError::MutationUnavailable);
+        }
+        let entry = self.replay_entry(room)?;
+        let mut replay = entry.lock().expect("replay lock is not poisoned");
+        if replay.consensus.current_term != rpc_term || replay.consensus.voted_for != Some(node) {
+            return Err(DaemonError::MutationUnavailable);
+        }
+        replay.consensus.role = ConsensusRole::Leader;
+        replay.consensus.leader_id = Some(node);
+        Ok(rpc_term)
+    }
+
+    fn demote_local_leader(&self, room: RoomId) -> Result<(), DaemonError> {
+        let entry = self.replay_entry(room)?;
+        let mut replay = entry.lock().expect("replay lock is not poisoned");
+        replay.consensus.role = ConsensusRole::Follower;
+        replay.consensus.leader_id = None;
+        Ok(())
+    }
+
+    async fn connect_known_peer(
+        &self,
+        peer: NodeId,
+        room: RoomId,
+    ) -> Result<TcpStream, DaemonError> {
+        for endpoint in self.peer_endpoints(peer) {
+            let Some(authority) = endpoint.strip_prefix("tcp://") else {
+                continue;
+            };
+            let Ok(addresses) = tokio::net::lookup_host(authority).await else {
+                continue;
+            };
+            for address in addresses {
+                let Ok(Ok(mut stream)) = timeout(SYNC_TIMEOUT, TcpStream::connect(address)).await
+                else {
+                    continue;
+                };
+                if write_message(&mut stream, &SwarmMsg::Hello(self.hello()))
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                let Ok(Some(message)) = timeout(SYNC_TIMEOUT, read_message(&mut stream))
+                    .await
+                    .map_err(|_| DaemonError::SyncTimeout)?
+                else {
+                    continue;
+                };
+                let Ok(remote) = validate_hello(message) else {
+                    continue;
+                };
+                if remote.node != peer {
+                    continue;
+                }
+                self.remember_peer(&remote)?;
+                if let Some(token) = self.room_token(room) {
+                    write_message(
+                        &mut stream,
+                        &SwarmMsg::Auth(conch_core::consensus::Auth { room, token }),
+                    )
+                    .await?;
+                }
+                return Ok(stream);
+            }
+        }
+        Err(DaemonError::MutationUnavailable)
+    }
+
+    fn room_token(&self, room: RoomId) -> Option<Hash32> {
+        self.inner
+            .joins
+            .read()
+            .expect("join registry lock is not poisoned")
+            .get(&room)
+            .and_then(|join| join.token)
+    }
+
+    async fn probe_peer(
+        &self,
+        peer: NodeId,
+        room: RoomId,
+    ) -> Result<Option<HaveMessage>, DaemonError> {
+        let mut stream = self.connect_known_peer(peer, room).await?;
+        let probe = async {
+            while let Some(message) = read_message(&mut stream).await? {
+                if let SwarmMsg::Have(have) = message {
+                    if have.room == room {
+                        return Ok(Some(have));
+                    }
+                }
+            }
+            Ok::<_, DaemonError>(None)
+        };
+        match timeout(Duration::from_millis(500), probe).await {
+            Ok(result) => result,
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn request_vote(
+        &self,
+        peer: NodeId,
+        request: &RequestVote,
+    ) -> Result<Option<Vote>, DaemonError> {
+        let mut stream = self.connect_known_peer(peer, request.room).await?;
+        write_message(&mut stream, &SwarmMsg::RequestVote(request.clone())).await?;
+        let response = async {
+            while let Some(message) = read_message(&mut stream).await? {
+                if let SwarmMsg::Vote(vote) = message {
+                    if vote.room == request.room && vote.rpc_term == request.rpc_term {
+                        return Ok(Some(vote));
+                    }
+                }
+            }
+            Ok::<_, DaemonError>(None)
+        };
+        match timeout(Duration::from_secs(1), response).await {
+            Ok(result) => result,
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn send_append(
+        &self,
+        peer: NodeId,
+        append: &Append,
+    ) -> Result<AppendResponse, DaemonError> {
+        let mut stream = self.connect_known_peer(peer, append.room).await?;
+        self.send_scene_blobs(&mut stream, &append.scene).await?;
+        if let Body::Grant {
+            reason: GrantReason::Queue,
+            intent_id,
+            ..
+        } = &append.scene.body
+        {
+            let floor = self.floor(append.room)?;
+            let intent = floor
+                .engine
+                .lock()
+                .expect("floor lock is not poisoned")
+                .intents()
+                .find(|intent| intent.id == *intent_id)
+                .cloned();
+            if let Some(intent) = intent {
+                write_message(&mut stream, &SwarmMsg::Intent(intent)).await?;
+            }
+        }
+        write_message(&mut stream, &SwarmMsg::Append(append.clone())).await?;
+        let response = async {
+            while let Some(message) = read_message(&mut stream).await? {
+                match message {
+                    SwarmMsg::Cert(cert)
+                        if cert.room == append.room && cert.n == append.scene.n =>
+                    {
+                        return Ok(AppendResponse::Cert(cert));
+                    }
+                    SwarmMsg::Nack(nack) if nack.room == append.room => {
+                        return Ok(AppendResponse::Nack(nack));
+                    }
+                    _ => {}
+                }
+            }
+            Ok::<_, DaemonError>(AppendResponse::Refused)
+        };
+        match timeout(Duration::from_secs(1), response).await {
+            Ok(result) => result,
+            Err(_) => Ok(AppendResponse::Refused),
+        }
+    }
+
+    async fn push_commit(
+        &self,
+        peer: NodeId,
+        commit: &conch_core::consensus::CommitMessage,
+    ) -> Result<(), DaemonError> {
+        let mut stream = self.connect_known_peer(peer, commit.room).await?;
+        self.send_scene_blobs(&mut stream, &commit.scene).await?;
+        write_message(&mut stream, &SwarmMsg::Commit(commit.clone())).await
+    }
+
+    async fn sync_from_known_peer(&self, peer: NodeId, room: RoomId) -> Result<(), DaemonError> {
+        let token = self.room_token(room);
+        for endpoint in self.peer_endpoints(peer) {
+            let Some(authority) = endpoint.strip_prefix("tcp://") else {
+                continue;
+            };
+            let Ok(addresses) = tokio::net::lookup_host(authority).await else {
+                continue;
+            };
+            for address in addresses {
+                if self
+                    .sync_room_from_inner(address, room, token, None)
+                    .await
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+            }
+        }
+        Err(DaemonError::MutationUnavailable)
     }
 
     fn commit_singleton_body_blocking(
@@ -1932,8 +2932,23 @@ impl Daemon {
     ) -> Result<(), DaemonError> {
         let floor = self.floor(room)?;
         let _mutation = floor.mutation.lock().await;
+        let breakout = match &record.scene.body {
+            Body::Breakout {
+                ticket, auto_join, ..
+            } if auto_join.contains(&self.node_id()) => {
+                Some(serde_json::from_value::<Ticket>(ticket.clone())?)
+            }
+            _ => None,
+        };
         let daemon = self.clone();
-        task::spawn_blocking(move || daemon.install_record_blocking(room, &record)).await?
+        task::spawn_blocking(move || daemon.install_record_blocking(room, &record)).await??;
+        drop(_mutation);
+        if let Some(ticket) = breakout {
+            if self.replay(ticket.id).is_err() {
+                Box::pin(self.join_ticket(ticket, JoinRole::Stake)).await?;
+            }
+        }
+        Ok(())
     }
 
     fn install_record_blocking(
@@ -2037,12 +3052,20 @@ impl Daemon {
         } else {
             let pending = replay.pending.clone();
             let head_proof = replay.head_proof.clone();
-            if advance_term(
+            let advanced = advance_term(
                 &mut replay.consensus,
                 pending.as_ref(),
                 head_proof.as_ref(),
                 AdvanceSource::VerifiedProof(record.commit_proof.rpc_term),
-            ) {
+            );
+            if record.commit_proof.rpc_term == replay.consensus.current_term
+                && replay.chain.roster.contains(&record.commit_proof.leader)
+                && record.commit_proof.leader != self.node_id()
+            {
+                replay.consensus.role = ConsensusRole::Follower;
+                replay.consensus.leader_id = Some(record.commit_proof.leader);
+            }
+            if advanced {
                 self.store(room)?.write_consensus(&replay.consensus)?;
             }
         }
@@ -2179,6 +3202,73 @@ fn validate_hello(message: SwarmMsg) -> Result<Hello, DaemonError> {
     Ok(hello)
 }
 
+fn valid_request_vote(request: &RequestVote) -> bool {
+    VerifyingKey::from_bytes(request.candidate.as_bytes()).is_ok_and(|key| {
+        verify(
+            &key,
+            &signed_object_digest(
+                &serde_json::to_value(request).expect("request_vote is serializable"),
+            ),
+            request.sig.as_bytes(),
+        )
+    })
+}
+
+fn valid_vote(vote: &Vote, roster: &[NodeId], candidate: NodeId, rpc_term: u64) -> bool {
+    vote.grant
+        && vote.candidate == candidate
+        && vote.rpc_term == rpc_term
+        && roster.contains(&vote.voter)
+        && VerifyingKey::from_bytes(vote.voter.as_bytes()).is_ok_and(|key| {
+            verify(
+                &key,
+                &signed_object_digest(&serde_json::to_value(vote).expect("vote is serializable")),
+                vote.sig.as_bytes(),
+            )
+        })
+}
+
+fn cert_message_from_pending(pending: &Pending) -> Result<CertMessage, DaemonError> {
+    let CertSigner::Node(node) = pending.cert.node else {
+        return Err(DaemonError::Protocol(
+            "pending cert cannot use the room key",
+        ));
+    };
+    Ok(CertMessage {
+        room: pending.scene.room,
+        n: pending.n,
+        hash: pending.hash,
+        rpc_term: pending.accepted_rpc_term,
+        leader: pending.accepted_leader,
+        node,
+        sig: pending.cert.sig,
+    })
+}
+
+fn valid_cert_message(cert: &CertMessage, scene: &Scene, rpc_term: u64, leader: NodeId) -> bool {
+    cert.room == scene.room
+        && cert.n == scene.n
+        && cert.hash == hash_scene(scene)
+        && cert.rpc_term == rpc_term
+        && cert.leader == leader
+        && scene.roster.contains(&cert.node)
+        && VerifyingKey::from_bytes(cert.node.as_bytes()).is_ok_and(|key| {
+            let digest = cert_digest(
+                &cert.room,
+                cert.n,
+                cert.hash.as_bytes(),
+                cert.rpc_term,
+                &cert.leader,
+                &cert.node,
+            );
+            verify(&key, &digest, cert.sig.as_bytes())
+        })
+}
+
+fn majority(roster_len: usize) -> usize {
+    roster_len / 2 + 1
+}
+
 fn client_peer_allowed(peer: SocketAddr) -> bool {
     peer.ip().is_loopback()
 }
@@ -2206,6 +3296,13 @@ fn hash_scene(scene: &Scene) -> Hash32 {
     Hash32::from_bytes(scene_hash(
         &serde_json::to_value(scene).expect("typed scene is serializable"),
     ))
+}
+
+fn scene_blobs(scene: &Scene) -> &[BlobRef] {
+    match &scene.body {
+        Body::Speech { blobs, .. } => blobs,
+        _ => &[],
+    }
 }
 
 fn load_or_create_node_key(data_dir: &Path) -> Result<SigningKey, DaemonError> {

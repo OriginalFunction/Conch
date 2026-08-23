@@ -266,3 +266,31 @@ async fn tokened_http_ticket_join_sends_bearer_and_authenticates_swarm() {
         source.replay(local_ticket.id).unwrap().history
     );
 }
+
+#[tokio::test]
+async fn current_room_file_supplies_the_cli_default() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let ticket = daemon
+        .create_ticket(
+            "Current Room",
+            conch_core::types::StakePolicy::default(),
+            conch_core::types::FloorConfig::stick(30),
+        )
+        .unwrap();
+    let server = daemon.start(loopback()).await.unwrap();
+
+    let status = Command::new(env!("CARGO_BIN_EXE_conch"))
+        .args(["--node", &format!("tcp://{}", server.addr()), "status"])
+        .env("CONCH_DATA_DIR", data.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["room"], ticket.id.to_string());
+}

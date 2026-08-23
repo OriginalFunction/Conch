@@ -39,6 +39,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let ParsedRequest::Mcp { room } = &request {
         return conch_mcp::run(node, agent, *room).await.map_err(Into::into);
     }
+    let follow = matches!(
+        &request,
+        ParsedRequest::Ready(request)
+            if matches!(request.as_ref(), ClientRequest::History { follow: true, .. })
+    );
     let (request, raw) = request.resolve().await?;
     let mut stream = TcpStream::connect(parse_node_addr(&node)?).await?;
     write_frame(&mut stream, &ClientRequest::Attach { agent }).await?;
@@ -51,6 +56,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         stream.write_u32(raw.len() as u32).await?;
         stream.write_all(&raw).await?;
         stream.flush().await?;
+    }
+    if follow {
+        loop {
+            let reply: ClientReply = read_frame(&mut stream).await?;
+            if !reply.ok {
+                return Err(format_reply_error(&reply).into());
+            }
+            println!(
+                "{}",
+                serde_json::to_string(&reply.data.unwrap_or_default())?
+            );
+        }
     }
     let reply: ClientReply = read_frame(&mut stream).await?;
     if !reply.ok {
@@ -180,7 +197,7 @@ impl Arguments {
         let mut arguments = arguments.peekable();
         let mut node = env::var("CONCH_NODE").unwrap_or_else(|_| "tcp://127.0.0.1:7421".into());
         let mut agent = env::var("CONCH_AGENT").unwrap_or_else(|_| "local".into());
-        let mut room = env::var("CONCH_ROOM").ok();
+        let mut room = env::var("CONCH_ROOM").ok().or_else(read_current_room);
         let mut token = env::var("CONCH_TOKEN")
             .ok()
             .map(|value| value.parse::<Hash32>())
@@ -527,17 +544,24 @@ impl Arguments {
             }
             "history" => ready({
                 let mut from_n = 0;
-                if arguments.peek().is_some_and(|value| value == "--from") {
-                    arguments.next();
-                    from_n = arguments
-                        .next()
-                        .ok_or("--from requires a height")?
-                        .parse()
-                        .map_err(|_| "invalid history height")?;
+                let mut follow = false;
+                while let Some(flag) = arguments.next() {
+                    match flag.as_str() {
+                        "--from" => {
+                            from_n = arguments
+                                .next()
+                                .ok_or("--from requires a height")?
+                                .parse()
+                                .map_err(|_| "invalid history height")?;
+                        }
+                        "--follow" => follow = true,
+                        _ => return Err(format!("unknown history argument: {flag}")),
+                    }
                 }
                 ClientRequest::History {
                     room: resolve_room()?,
                     from_n,
+                    follow,
                 }
             }),
             "status" => ready(ClientRequest::Status {
@@ -633,4 +657,20 @@ fn slug(name: &str) -> String {
     } else {
         slug
     }
+}
+
+fn read_current_room() -> Option<String> {
+    let data_dir = env::var_os("CONCH_DATA_DIR").map_or_else(
+        || {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".conch")
+        },
+        PathBuf::from,
+    );
+    let bytes = fs::read(data_dir.join("current-room")).ok()?;
+    serde_json::from_slice::<RoomId>(&bytes)
+        .ok()
+        .map(|room| room.to_string())
 }

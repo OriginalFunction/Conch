@@ -60,7 +60,7 @@ impl Daemon {
     pub async fn start_http(&self, addr: SocketAddr) -> Result<RunningHttpServer, DaemonError> {
         let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
-        self.remember_http_addr(addr);
+        self.remember_http_addr(addr)?;
         let router = router(self.clone());
         let task = tokio::spawn(async move {
             axum::serve(
@@ -74,7 +74,7 @@ impl Daemon {
 
     pub async fn serve_http(&self, addr: SocketAddr) -> Result<(), DaemonError> {
         let listener = TcpListener::bind(addr).await?;
-        self.remember_http_addr(listener.local_addr()?);
+        self.remember_http_addr(listener.local_addr()?)?;
         axum::serve(
             listener,
             router(self.clone()).into_make_service_with_connect_info::<SocketAddr>(),

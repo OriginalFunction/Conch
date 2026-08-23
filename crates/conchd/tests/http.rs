@@ -58,7 +58,15 @@ async fn get_history_matches_cli_protocol() {
     let tcp = daemon.start(loopback()).await.unwrap();
     let http = daemon.start_http(loopback()).await.unwrap();
 
-    let cli = tcp_request(tcp.addr(), ClientRequest::History { room, from_n: 0 }).await;
+    let cli = tcp_request(
+        tcp.addr(),
+        ClientRequest::History {
+            room,
+            from_n: 0,
+            follow: false,
+        },
+    )
+    .await;
     assert!(cli.ok);
     let response = http_get(http.addr(), &format!("/history/{room}?from=0"), None).await;
     assert_eq!(response.0, 200);
@@ -74,7 +82,15 @@ async fn ws_client_and_tcp_expose_the_same_commit_hashes() {
     let tcp = daemon.start(loopback()).await.unwrap();
     let http = daemon.start_http(loopback()).await.unwrap();
 
-    let tcp_history = tcp_request(tcp.addr(), ClientRequest::History { room, from_n: 0 }).await;
+    let tcp_history = tcp_request(
+        tcp.addr(),
+        ClientRequest::History {
+            room,
+            from_n: 0,
+            follow: false,
+        },
+    )
+    .await;
     let (mut socket, _) = connect_async(format!("ws://{}/client", http.addr()))
         .await
         .unwrap();
@@ -88,7 +104,11 @@ async fn ws_client_and_tcp_expose_the_same_commit_hashes() {
     assert!(attached.ok);
     assert_eq!(attached.data.unwrap()["agent"], "human:operator");
     socket
-        .send(json_message(&ClientRequest::History { room, from_n: 0 }))
+        .send(json_message(&ClientRequest::History {
+            room,
+            from_n: 0,
+            follow: false,
+        }))
         .await
         .unwrap();
     let ws_history = next_reply(&mut socket).await;
@@ -135,7 +155,11 @@ async fn ws_and_tcp_same_commit_hashes() {
 
     let through_tcp = tcp_request(
         follower_tcp.addr(),
-        ClientRequest::History { room, from_n: 0 },
+        ClientRequest::History {
+            room,
+            from_n: 0,
+            follow: false,
+        },
     )
     .await;
     assert_eq!(

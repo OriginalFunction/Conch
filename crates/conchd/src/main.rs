@@ -15,6 +15,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut tcp: SocketAddr = "0.0.0.0:7421".parse()?;
     let mut http: SocketAddr = "0.0.0.0:7420".parse()?;
     let mut localhost = false;
+    let mut advertised = Vec::new();
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -34,6 +35,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .parse()?;
             }
             "--localhost" => localhost = true,
+            "--advertise" => {
+                advertised.push(arguments.next().ok_or("--advertise requires an endpoint")?)
+            }
             _ => return Err(format!("unknown argument: {argument}").into()),
         }
     }
@@ -44,6 +48,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let daemon = Daemon::open(data_dir)?;
+    for endpoint in advertised {
+        daemon.advertise(&endpoint)?;
+    }
     tokio::try_join!(daemon.serve(tcp), daemon.serve_http(http))?;
     Ok(())
 }

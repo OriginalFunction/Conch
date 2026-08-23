@@ -72,6 +72,8 @@ pub enum ClientRequest {
     History {
         room: RoomId,
         from_n: u64,
+        #[serde(default)]
+        follow: bool,
     },
     Status {
         #[serde(default, skip_serializing_if = "Option::is_none")]
