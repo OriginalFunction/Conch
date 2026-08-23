@@ -76,6 +76,8 @@ pub enum DaemonError {
     JoinUnavailable,
     #[error("room mutation requires an available local leader")]
     MutationUnavailable,
+    #[error("WebSocket transport failed: {0}")]
+    WebSocket(String),
 }
 
 #[derive(Clone)]
@@ -92,6 +94,7 @@ struct Inner {
     joins: RwLock<BTreeMap<RoomId, LocalJoin>>,
     agents: RwLock<BTreeSet<AgentId>>,
     addrs: RwLock<Vec<String>>,
+    trackers: RwLock<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -111,6 +114,13 @@ struct RoomFloor {
 pub struct RunningServer {
     addr: SocketAddr,
     task: JoinHandle<Result<(), DaemonError>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionProtocol {
+    Tcp { allow_client: bool },
+    Swarm,
+    Client,
 }
 
 impl RunningServer {
@@ -188,6 +198,7 @@ impl Daemon {
                 joins: RwLock::new(joins),
                 agents: RwLock::new(BTreeSet::new()),
                 addrs: RwLock::new(Vec::new()),
+                trackers: RwLock::new(Vec::new()),
             }),
         })
     }
@@ -267,6 +278,16 @@ impl Daemon {
         stake: StakePolicy,
         floor: FloorConfig,
     ) -> Result<Ticket, DaemonError> {
+        self.create_ticket_with_token(name, stake, floor, None)
+    }
+
+    pub fn create_ticket_with_token(
+        &self,
+        name: &str,
+        stake: StakePolicy,
+        floor: FloorConfig,
+        token: Option<Hash32>,
+    ) -> Result<Ticket, DaemonError> {
         let room_key = SigningKey::from_bytes(&random::<[u8; 32]>());
         let room = RoomId::from_bytes(room_key.verifying_key().to_bytes());
         let node = self.node_id();
@@ -285,7 +306,8 @@ impl Daemon {
                 floor: floor.clone(),
                 creator_node: node,
                 parent_room: None,
-                token_sha256: None,
+                token_sha256: token
+                    .map(|token| Hash32::from_bytes(Sha256::digest(token.as_bytes()).into())),
             },
             certs: Vec::new(),
         };
@@ -306,14 +328,19 @@ impl Daemon {
             v: 1,
             id: room,
             name: name.to_owned(),
-            trackers: Vec::new(),
+            trackers: self
+                .inner
+                .trackers
+                .read()
+                .expect("tracker registry lock is not poisoned")
+                .clone(),
             peers: self
                 .inner
                 .addrs
                 .read()
                 .expect("address registry lock is not poisoned")
                 .clone(),
-            token: None,
+            token,
             stake,
             floor,
             parent: None,
@@ -399,6 +426,21 @@ impl Daemon {
         }
     }
 
+    pub(crate) fn remember_http_addr(&self, mut addr: SocketAddr) {
+        if addr.ip().is_unspecified() {
+            addr.set_ip("127.0.0.1".parse().expect("loopback address is valid"));
+        }
+        let endpoint = format!("ws://{addr}/swarm");
+        let mut trackers = self
+            .inner
+            .trackers
+            .write()
+            .expect("tracker registry lock is not poisoned");
+        if !trackers.contains(&endpoint) {
+            trackers.push(endpoint);
+        }
+    }
+
     pub async fn sync_room_from(
         &self,
         addr: SocketAddr,
@@ -419,7 +461,21 @@ impl Daemon {
         token: Option<Hash32>,
         expected_genesis: Option<Hash32>,
     ) -> Result<ChainState, DaemonError> {
-        let mut stream = TcpStream::connect(addr).await?;
+        let stream = TcpStream::connect(addr).await?;
+        self.sync_room_stream(stream, room, token, expected_genesis)
+            .await
+    }
+
+    pub(crate) async fn sync_room_stream<S>(
+        &self,
+        mut stream: S,
+        room: RoomId,
+        token: Option<Hash32>,
+        expected_genesis: Option<Hash32>,
+    ) -> Result<ChainState, DaemonError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
         write_message(&mut stream, &SwarmMsg::Hello(self.hello())).await?;
         let remote = read_message(&mut stream)
             .await?
@@ -521,6 +577,22 @@ impl Daemon {
             .cloned()
             .collect::<Vec<_>>();
         for endpoint in endpoints {
+            if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+                let attempt = timeout(
+                    SYNC_TIMEOUT,
+                    self.sync_room_from_ws(&endpoint, room, ticket.token, Some(ticket.genesis)),
+                )
+                .await;
+                if let Ok(Ok(chain)) = attempt {
+                    let replay = self.replay(room)?;
+                    verify_ticket_replay(&ticket, &replay)?;
+                    let store = self.store(room)?;
+                    let canonical = canonical_ticket(&ticket, &replay)?;
+                    task::spawn_blocking(move || write_ticket(&store, &canonical)).await??;
+                    return Ok(chain);
+                }
+                continue;
+            }
             let Some(authority) = endpoint.strip_prefix("tcp://") else {
                 continue;
             };
@@ -598,17 +670,42 @@ impl Daemon {
         }
     }
 
-    async fn handle_connection(&self, mut stream: TcpStream) -> Result<(), DaemonError> {
+    async fn handle_connection(&self, stream: TcpStream) -> Result<(), DaemonError> {
         let peer_addr = stream.peer_addr()?;
+        self.handle_transport(
+            stream,
+            ConnectionProtocol::Tcp {
+                allow_client: client_peer_allowed(peer_addr),
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn handle_transport<S>(
+        &self,
+        mut stream: S,
+        protocol: ConnectionProtocol,
+    ) -> Result<(), DaemonError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
         let first: Value = read_frame(&mut stream)
             .await?
             .ok_or(DaemonError::Protocol("peer closed before hello"))?;
         match first.get("typ").and_then(Value::as_str) {
-            Some("hello") => {
+            Some("hello")
+                if matches!(
+                    protocol,
+                    ConnectionProtocol::Tcp { .. } | ConnectionProtocol::Swarm
+                ) =>
+            {
                 let hello = serde_json::from_value(first).map_err(FrameError::from)?;
                 self.handle_swarm_connection(stream, hello).await
             }
-            Some("attach") if client_peer_allowed(peer_addr) => {
+            Some("attach")
+                if matches!(protocol, ConnectionProtocol::Client)
+                    || matches!(protocol, ConnectionProtocol::Tcp { allow_client: true }) =>
+            {
                 let attach = serde_json::from_value(first).map_err(FrameError::from)?;
                 self.handle_client_connection(stream, attach).await
             }
@@ -620,7 +717,7 @@ impl Daemon {
 
     async fn handle_swarm_connection(
         &self,
-        mut stream: TcpStream,
+        mut stream: impl AsyncRead + AsyncWrite + Unpin + Send,
         hello: SwarmMsg,
     ) -> Result<(), DaemonError> {
         let peer = validate_hello(hello)?;
@@ -701,7 +798,7 @@ impl Daemon {
 
     async fn handle_client_connection(
         &self,
-        mut stream: TcpStream,
+        mut stream: impl AsyncRead + AsyncWrite + Unpin + Send,
         attach: ClientRequest,
     ) -> Result<(), DaemonError> {
         let ClientRequest::Attach { agent } = attach else {
@@ -719,22 +816,21 @@ impl Daemon {
             &ClientReply::success(json!({ "agent": agent })),
         )
         .await?;
-        let Some(value) = read_frame::<_, Value>(&mut stream).await? else {
-            return Ok(());
-        };
-        let request = match serde_json::from_value::<ClientRequest>(value) {
-            Ok(request) => request,
-            Err(error) => {
-                write_frame(
-                    &mut stream,
-                    &ClientReply::failure("invalid", error.to_string()),
-                )
-                .await?;
-                return Ok(());
-            }
-        };
-        let reply = self.execute_client(agent, request).await;
-        write_frame(&mut stream, &reply).await?;
+        while let Some(value) = read_frame::<_, Value>(&mut stream).await? {
+            let request = match serde_json::from_value::<ClientRequest>(value) {
+                Ok(request) => request,
+                Err(error) => {
+                    write_frame(
+                        &mut stream,
+                        &ClientReply::failure("invalid", error.to_string()),
+                    )
+                    .await?;
+                    continue;
+                }
+            };
+            let reply = self.execute_client(agent.clone(), request).await;
+            write_frame(&mut stream, &reply).await?;
+        }
         Ok(())
     }
 
@@ -1322,12 +1418,23 @@ impl Daemon {
         Hello {
             node,
             r#pub: node,
-            addrs: self
-                .inner
-                .addrs
-                .read()
-                .expect("address registry lock is not poisoned")
-                .clone(),
+            addrs: {
+                let mut addrs = self
+                    .inner
+                    .addrs
+                    .read()
+                    .expect("address registry lock is not poisoned")
+                    .clone();
+                addrs.extend(
+                    self.inner
+                        .trackers
+                        .read()
+                        .expect("tracker registry lock is not poisoned")
+                        .iter()
+                        .cloned(),
+                );
+                addrs
+            },
             decl,
         }
     }
@@ -1354,7 +1461,7 @@ impl Daemon {
         Ok(haves)
     }
 
-    fn authenticate(&self, room: RoomId, token: Hash32) -> Result<bool, DaemonError> {
+    pub(crate) fn authenticate(&self, room: RoomId, token: Hash32) -> Result<bool, DaemonError> {
         let expected = match self.token_sha256(room) {
             Ok(expected) => expected,
             Err(DaemonError::UnknownRoom(_)) => return Ok(false),
@@ -1378,7 +1485,7 @@ impl Daemon {
         }
     }
 
-    fn token_sha256(&self, room: RoomId) -> Result<Option<Hash32>, DaemonError> {
+    pub(crate) fn token_sha256(&self, room: RoomId) -> Result<Option<Hash32>, DaemonError> {
         let replay = self.replay(room)?;
         Ok(replay
             .history
@@ -1387,6 +1494,24 @@ impl Daemon {
                 Body::Genesis { token_sha256, .. } => *token_sha256,
                 _ => None,
             }))
+    }
+
+    pub(crate) fn served_ticket(&self, room: RoomId) -> Result<Ticket, DaemonError> {
+        let bytes = fs::read(self.store(room)?.root().join("ticket.conch"))?;
+        Ok(Ticket::from_json_slice(&bytes)?)
+    }
+
+    pub(crate) fn history_from(
+        &self,
+        room: RoomId,
+        from_n: u64,
+    ) -> Result<Vec<CommittedScene>, DaemonError> {
+        Ok(self
+            .replay(room)?
+            .history
+            .into_iter()
+            .filter(|record| record.scene.n >= from_n)
+            .collect())
     }
 
     async fn install_record(

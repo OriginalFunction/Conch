@@ -118,3 +118,44 @@ async fn join_file_defaults_to_stake_and_fetches_verified_genesis() {
     .unwrap();
     assert_eq!(local_join["role"], "stake");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn join_http_ticket_uses_the_same_parser_and_fetches_genesis() {
+    let source_data = TempDir::new().unwrap();
+    let follower_data = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+    let source = Daemon::open(source_data.path()).unwrap();
+    let follower = Daemon::open(follower_data.path()).unwrap();
+    let source_tcp = source.start(loopback()).await.unwrap();
+    let ticket = source
+        .create_ticket(
+            "HTTP Join",
+            conch_core::types::StakePolicy::default(),
+            conch_core::types::FloorConfig::stick(30),
+        )
+        .unwrap();
+    let source_http = source.start_http(loopback()).await.unwrap();
+    let follower_tcp = follower.start(loopback()).await.unwrap();
+    assert_eq!(ticket.peers, vec![format!("tcp://{}", source_tcp.addr())]);
+
+    let joined = Command::new(env!("CARGO_BIN_EXE_conch"))
+        .args([
+            "--node",
+            &format!("tcp://{}", follower_tcp.addr()),
+            "join",
+            &format!("http://{}/ticket/{}", source_http.addr(), ticket.id),
+        ])
+        .current_dir(output_dir.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        joined.status.success(),
+        "{}",
+        String::from_utf8_lossy(&joined.stderr)
+    );
+    assert_eq!(
+        follower.replay(ticket.id).unwrap().history,
+        source.replay(ticket.id).unwrap().history
+    );
+}

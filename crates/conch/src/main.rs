@@ -10,7 +10,7 @@ use std::{
 use conch_core::{
     client::{ClientReply, ClientRequest},
     frame::{self, MAX_FRAME_BYTES},
-    ticket::{JoinRole, Ticket},
+    ticket::{JoinRole, Ticket, TicketSource},
     types::{AgentId, FloorConfig, FloorMode, Mouth, NodeId, RoomId, StakePolicy},
 };
 use rand::random;
@@ -30,25 +30,26 @@ async fn main() {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let parsed = Arguments::parse(env::args().skip(1))?;
-    let mut stream = TcpStream::connect(parse_node_addr(&parsed.node)?).await?;
-    write_frame(
-        &mut stream,
-        &ClientRequest::Attach {
-            agent: parsed.agent.clone(),
-        },
-    )
-    .await?;
+    let Arguments {
+        node,
+        agent,
+        request,
+        output,
+    } = parsed;
+    let request = request.resolve().await?;
+    let mut stream = TcpStream::connect(parse_node_addr(&node)?).await?;
+    write_frame(&mut stream, &ClientRequest::Attach { agent }).await?;
     let attached: ClientReply = read_frame(&mut stream).await?;
     if !attached.ok {
         return Err(format_reply_error(&attached).into());
     }
-    write_frame(&mut stream, &parsed.request).await?;
+    write_frame(&mut stream, &request).await?;
     let reply: ClientReply = read_frame(&mut stream).await?;
     if !reply.ok {
         return Err(format_reply_error(&reply).into());
     }
     let data = reply.data.unwrap_or_default();
-    let output = match parsed.output {
+    let output = match output {
         Output::Json => data,
         Output::Create { ticket_path } => {
             let ticket: Ticket = serde_json::from_value(
@@ -77,13 +78,44 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 struct Arguments {
     node: String,
     agent: AgentId,
-    request: ClientRequest,
+    request: ParsedRequest,
     output: Output,
 }
 
 enum Output {
     Json,
     Create { ticket_path: PathBuf },
+}
+
+enum ParsedRequest {
+    Ready(Box<ClientRequest>),
+    Join {
+        source: TicketSource,
+        role: JoinRole,
+    },
+}
+
+impl ParsedRequest {
+    async fn resolve(self) -> Result<ClientRequest, Box<dyn std::error::Error>> {
+        match self {
+            Self::Ready(request) => Ok(*request),
+            Self::Join { source, role } => {
+                let ticket = match source {
+                    TicketSource::Inline(ticket) => *ticket,
+                    TicketSource::File(path) => Ticket::from_json_slice(&fs::read(path)?)?,
+                    TicketSource::Http(url) => {
+                        let bytes = reqwest::get(url).await?.error_for_status()?.bytes().await?;
+                        Ticket::from_json_slice(&bytes)?
+                    }
+                };
+                Ok(ClientRequest::Join { ticket, role })
+            }
+        }
+    }
+}
+
+fn ready(request: ClientRequest) -> ParsedRequest {
+    ParsedRequest::Ready(Box::new(request))
 }
 
 impl Arguments {
@@ -179,7 +211,7 @@ impl Arguments {
                     ));
                 }
                 output = Output::Create { ticket_path };
-                ClientRequest::Create {
+                ready(ClientRequest::Create {
                     name,
                     stake: StakePolicy::default(),
                     floor: FloorConfig {
@@ -187,21 +219,11 @@ impl Arguments {
                         timeout_secs: 30,
                         moderator,
                     },
-                }
+                })
             }
             "join" => {
                 let source = arguments.next().ok_or("join requires a ticket")?;
-                let ticket = if source.starts_with("conch:") {
-                    Ticket::from_magnet(&source).map_err(|error| error.to_string())?
-                } else if source.starts_with("http://") || source.starts_with("https://") {
-                    return Err(
-                        "HTTP ticket URLs are not available until the HTTP adapter is enabled"
-                            .into(),
-                    );
-                } else {
-                    Ticket::from_json_slice(&fs::read(&source).map_err(|error| error.to_string())?)
-                        .map_err(|error| error.to_string())?
-                };
+                let source = TicketSource::parse(&source).map_err(|error| error.to_string())?;
                 let mut selected_role = None;
                 for flag in arguments.by_ref() {
                     let role = match flag.as_str() {
@@ -214,9 +236,9 @@ impl Arguments {
                     }
                 }
                 let role = selected_role.unwrap_or_default();
-                ClientRequest::Join { ticket, role }
+                ParsedRequest::Join { source, role }
             }
-            "wait-for-floor" => {
+            "wait-for-floor" => ready({
                 let mut timeout_secs = None;
                 if arguments.peek().is_some_and(|value| value == "--timeout") {
                     arguments.next();
@@ -232,8 +254,8 @@ impl Arguments {
                     room: resolve_room()?,
                     timeout_secs,
                 }
-            }
-            "speak" => {
+            }),
+            "speak" => ready({
                 let mut request_id = None;
                 let mut read_stdin = false;
                 while let Some(flag) = arguments.next() {
@@ -262,14 +284,14 @@ impl Arguments {
                     text,
                     request_id: request_id.unwrap_or_else(|| hex_string(&random::<[u8; 16]>())),
                 }
-            }
-            "yield" => ClientRequest::Yield {
+            }),
+            "yield" => ready(ClientRequest::Yield {
                 room: resolve_room()?,
-            },
-            "raise-hand" => ClientRequest::RaiseHand {
+            }),
+            "raise-hand" => ready(ClientRequest::RaiseHand {
                 room: resolve_room()?,
-            },
-            "history" => {
+            }),
+            "history" => ready({
                 let mut from_n = 0;
                 if arguments.peek().is_some_and(|value| value == "--from") {
                     arguments.next();
@@ -283,14 +305,14 @@ impl Arguments {
                     room: resolve_room()?,
                     from_n,
                 }
-            }
-            "status" => ClientRequest::Status {
+            }),
+            "status" => ready(ClientRequest::Status {
                 room: room
                     .as_deref()
                     .map(RoomId::from_str)
                     .transpose()
                     .map_err(|error| format!("invalid room id: {error}"))?,
-            },
+            }),
             _ => return Err(format!("unknown command: {command}")),
         };
         if arguments.next().is_some() {

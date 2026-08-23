@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, str::FromStr};
+use std::{collections::BTreeMap, path::PathBuf, str::FromStr};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use form_urlencoded;
@@ -17,6 +17,27 @@ pub enum JoinRole {
     #[default]
     Stake,
     Observe,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TicketSource {
+    Inline(Box<Ticket>),
+    File(PathBuf),
+    Http(String),
+}
+
+impl TicketSource {
+    pub fn parse(reference: &str) -> Result<Self, TicketError> {
+        if reference.starts_with("conch:") {
+            Ticket::from_magnet(reference)
+                .map(Box::new)
+                .map(Self::Inline)
+        } else if reference.starts_with("http://") || reference.starts_with("https://") {
+            Ok(Self::Http(reference.to_owned()))
+        } else {
+            Ok(Self::File(PathBuf::from(reference)))
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

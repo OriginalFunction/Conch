@@ -13,6 +13,7 @@ async fn main() {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut data_dir = default_data_dir();
     let mut tcp: SocketAddr = "0.0.0.0:7421".parse()?;
+    let mut http: SocketAddr = "0.0.0.0:7420".parse()?;
     let mut localhost = false;
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -26,6 +27,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or("--tcp requires an address")?
                     .parse()?;
             }
+            "--http" => {
+                http = arguments
+                    .next()
+                    .ok_or("--http requires an address")?
+                    .parse()?;
+            }
             "--localhost" => localhost = true,
             _ => return Err(format!("unknown argument: {argument}").into()),
         }
@@ -33,9 +40,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     if localhost {
         tcp.set_ip("127.0.0.1".parse()?);
+        http.set_ip("127.0.0.1".parse()?);
     }
 
-    Daemon::open(data_dir)?.serve(tcp).await?;
+    let daemon = Daemon::open(data_dir)?;
+    tokio::try_join!(daemon.serve(tcp), daemon.serve_http(http))?;
     Ok(())
 }
 
