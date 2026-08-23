@@ -16,7 +16,8 @@ use crate::{
     consensus::{advance_term, AdvanceSource},
     encoding::{cert_digest, scene_hash, verify},
     types::{
-        CertSigner, ChainState, CommitProof, CommittedScene, ConsensusState, Hash32, Pending, Scene,
+        CertSigner, ChainState, CommitProof, CommittedScene, ConsensusState, Hash32, Intent,
+        Pending, Scene,
     },
 };
 
@@ -34,6 +35,8 @@ pub enum StoreError {
     InvalidPending,
     #[error("committed scene filename does not match its contents")]
     InvalidSceneFile,
+    #[error("intent filename does not match its contents")]
+    InvalidIntentFile,
     #[error("two committed scene files conflict at height {0}")]
     ConflictingScenes(u64),
     #[error("committed prefix has a hole at height {0}")]
@@ -59,6 +62,7 @@ impl Store {
         let root = root.into();
         fs::create_dir_all(root.join("scenes"))?;
         fs::create_dir_all(root.join("blobs"))?;
+        fs::create_dir_all(root.join("intents"))?;
         sync_dir(&root)?;
         Ok(Self { root })
     }
@@ -82,6 +86,44 @@ impl Store {
         }
         write_json_atomic(&self.root.join("pending.json"), pending)?;
         Ok(())
+    }
+
+    pub fn write_intent(&self, intent: &Intent) -> Result<(), StoreError> {
+        write_json_atomic(
+            &self
+                .root
+                .join("intents")
+                .join(format!("{}.json", intent.id)),
+            intent,
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_intent(&self, id: Hash32) -> Result<(), StoreError> {
+        let path = self.root.join("intents").join(format!("{id}.json"));
+        match fs::remove_file(path) {
+            Ok(()) => sync_dir(&self.root.join("intents"))?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    pub fn load_intents(&self) -> Result<Vec<Intent>, StoreError> {
+        let mut intents = Vec::new();
+        for entry in fs::read_dir(self.root.join("intents"))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let intent: Intent = serde_json::from_slice(&fs::read(entry.path())?)?;
+            if entry.file_name().to_string_lossy() != format!("{}.json", intent.id) {
+                return Err(StoreError::InvalidIntentFile);
+            }
+            intents.push(intent);
+        }
+        intents.sort_by_key(|intent| (intent.ts, intent.id));
+        Ok(intents)
     }
 
     /// Durable commit steps 1-2: validate, fsync scene+proof and its directory,

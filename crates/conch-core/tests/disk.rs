@@ -4,8 +4,8 @@ use conch_core::{
     disk::Store,
     encoding::{cert_digest, scene_hash, sign},
     types::{
-        Body, Cert, ChainState, CommitProof, ConsensusState, FloorConfig, Hash32, NodeId, Pending,
-        RoomId, Scene, SignatureBytes, StakePolicy,
+        AgentId, Body, Cert, ChainState, CommitProof, ConsensusState, FloorConfig, Hash32, Intent,
+        IntentKind, NodeId, Pending, RoomId, Scene, SignatureBytes, StakePolicy,
     },
 };
 use ed25519_dalek::SigningKey;
@@ -192,4 +192,27 @@ fn durable_commit_writes_scene_head_and_clears_pending() {
     let replay = store.load_replay().unwrap();
     assert_eq!(replay.chain, next);
     assert_eq!(replay.head_proof, Some(proof));
+}
+
+#[test]
+fn intents_are_durable_objects_not_process_local_waiters() {
+    let temp = TempDir::new().unwrap();
+    let fixture = Fixture::new();
+    let store = room_store(&temp, &fixture);
+    let intent = Intent {
+        v: 1,
+        id: Hash32::from_bytes([8; 32]),
+        room: fixture.room(),
+        kind: IntentKind::Wait,
+        agent: AgentId::new("codex").unwrap(),
+        node: fixture.node(),
+        ts: 10,
+        exp: 20,
+        sig: SignatureBytes::from_bytes([9; 64]),
+    };
+
+    store.write_intent(&intent).unwrap();
+    assert_eq!(store.load_intents().unwrap(), vec![intent.clone()]);
+    store.remove_intent(intent.id).unwrap();
+    assert!(store.load_intents().unwrap().is_empty());
 }

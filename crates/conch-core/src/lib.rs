@@ -1,4 +1,5 @@
 pub mod apply;
+pub mod client;
 pub mod cluster;
 pub mod consensus;
 pub mod disk;

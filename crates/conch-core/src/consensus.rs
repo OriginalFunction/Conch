@@ -4,7 +4,8 @@ use thiserror::Error;
 
 pub use crate::types::ConsensusRole;
 use crate::types::{
-    Cert, CommitProof, ConsensusState, Hash32, NodeId, Pending, RoomId, Scene, SignatureBytes,
+    BlobRef, Cert, CommitProof, ConsensusState, Hash32, Intent, NodeId, Pending, RoomId, Scene,
+    SignatureBytes,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +205,23 @@ pub struct GetScenes {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Freeze {
+    pub room: RoomId,
+    pub grant_hash: Hash32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloseTake {
+    pub room: RoomId,
+    pub grant_hash: Hash32,
+    pub text: String,
+    pub rev: u64,
+    pub blobs: Vec<BlobRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "typ", rename_all = "snake_case")]
 pub enum SwarmMsg {
     Hello(Hello),
@@ -219,6 +237,9 @@ pub enum SwarmMsg {
     Nack(Nack),
     GetScenes(GetScenes),
     Scene(crate::types::CommittedScene),
+    Intent(Intent),
+    Freeze(Freeze),
+    CloseTake(CloseTake),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
