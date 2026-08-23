@@ -1,0 +1,17 @@
+image: rust:1.95
+
+definitions:
+  caches:
+    cargo-registry: /usr/local/cargo/registry
+    cargo-target: target
+
+pipelines:
+  default:
+    - step:
+        name: Rust checks
+        caches:
+          - cargo-registry
+          - cargo-target
+        script:
+          - cargo fmt --all -- --check
+          - cargo test --workspace --locked
