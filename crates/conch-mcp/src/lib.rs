@@ -1,4 +1,10 @@
-use std::{fs, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
+use std::{
+    fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+};
 
 use conch_core::{
     client::{ClientReply, ClientRequest},
@@ -25,11 +31,22 @@ pub struct Server {
     node: String,
     agent: AgentId,
     room: Option<RoomId>,
+    tls_ca: Option<PathBuf>,
 }
 
 impl Server {
     pub fn new(node: String, agent: AgentId, room: Option<RoomId>) -> Self {
-        Self { node, agent, room }
+        Self {
+            node,
+            agent,
+            room,
+            tls_ca: None,
+        }
+    }
+
+    pub fn with_tls_ca(mut self, tls_ca: Option<PathBuf>) -> Self {
+        self.tls_ca = tls_ca;
+        self
     }
 
     pub async fn handle_message(&self, message: Value) -> Option<Value> {
@@ -95,7 +112,10 @@ impl Server {
         };
         match reply {
             Ok(reply) if reply.ok => {
-                let data = reply.data.unwrap_or(Value::Null);
+                let mut data = reply.data.unwrap_or(Value::Null);
+                if name == "create" && !arguments.optional_bool("show_secret").unwrap_or(false) {
+                    redact_created_room(&mut data);
+                }
                 let structured = match &data {
                     Value::Object(object) => Value::Object(object.clone()),
                     _ => json!({ "data": data }),
@@ -144,12 +164,20 @@ impl Server {
                     },
                     _ => return Err("mode must be stick or moderator".into()),
                 };
+                let open = arguments.optional_bool("open").unwrap_or(false);
+                let mut token = arguments.optional_hash("token")?;
+                if open && token.is_some() {
+                    return Err("open conflicts with token".into());
+                }
+                if !open && token.is_none() {
+                    token = Some(conch_core::types::Hash32::from_bytes(random::<[u8; 32]>()));
+                }
                 (
                     ClientRequest::Create {
                         name,
                         stake: StakePolicy::default(),
                         floor,
-                        token: arguments.optional_hash("token")?,
+                        token,
                     },
                     None,
                 )
@@ -158,7 +186,7 @@ impl Server {
                 let source = TicketSource::parse(arguments.string_ref("ticket")?)
                     .map_err(|error| error.to_string())?;
                 let token = arguments.optional_hash("token")?;
-                let ticket = resolve_ticket(source, token).await?;
+                let ticket = resolve_ticket(source, token, self.tls_ca.as_deref()).await?;
                 let role = match arguments.optional_string("role").unwrap_or("stake") {
                     "stake" => JoinRole::Stake,
                     "observe" => JoinRole::Observe,
@@ -339,8 +367,13 @@ impl Server {
     }
 }
 
-pub async fn run(node: String, agent: AgentId, room: Option<RoomId>) -> Result<(), String> {
-    let server = Server::new(node, agent, room);
+pub async fn run(
+    node: String,
+    agent: AgentId,
+    room: Option<RoomId>,
+    tls_ca: Option<PathBuf>,
+) -> Result<(), String> {
+    let server = Server::new(node, agent, room).with_tls_ca(tls_ca);
     let input = BufReader::new(io::stdin());
     let mut lines = input.lines();
     let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
@@ -449,6 +482,7 @@ impl Arguments {
 async fn resolve_ticket(
     source: TicketSource,
     token: Option<conch_core::types::Hash32>,
+    tls_ca: Option<&Path>,
 ) -> Result<Ticket, String> {
     let mut ticket = match source {
         TicketSource::Inline(ticket) => Ok(*ticket),
@@ -457,20 +491,7 @@ async fn resolve_ticket(
                 .map_err(|error| error.to_string())
         }
         TicketSource::Http(url) => {
-            let client = reqwest::Client::new();
-            let mut request = client.get(url);
-            if let Some(token) = token {
-                request = request.bearer_auth(token.to_string());
-            }
-            let bytes = request
-                .send()
-                .await
-                .map_err(|error| error.to_string())?
-                .error_for_status()
-                .map_err(|error| error.to_string())?
-                .bytes()
-                .await
-                .map_err(|error| error.to_string())?;
+            let bytes = fetch_ticket(&url, token, tls_ca).await?;
             Ticket::from_json_slice(&bytes).map_err(|error| error.to_string())
         }
     }?;
@@ -481,6 +502,100 @@ async fn resolve_ticket(
         ticket.token = Some(token);
     }
     Ok(ticket)
+}
+
+pub async fn fetch_ticket(
+    source: &str,
+    token: Option<conch_core::types::Hash32>,
+    tls_ca: Option<&Path>,
+) -> Result<Vec<u8>, String> {
+    const MAX_REDIRECTS: usize = 5;
+    const MAX_TICKET_BYTES: usize = 64 * 1024;
+
+    let mut client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    if let Some(path) = tls_ca {
+        let pem = fs::read(path)
+            .map_err(|error| format!("cannot read TLS CA {}: {error}", path.display()))?;
+        let certificates = reqwest::Certificate::from_pem_bundle(&pem)
+            .map_err(|error| format!("invalid TLS CA {}: {error}", path.display()))?;
+        if certificates.is_empty() {
+            return Err(format!(
+                "TLS CA {} contains no certificates",
+                path.display()
+            ));
+        }
+        for certificate in certificates {
+            client = client.add_root_certificate(certificate);
+        }
+    }
+    let client = client.build().map_err(|error| error.to_string())?;
+    let mut url = reqwest::Url::parse(source).map_err(|error| error.to_string())?;
+    let origin = ticket_origin(&url)?;
+    for redirects in 0..=MAX_REDIRECTS {
+        let mut request = client.get(url.clone());
+        if let Some(token) = token {
+            request = request.bearer_auth(token.to_string());
+        }
+        let response = request.send().await.map_err(|error| error.to_string())?;
+        if response.status().is_redirection() {
+            if redirects == MAX_REDIRECTS {
+                return Err("ticket redirect limit exceeded".into());
+            }
+            let mut locations = response.headers().get_all(reqwest::header::LOCATION).iter();
+            let location = locations
+                .next()
+                .ok_or("ticket redirect omitted Location")?
+                .to_str()
+                .map_err(|error| error.to_string())?;
+            if locations.next().is_some() {
+                return Err("ticket redirect supplied multiple Location headers".into());
+            }
+            let next = url.join(location).map_err(|error| error.to_string())?;
+            if ticket_origin(&next)? != origin {
+                return Err("ticket redirect changed origin".into());
+            }
+            url = next;
+            continue;
+        }
+        let response = response
+            .error_for_status()
+            .map_err(|error| error.to_string())?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_TICKET_BYTES as u64)
+        {
+            return Err("ticket response exceeds 64 KiB".into());
+        }
+        let bytes = response.bytes().await.map_err(|error| error.to_string())?;
+        if bytes.len() > MAX_TICKET_BYTES {
+            return Err("ticket response exceeds 64 KiB".into());
+        }
+        return Ok(bytes.to_vec());
+    }
+    unreachable!("the redirect loop returns or advances within its fixed bound")
+}
+
+fn ticket_origin(url: &reqwest::Url) -> Result<(String, String, u16), String> {
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("ticket URL cannot contain userinfo".into());
+    }
+    let host = url.host_str().ok_or("ticket URL requires a host")?;
+    let allowed = match url.scheme() {
+        "https" => true,
+        "http" => host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback()),
+        _ => false,
+    };
+    if !allowed {
+        return Err("ticket URL must use HTTPS or literal-loopback HTTP".into());
+    }
+    Ok((
+        url.scheme().to_owned(),
+        host.to_ascii_lowercase(),
+        url.port_or_known_default()
+            .ok_or("ticket URL requires an effective port")?,
+    ))
 }
 
 async fn write_frame<T: serde::Serialize>(stream: &mut TcpStream, value: &T) -> Result<(), String> {
@@ -562,7 +677,9 @@ fn tool_definitions() -> Vec<Value> {
                     "mode": { "enum": ["stick", "moderator"] },
                     "moderator": { "type": "string" },
                     "moderator_node": { "type": "string" },
-                    "token": { "type": "string", "description": "Optional 64-character hex room capability" }
+                    "token": { "type": "string", "description": "Explicit 64-character hex room capability" },
+                    "open": { "type": "boolean", "description": "Create a tokenless room instead of the private default (local/LAN only; public mode refuses open rooms)" },
+                    "show_secret": { "type": "boolean", "description": "Return the private room capability in this explicit response" }
                 }),
                 &["name"],
             ),
@@ -684,4 +801,19 @@ fn tool_definitions() -> Vec<Value> {
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
     json!({ "name": name, "description": description, "inputSchema": input_schema })
+}
+
+fn redact_created_room(data: &mut Value) {
+    let Some(object) = data.as_object_mut() else {
+        return;
+    };
+    let Some(ticket_value) = object.get_mut("ticket") else {
+        return;
+    };
+    let Ok(mut ticket) = serde_json::from_value::<Ticket>(ticket_value.clone()) else {
+        return;
+    };
+    ticket.token = None;
+    *ticket_value = serde_json::to_value(&ticket).expect("ticket is serializable");
+    object.insert("magnet".into(), Value::String(ticket.to_magnet()));
 }

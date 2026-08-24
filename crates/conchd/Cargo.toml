@@ -16,7 +16,15 @@ tokio.workspace = true
 thiserror.workspace = true
 axum.workspace = true
 futures-util.workspace = true
+axum-server.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+rustls-native-certs.workspace = true
+subtle.workspace = true
+url.workspace = true
 tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-native-roots"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+rcgen = "0.14.5"
+tokio = { workspace = true, features = ["test-util"] }

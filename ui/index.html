@@ -30,15 +30,15 @@
         </section>
 
         <section class="join-panel">
-          <p class="eyebrow">Open or join</p>
+          <p class="eyebrow">Open a locally joined room</p>
           <label for="ticket-source">Ticket, magnet, or URL</label>
           <textarea id="ticket-source" rows="4" placeholder="Paste a .conch JSON object or conch:1:… magnet"></textarea>
           <div class="join-row">
-            <select id="join-role" aria-label="Join role">
+            <select id="join-role" aria-label="Join role" hidden>
               <option value="stake">Stake</option>
               <option value="observe">Observe</option>
             </select>
-            <button id="join-button" class="secondary">Join room</button>
+            <button id="join-button" class="secondary">Open room</button>
           </div>
           <p id="join-error" class="error" role="alert"></p>
         </section>

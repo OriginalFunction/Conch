@@ -10,7 +10,7 @@ Reviewers: look for contradictions, missing algorithms, and any requirement that
 
 ## Changelog
 
-**v1.6.** Safety of Example I confirmed. Win **aborts** if `advance_term` demotes the leader mid-probe. `advance_term` runs on installed proofs and signed/roster election terms, not on bare `have_rpc`. Example I reworded (vote-quorum at 101, then higher `last_rpc`). Nack cases, probe bound, self-removal keeps serving `have`.
+**v1.6.** Safety of Example I confirmed. Win **aborts** if `advance_term` demotes the leader mid-probe. `advance_term` runs on installed proofs and signed/roster election terms, not on bare `have_rpc`. Example I reworded (vote-quorum at 101, then higher `last_rpc`). Nack cases, probe bound, self-removal keeps serving `have`. Breakout forwarding carries the holder-created child ticket and committed genesis so the room key remains on the holder node.
 
 **v1.5.** `current_term` is raised on every accepted commit proof (live catch-up, not only restart). Campaign starts at `max(current_term, tail.last_rpc)+1`. Followers catch up from `have`/nack. Self-removal pushes `commit` before step-down. Stale `pending.n <= head.n` is unlinked.
 
@@ -633,7 +633,7 @@ Always the **consensus leader**, not every staker.
 - Speech: freeze protocol (§12.1). `close_take` includes `blobs` already uploaded via `put_blob`.
 - Membership and view-change: leader proposes when vacant, or as the holder's take (`closes_grant` set). Membership requests are accepted only from agents attached to roster nodes. Never "because we cannot reach majority."
 
-**Client → leader.** `grant`, `yank`, `membership`, `breakout`, `yield`/`close_take` may be issued on a follower. That node sends the matching swarm `*_req` / `close_take` / `breakout_req` to `leader_id`. If `leader_id` is unknown: reply `unavailable`. The leader proposes; it does not require the client to be local.
+**Client → leader.** `grant`, `yank`, `membership`, `breakout`, `yield`/`close_take` may be issued on a follower. That node sends the matching swarm `*_req` / `close_take` / `breakout_req` to `leader_id`. For a breakout, the holder first freezes its take, creates and stages the child genesis locally, then includes the child ticket and committed genesis in `breakout_req`; the leader verifies the genesis room signature, creator node, parent, ticket hash, and requested name before proposing it. If `leader_id` is unknown: reply `unavailable`. The leader proposes; it does not require the client to be local.
 
 Holders must be on roster nodes. An observer can watch, not speak.
 
@@ -710,7 +710,7 @@ Illegal: next_roster empty.
 
 **Cold start.** `conch create --name NAME` → genesis, ticket file, magnet with `g=`. Each machine `conch join <ticket>`.
 
-**Lobby breakout.** Holder `conch breakout --name NAME [--members node,node]`. Leader proposes `breakout` body: new room key on the holder node, child genesis signed, ticket embedded, `parent` set, `auto_join` default = current roster, or the listed subset (must be subset of roster). Observers not listed.
+**Lobby breakout.** Holder `conch breakout --name NAME [--members node,node]`. The holder freezes its take and durably stages a newly signed child genesis before forwarding the request. Leader proposes `breakout` body only after verifying that exact holder-created genesis: new room key on the holder node, child genesis signed, ticket embedded, `parent` set, `auto_join` default = current roster, or the listed subset (must be subset of roster). Observers not listed. Failed forwarding leaves the stage retryable; only the matching committed parent breakout promotes it. Auto-join is an idempotent retrying commit side effect and its temporary failure does not turn the committed parent breakout into a failed mutation response.
 
 On commit, each listed node joins the child locally (`role=stake`). Child genesis must `apply()` before child `wait-for-floor`.
 
@@ -764,7 +764,7 @@ Framed JSON, `typ` field. Blobs: `blob_meta` then raw length-prefixed bytes. Max
 | `close_take` | room, grant_hash, text, rev, blobs |
 | `grant_req` | room, to, from `{agent,node}` |
 | `yank_req` | room, from `{agent,node}` |
-| `breakout_req` | room, name, members?, from |
+| `breakout_req` | room, name, members?, from, ticket, genesis `{scene,commit_proof}` |
 | `membership_req` | room, stake?, floor?, from |
 | `draft` | room, grant_hash, text, rev |
 | `leave` | room, node, sig |

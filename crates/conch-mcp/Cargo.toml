@@ -14,4 +14,6 @@ tokio.workspace = true
 
 [dev-dependencies]
 conchd = { path = "../conchd" }
+rcgen = "0.14.5"
 tempfile.workspace = true
+tokio-rustls.workspace = true

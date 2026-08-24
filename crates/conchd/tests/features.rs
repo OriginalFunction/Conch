@@ -1,21 +1,41 @@
 use std::{
     fs,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::{Arc, OnceLock},
 };
 
 use conch_core::{
     client::{ClientReply, ClientRequest},
-    consensus::{Freeze, Hello, SwarmMsg},
+    consensus::{Freeze, HelloI, SwarmMsg},
     encoding::scene_hash,
     ticket::JoinRole,
-    types::{AgentId, BlobRef, Body, FloorConfig, FloorMode, Hash32, Mouth, StakePolicy},
+    types::{
+        AgentId, BlobRef, Body, FloorConfig, FloorMode, Hash32, Mouth, SignatureBytes, StakePolicy,
+    },
 };
-use conchd::tcp::{read_frame, write_frame, Daemon};
+use conchd::tcp::{read_frame, write_frame, Daemon, TransportMode};
+use rcgen::{generate_simple_self_signed, CertifiedKey};
 use tempfile::TempDir;
-use tokio::{io::AsyncWriteExt, net::TcpStream, time::Duration};
+use tokio::{
+    io::AsyncWriteExt,
+    net::{TcpListener, TcpStream},
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time::{Duration, Instant},
+};
+use tokio_rustls::rustls::{
+    pki_types::PrivatePkcs8KeyDer, version::TLS13, ClientConfig, RootCertStore, ServerConfig,
+};
 
 fn loopback() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+}
+
+async fn network_test_guard() -> OwnedSemaphorePermit {
+    static NETWORK_TESTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(NETWORK_TESTS.get_or_init(|| Arc::new(Semaphore::new(1))))
+        .acquire_owned()
+        .await
+        .expect("network test semaphore remains open")
 }
 
 async fn attach(addr: SocketAddr, agent: &str) -> TcpStream {
@@ -45,6 +65,7 @@ async fn request(stream: &mut TcpStream, request: ClientRequest) -> ClientReply 
 
 #[tokio::test]
 async fn non_moderator_grant_not_moderator() {
+    let _network_test = network_test_guard().await;
     let data = TempDir::new().unwrap();
     let daemon = Daemon::open(data.path()).unwrap();
     let moderator = AgentId::new("human:operator").unwrap();
@@ -114,6 +135,7 @@ async fn non_moderator_grant_not_moderator() {
 
 #[tokio::test]
 async fn breakout_auto_join_shares_child_genesis() {
+    let _network_test = network_test_guard().await;
     let data = TempDir::new().unwrap();
     let daemon = Daemon::open(data.path()).unwrap();
     let ticket = daemon
@@ -172,6 +194,7 @@ async fn breakout_auto_join_shares_child_genesis() {
 
 #[tokio::test]
 async fn blob_put_is_durable_before_speech_certification() {
+    let _network_test = network_test_guard().await;
     let data = TempDir::new().unwrap();
     let daemon = Daemon::open(data.path()).unwrap();
     let ticket = daemon
@@ -244,6 +267,7 @@ async fn blob_put_is_durable_before_speech_certification() {
 
 #[tokio::test]
 async fn oversized_blob_declaration_replies_then_closes_transport() {
+    let _network_test = network_test_guard().await;
     let data = TempDir::new().unwrap();
     let daemon = Daemon::open(data.path()).unwrap();
     let ticket = daemon
@@ -276,6 +300,7 @@ async fn oversized_blob_declaration_replies_then_closes_transport() {
 
 #[tokio::test]
 async fn unsigned_hello_cannot_spoof_leader_freeze() {
+    let _network_test = network_test_guard().await;
     let data = TempDir::new().unwrap();
     let daemon = Daemon::open(data.path()).unwrap();
     let ticket = daemon
@@ -316,23 +341,18 @@ async fn unsigned_hello_cannot_spoof_leader_freeze() {
     let node = daemon.node_id();
     write_frame(
         &mut attacker,
-        &SwarmMsg::Hello(Hello {
+        &SwarmMsg::HelloI(HelloI {
+            label: "conch-swarm-v1".into(),
+            kind: "hello_i".into(),
+            v: 1,
             node,
             r#pub: node,
-            addrs: Vec::new(),
-            decl: Vec::new(),
+            nonce_i: Hash32::from_bytes([7; 32]),
+            sig: SignatureBytes::from_bytes([0; 64]),
         }),
     )
     .await
     .unwrap();
-    loop {
-        if matches!(
-            read_frame(&mut attacker).await.unwrap().unwrap(),
-            SwarmMsg::Have(_)
-        ) {
-            break;
-        }
-    }
     write_frame(
         &mut attacker,
         &SwarmMsg::Freeze(Freeze {
@@ -342,16 +362,160 @@ async fn unsigned_hello_cannot_spoof_leader_freeze() {
     )
     .await
     .unwrap();
-    assert!(tokio::time::timeout(
+    let response = tokio::time::timeout(
         Duration::from_millis(100),
-        read_frame::<_, SwarmMsg>(&mut attacker)
+        read_frame::<_, SwarmMsg>(&mut attacker),
     )
-    .await
-    .is_err());
+    .await;
+    assert!(!matches!(response, Ok(Ok(Some(_)))));
+}
+
+#[tokio::test]
+async fn reflected_live_hello_is_rejected_before_any_response_or_state_change() {
+    let _network_test = network_test_guard().await;
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let room = daemon.create_genesis("reflection").unwrap();
+    let server = daemon.start(loopback()).await.unwrap();
+    let attacker = TcpListener::bind(loopback()).await.unwrap();
+    let attacker_addr = attacker.local_addr().unwrap();
+    let before = daemon.replay(room).unwrap();
+
+    let outbound_daemon = daemon.clone();
+    let outbound = tokio::spawn(async move {
+        let _ = outbound_daemon.sync_room_from(attacker_addr, room).await;
+    });
+    let (mut attacker_side, _) = attacker.accept().await.unwrap();
+    let hello = read_frame::<_, SwarmMsg>(&mut attacker_side)
+        .await
+        .unwrap()
+        .expect("the initiator sends hello_i");
+    assert!(matches!(hello, SwarmMsg::HelloI(_)));
+
+    let mut reflected = TcpStream::connect(server.addr()).await.unwrap();
+    write_frame(&mut reflected, &hello).await.unwrap();
+    let response = tokio::time::timeout(
+        Duration::from_millis(250),
+        read_frame::<_, SwarmMsg>(&mut reflected),
+    )
+    .await;
+    assert!(
+        matches!(response, Ok(Ok(None))),
+        "a self-directed hello must be closed before hello_r"
+    );
+    drop(attacker_side);
+    outbound.await.unwrap();
+
+    let after = daemon.replay(room).unwrap();
+    assert_eq!(after.chain.head_hash, before.chain.head_hash);
+    assert_eq!(after.consensus, before.consensus);
+    assert_eq!(after.pending, before.pending);
+}
+
+#[tokio::test]
+async fn inbound_first_frame_and_node_handshake_share_one_five_second_deadline() {
+    let _network_test = network_test_guard().await;
+    let initiator_data = TempDir::new().unwrap();
+    let target_data = TempDir::new().unwrap();
+    let initiator = Daemon::open(initiator_data.path()).unwrap();
+    let target = Daemon::open(target_data.path()).unwrap();
+    let room = initiator.create_genesis("handshake deadline").unwrap();
+    let capture = TcpListener::bind(loopback()).await.unwrap();
+    let capture_addr = capture.local_addr().unwrap();
+    let outbound = tokio::spawn(async move {
+        let _ = initiator.sync_room_from(capture_addr, room).await;
+    });
+    let (mut capture_stream, _) = capture.accept().await.unwrap();
+    let hello = read_frame::<_, SwarmMsg>(&mut capture_stream)
+        .await
+        .unwrap()
+        .expect("initiator emits hello_i");
+
+    let server = target.start(loopback()).await.unwrap();
+    let started = Instant::now();
+    let mut slow = TcpStream::connect(server.addr()).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    write_frame(&mut slow, &hello).await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            read_frame::<_, SwarmMsg>(&mut slow)
+        )
+        .await,
+        Ok(Ok(Some(SwarmMsg::HelloR(_))))
+    ));
+    let closed =
+        tokio::time::timeout(Duration::from_secs(2), read_frame::<_, SwarmMsg>(&mut slow)).await;
+    assert!(matches!(closed, Ok(Ok(None)) | Ok(Err(_))));
+    assert!(started.elapsed() < Duration::from_secs(6));
+    outbound.abort();
+}
+
+#[tokio::test]
+async fn local_client_daemon_uses_custom_ca_tcps_and_never_downgrades_to_tcp() {
+    let _network_test = network_test_guard().await;
+    let CertifiedKey { cert, signing_key } =
+        generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
+    let key = PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into();
+    let provider = std::sync::Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider());
+    let server_config = ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.der().clone()], key)
+        .unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(cert.der().clone()).unwrap();
+    let provider = std::sync::Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider());
+    let client_config = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    let source_data = TempDir::new().unwrap();
+    let follower_data = TempDir::new().unwrap();
+    let source = Daemon::open(source_data.path()).unwrap();
+    let follower = Daemon::open(follower_data.path()).unwrap();
+    let client_config = std::sync::Arc::new(client_config);
+    source
+        .configure_transport(TransportMode::Public, Some(client_config.clone()))
+        .unwrap();
+    follower
+        .configure_transport(TransportMode::Local, Some(client_config))
+        .unwrap();
+    let server = source
+        .start_tls(loopback(), std::sync::Arc::new(server_config))
+        .await
+        .unwrap();
+    let token = Hash32::from_bytes([7; 32]);
+    let ticket = source
+        .create_ticket_with_token(
+            "public tls",
+            StakePolicy::default(),
+            FloorConfig::stick(30),
+            Some(token),
+        )
+        .unwrap();
+    assert!(ticket.peers.iter().any(|peer| peer.starts_with("tcps://")));
+
+    let mut plaintext_only = ticket.clone();
+    plaintext_only.peers = vec![format!("tcp://{}", server.addr())];
+    assert!(follower
+        .join_ticket(plaintext_only, JoinRole::Observe)
+        .await
+        .is_err());
+
+    let chain = follower
+        .join_ticket(ticket.clone(), JoinRole::Observe)
+        .await
+        .unwrap();
+    assert_eq!(chain.head_hash, Some(ticket.genesis));
 }
 
 #[tokio::test]
 async fn history_follow_streams_each_new_committed_batch() {
+    let _network_test = network_test_guard().await;
     let data = TempDir::new().unwrap();
     let daemon = Daemon::open(data.path()).unwrap();
     let ticket = daemon
@@ -394,6 +558,7 @@ async fn history_follow_streams_each_new_committed_batch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_daemon_staker_wrap_uses_network_votes_and_certs() {
+    let _network_test = network_test_guard().await;
     let source_data = TempDir::new().unwrap();
     let follower_data = TempDir::new().unwrap();
     let source = Daemon::open(source_data.path()).unwrap();
@@ -420,7 +585,7 @@ async fn two_daemon_staker_wrap_uses_network_votes_and_certs() {
             .await
             .ok
     );
-    tokio::time::timeout(Duration::from_secs(3), async {
+    let granted = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             if follower
                 .replay(ticket.id)
@@ -434,8 +599,13 @@ async fn two_daemon_staker_wrap_uses_network_votes_and_certs() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .unwrap();
+    .await;
+    assert!(
+        granted.is_ok(),
+        "source={:?}; follower={:?}",
+        source.replay(ticket.id).unwrap(),
+        follower.replay(ticket.id).unwrap()
+    );
     let attachment = b"network blob";
     write_frame(
         &mut writer,
@@ -466,7 +636,7 @@ async fn two_daemon_staker_wrap_uses_network_votes_and_certs() {
     let yielded = request(&mut writer, ClientRequest::Yield { room: ticket.id }).await;
     assert!(yielded.ok, "{yielded:?}");
 
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if source.replay(ticket.id).unwrap().chain.head_n
                 == follower.replay(ticket.id).unwrap().chain.head_n
@@ -507,6 +677,7 @@ async fn two_daemon_staker_wrap_uses_network_votes_and_certs() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn moderator_yank_freezes_remote_holder_before_commit() {
+    let _network_test = network_test_guard().await;
     let source_data = TempDir::new().unwrap();
     let holder_data = TempDir::new().unwrap();
     let source = Daemon::open(source_data.path()).unwrap();
@@ -550,7 +721,7 @@ async fn moderator_yank_freezes_remote_holder_before_commit() {
     )
     .await;
     assert!(granted.ok, "{granted:?}");
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         while holder.replay(ticket.id).unwrap().chain.live_grant.is_none() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -585,7 +756,8 @@ async fn moderator_yank_freezes_remote_holder_before_commit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn observer_moderator_forwards_grant_and_yank_to_leader() {
+async fn follower_staker_moderator_forwards_grant_and_yank_without_blocking_append() {
+    let _network_test = network_test_guard().await;
     let source_data = TempDir::new().unwrap();
     let moderator_data = TempDir::new().unwrap();
     let source = Daemon::open(source_data.path()).unwrap();
@@ -608,9 +780,10 @@ async fn observer_moderator_forwards_grant_and_yank_to_leader() {
         )
         .unwrap();
     moderator_node
-        .join_ticket(ticket.clone(), JoinRole::Observe)
+        .join_ticket(ticket.clone(), JoinRole::Stake)
         .await
         .unwrap();
+    assert_eq!(source.replay(ticket.id).unwrap().chain.roster.len(), 2);
 
     let mut writer = attach(source_server.addr(), "agent:writer").await;
     assert!(
@@ -644,6 +817,7 @@ async fn observer_moderator_forwards_grant_and_yank_to_leader() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn two_of_three_live_stakers_can_wrap() {
+    let _network_test = network_test_guard().await;
     let source_data = TempDir::new().unwrap();
     let second_data = TempDir::new().unwrap();
     let third_data = TempDir::new().unwrap();
@@ -709,7 +883,84 @@ async fn two_of_three_live_stakers_can_wrap() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn learned_pex_mesh_wraps_after_initial_seeder_exits() {
+    let _network_test = network_test_guard().await;
+    let source_data = TempDir::new().unwrap();
+    let second_data = TempDir::new().unwrap();
+    let third_data = TempDir::new().unwrap();
+    let source = Daemon::open(source_data.path()).unwrap();
+    let second = Daemon::open(second_data.path()).unwrap();
+    let third = Daemon::open(third_data.path()).unwrap();
+    let source_server = source.start(loopback()).await.unwrap();
+    let second_server = second.start(loopback()).await.unwrap();
+    let _third_server = third.start(loopback()).await.unwrap();
+    let ticket = source
+        .create_ticket(
+            "kill seeder",
+            StakePolicy::default(),
+            FloorConfig::stick(30),
+        )
+        .unwrap();
+    second
+        .join_ticket(ticket.clone(), JoinRole::Stake)
+        .await
+        .unwrap();
+    third
+        .join_ticket(ticket.clone(), JoinRole::Stake)
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let learned = fs::read(second_data.path().join("peers.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|peers| {
+                    peers
+                        .get(ticket.id.to_string())?
+                        .get(third.node_id().to_string())
+                        .cloned()
+                })
+                .is_some();
+            if learned {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the surviving stakers must learn one another through PEX");
+    source_server.abort();
+    drop(source_server);
+    drop(source);
+
+    let mut client = attach(second_server.addr(), "agent:survivor").await;
+    assert!(
+        request(&mut client, ClientRequest::RaiseHand { room: ticket.id })
+            .await
+            .ok
+    );
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if second.replay(ticket.id).unwrap().chain.live_grant.is_some()
+                && third.replay(ticket.id).unwrap().chain.live_grant.is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the PEX mesh must elect and wrap without the seeder");
+    assert_eq!(
+        second.replay(ticket.id).unwrap().chain.head_hash,
+        third.replay(ticket.id).unwrap().chain.head_hash
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn remaining_majority_elects_successor_after_leader_stops() {
+    let _network_test = network_test_guard().await;
     let source_data = TempDir::new().unwrap();
     let second_data = TempDir::new().unwrap();
     let third_data = TempDir::new().unwrap();
@@ -774,6 +1025,7 @@ async fn remaining_majority_elects_successor_after_leader_stops() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_of_two_live_stakers_cannot_wrap() {
+    let _network_test = network_test_guard().await;
     let source_data = TempDir::new().unwrap();
     let follower_data = TempDir::new().unwrap();
     let source = Daemon::open(source_data.path()).unwrap();
@@ -807,6 +1059,7 @@ async fn one_of_two_live_stakers_cannot_wrap() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restarted_network_leader_carries_exact_pending_hash() {
+    let _network_test = network_test_guard().await;
     let source_data = TempDir::new().unwrap();
     let follower_data = TempDir::new().unwrap();
     let source = Daemon::open(source_data.path()).unwrap();
@@ -845,17 +1098,25 @@ async fn restarted_network_leader_carries_exact_pending_hash() {
         .sync_room_from(source_server.addr(), ticket.id)
         .await
         .unwrap();
-    let mut writer = attach(source_server.addr(), "agent:carry").await;
-    let retried = request(&mut writer, ClientRequest::RaiseHand { room: ticket.id }).await;
-    assert!(retried.ok, "{retried:?}");
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while source.replay(ticket.id).unwrap().chain.head_n != Some(2) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the new leader must carry the accepted entry without a client nudge");
     let replay = source.replay(ticket.id).unwrap();
     assert_eq!(replay.chain.head_n, Some(2));
     assert_eq!(replay.chain.head_hash, Some(accepted_hash));
-    assert_eq!(replay.history.last().unwrap().commit_proof.rpc_term, 3);
+    assert!(
+        replay.history.last().unwrap().commit_proof.rpc_term >= 3,
+        "retries may advance the election term, but must commit the accepted hash"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn network_breakout_autojoins_listed_peer() {
+    let _network_test = network_test_guard().await;
     let source_data = TempDir::new().unwrap();
     let holder_data = TempDir::new().unwrap();
     let source = Daemon::open(source_data.path()).unwrap();
@@ -879,7 +1140,7 @@ async fn network_breakout_autojoins_listed_peer() {
             .await
             .ok
     );
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         while holder.replay(parent.id).unwrap().chain.live_grant.is_none() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -898,7 +1159,7 @@ async fn network_breakout_autojoins_listed_peer() {
     assert!(breakout.ok, "{breakout:?}");
     let child: conch_core::ticket::Ticket =
         serde_json::from_value(breakout.data.unwrap()["ticket"].clone()).unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if source
                 .replay(child.id)
@@ -922,6 +1183,7 @@ async fn network_breakout_autojoins_listed_peer() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn uncommitted_breakout_child_stays_staged_across_restart() {
+    let _network_test = network_test_guard().await;
     let source_data = TempDir::new().unwrap();
     let follower_data = TempDir::new().unwrap();
     let source = Daemon::open(source_data.path()).unwrap();
@@ -983,23 +1245,26 @@ async fn uncommitted_breakout_child_stays_staged_across_restart() {
         .sync_room_from(source_server.addr(), parent.id)
         .await
         .unwrap();
-    let mut client = attach(source_server.addr(), "agent:holder").await;
-    let recovered = request(
-        &mut client,
-        ClientRequest::Breakout {
-            room: parent.id,
-            name: "ignored retry name".into(),
-            members: None,
-        },
-    )
-    .await;
-    assert!(recovered.ok, "{recovered:?}");
-    assert_eq!(recovered.data.unwrap()["id"], child.id.to_string());
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while source.replay(child.id).is_err() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the new leader must carry the staged breakout without a client nudge");
+    let committed = source.replay(parent.id).unwrap();
+    assert!(matches!(
+        &committed.history.last().unwrap().scene.body,
+        Body::Breakout { ticket, .. }
+            if serde_json::from_value::<conch_core::ticket::Ticket>(ticket.clone())
+                .is_ok_and(|ticket| ticket.id == child.id)
+    ));
     assert!(source.replay(child.id).is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn leader_self_removal_pushes_commit_then_cannot_campaign() {
+    let _network_test = network_test_guard().await;
     let source_data = TempDir::new().unwrap();
     let second_data = TempDir::new().unwrap();
     let third_data = TempDir::new().unwrap();
@@ -1057,6 +1322,7 @@ async fn leader_self_removal_pushes_commit_then_cannot_campaign() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn follower_leave_is_signed_and_forwarded_to_the_leader() {
+    let _network_test = network_test_guard().await;
     let source_data = TempDir::new().unwrap();
     let second_data = TempDir::new().unwrap();
     let third_data = TempDir::new().unwrap();

@@ -3,12 +3,13 @@ const HUMAN = "human:operator";
 const state = {
   socket: null,
   pending: [],
-  room: localStorage.getItem("conch.room") || new URLSearchParams(location.search).get("room"),
-  token: localStorage.getItem("conch.token") || "",
+  room: localStorage.getItem("conch.room") || null,
+  token: "",
   node: null,
   history: [],
   liveGrant: null,
   refreshing: false,
+  readOnly: false,
 };
 
 const el = {
@@ -35,13 +36,14 @@ const el = {
 
 function wsUrl() {
   const scheme = location.protocol === "https:" ? "wss:" : "ws:";
-  const query = new URLSearchParams();
-  if (state.room) query.set("room", state.room);
-  if (state.token) query.set("token", state.token);
-  return `${scheme}//${location.host}/client${query.size ? `?${query}` : ""}`;
+  return `${scheme}//${location.host}/client`;
 }
 
 async function connect() {
+  if (!state.room) {
+    setConnection("offline", "Open a room");
+    return;
+  }
   if (state.socket) state.socket.close();
   setConnection("connecting", "Connecting");
   const socket = new WebSocket(wsUrl());
@@ -63,6 +65,7 @@ async function connect() {
   });
   const attached = await rpc({ typ: "attach", agent: HUMAN });
   state.node = attached.node || null;
+  state.readOnly = false;
   setConnection("online", "Verified connection");
   if (state.room) await refresh();
   renderFacts();
@@ -80,7 +83,20 @@ async function refresh() {
   if (!state.room || state.refreshing || state.pending.length) return;
   state.refreshing = true;
   try {
-    const page = await rpc({ typ: "history", room: state.room, from_n: 0 });
+    let page;
+    if (state.socket?.readyState === WebSocket.OPEN) {
+      page = await rpc({ typ: "history", room: state.room, from_n: 0 });
+    } else {
+      const headers = state.token ? { Authorization: `Bearer ${state.token}` } : {};
+      const response = await fetch(`/history/${encodeURIComponent(state.room)}?from=0`, {
+        headers,
+        cache: "no-store",
+      });
+      if (!response.ok) throw new Error(`History unavailable (${response.status}).`);
+      page = await response.json();
+      state.readOnly = true;
+      setConnection("online", "Verified read-only ledger");
+    }
     state.history = page.scenes;
     if (page.syncing) setConnection("syncing", "Showing a verified prefix while catching up");
     await renderHistory();
@@ -142,11 +158,13 @@ function updateFloor() {
   else if (!state.liveGrant) el.floorStatus.textContent = "The floor is vacant.";
   else if (mine) el.floorStatus.textContent = "You hold Conch. Your next take can be wrapped.";
   else el.floorStatus.textContent = `${state.liveGrant.to.agent} holds Conch on ${short(state.liveGrant.to.node)}.`;
-  el.takeButton.disabled = !state.room || Boolean(state.liveGrant);
+  el.takeButton.disabled = state.readOnly || !state.room || Boolean(state.liveGrant);
   el.speech.disabled = !mine;
   el.wrapButton.disabled = !mine || !el.speech.value.trim();
   el.yieldButton.disabled = !mine;
-  el.composeHint.textContent = mine ? "Drafts remain unverified until you wrap and yield." : "The wrapped grant controls this composer.";
+  el.composeHint.textContent = state.readOnly
+    ? "This tokenless browser view is read-only; use the local CLI to write."
+    : mine ? "Drafts remain unverified until you wrap and yield." : "The wrapped grant controls this composer.";
   if (!mine) hideDraft();
 }
 
@@ -163,13 +181,29 @@ async function joinRoom() {
   el.joinButton.disabled = true;
   try {
     const ticket = await parseTicket(el.ticketSource.value.trim());
-    const reply = await rpc({ typ: "join", ticket, role: el.joinRole.value });
-    state.room = reply.id;
+    state.room = ticket.id;
     state.token = ticket.token || "";
     localStorage.setItem("conch.room", state.room);
-    if (state.token) localStorage.setItem("conch.token", state.token); else localStorage.removeItem("conch.token");
-    history.replaceState(null, "", `?room=${encodeURIComponent(state.room)}`);
-    await connect();
+    if (state.token) {
+      const capability = state.token;
+      let session;
+      try {
+        session = await fetch(`/session/${encodeURIComponent(state.room)}`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${capability}` },
+          credentials: "same-origin",
+        });
+      } finally {
+        state.token = "";
+        el.ticketSource.value = "";
+      }
+      if (!session.ok) throw new Error(`Session authorization failed (${session.status}); join this ticket with the local conch CLI first.`);
+      await connect();
+    } else {
+      state.readOnly = true;
+      if (state.socket) state.socket.close();
+      await refresh();
+    }
     el.ticketSource.value = "";
   } catch (error) {
     el.joinError.textContent = error.message;
@@ -259,5 +293,8 @@ el.speech.addEventListener("input", () => {
   el.draftPreview.hidden = !text;
 });
 
-connect().catch((error) => setConnection("offline", error.message));
+connect().catch(async () => {
+  try { await refresh(); }
+  catch (error) { setConnection("offline", error.message); }
+});
 setInterval(refresh, 1500);

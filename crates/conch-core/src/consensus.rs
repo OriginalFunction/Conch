@@ -33,18 +33,60 @@ pub struct HaveObservation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Hello {
+pub struct HelloI {
+    pub label: String,
+    pub kind: String,
+    pub v: u64,
     pub node: NodeId,
     pub r#pub: NodeId,
-    pub addrs: Vec<String>,
-    pub decl: Vec<Declaration>,
+    pub nonce_i: Hash32,
+    pub sig: SignatureBytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelloR {
+    pub label: String,
+    pub kind: String,
+    pub v: u64,
+    pub node: NodeId,
+    pub r#pub: NodeId,
+    pub peer: NodeId,
+    pub nonce_i: Hash32,
+    pub nonce_r: Hash32,
+    pub hello_i_hash: Hash32,
+    pub sig: SignatureBytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelloAck {
+    pub label: String,
+    pub kind: String,
+    pub v: u64,
+    pub node: NodeId,
+    pub peer: NodeId,
+    pub nonce_i: Hash32,
+    pub nonce_r: Hash32,
+    pub hello_i_hash: Hash32,
+    pub hello_r_hash: Hash32,
+    pub sig: SignatureBytes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Auth {
     pub room: RoomId,
-    pub token: Hash32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<Hash32>,
+    pub declaration: Declaration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Authed {
+    pub room: RoomId,
+    pub declaration: Declaration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +99,7 @@ pub struct PeerInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pex {
+    pub room: RoomId,
     pub peers: Vec<PeerInfo>,
 }
 
@@ -244,9 +287,35 @@ pub struct YankReq {
     pub from: crate::types::Mouth,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BreakoutReq {
+    pub room: RoomId,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members: Option<Vec<NodeId>>,
+    pub from: crate::types::Mouth,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genesis: Option<crate::types::CommittedScene>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MembershipReq {
+    pub room: RoomId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stake: Option<crate::types::StakePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor: Option<crate::types::FloorConfig>,
+    pub from: crate::types::Mouth,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GetBlob {
+    pub room: RoomId,
     pub sha256: Hash32,
 }
 
@@ -260,8 +329,11 @@ pub struct BlobMeta {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "typ", rename_all = "snake_case")]
 pub enum SwarmMsg {
-    Hello(Hello),
+    HelloI(HelloI),
+    HelloR(HelloR),
+    HelloAck(HelloAck),
     Auth(Auth),
+    Authed(Authed),
     Pex(Pex),
     Have(HaveMessage),
     RequestVote(RequestVote),
@@ -279,6 +351,8 @@ pub enum SwarmMsg {
     Leave(Leave),
     GrantReq(GrantReq),
     YankReq(YankReq),
+    BreakoutReq(BreakoutReq),
+    MembershipReq(MembershipReq),
     GetBlob(GetBlob),
     BlobMeta(BlobMeta),
 }

@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
@@ -72,6 +74,15 @@ impl Store {
         fs::create_dir_all(root.join("scenes"))?;
         fs::create_dir_all(root.join("blobs"))?;
         fs::create_dir_all(root.join("intents"))?;
+        #[cfg(unix)]
+        for directory in [
+            &root,
+            &root.join("scenes"),
+            &root.join("blobs"),
+            &root.join("intents"),
+        ] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        }
         sync_dir(&root)?;
         Ok(Self {
             root,
@@ -505,10 +516,11 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
         })?;
     let temporary = parent.join(format!(".{filename}.tmp-{}-{suffix}", std::process::id()));
     let result = (|| -> Result<(), StoreError> {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);

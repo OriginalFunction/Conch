@@ -147,6 +147,86 @@ async fn cli_speak_retry_yield_and_next_waiter() {
     assert!(String::from_utf8_lossy(&late.stderr).contains("no_grant"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raise_retry_and_wait_while_granted_do_not_queue_a_second_turn() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    let server = daemon.start(bind).await.unwrap();
+    let node = format!("tcp://{}", server.addr());
+    let binary = env!("CARGO_BIN_EXE_conch");
+    let room = create(binary, &node, data.path()).await;
+    let raise_args = [
+        "--node",
+        &node,
+        "--agent",
+        "alpha",
+        "--room",
+        &room,
+        "raise-hand",
+    ];
+
+    let first = run(binary, &raise_args, data.path()).await;
+    let retry = run(binary, &raise_args, data.path()).await;
+    assert!(first.status.success());
+    assert!(retry.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&first.stdout).unwrap()["intent_id"],
+        serde_json::from_slice::<Value>(&retry.stdout).unwrap()["intent_id"]
+    );
+    let waited = run(
+        binary,
+        &[
+            "--node",
+            &node,
+            "--agent",
+            "alpha",
+            "--room",
+            &room,
+            "wait-for-floor",
+        ],
+        data.path(),
+    )
+    .await;
+    assert!(
+        waited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    assert!(speak(
+        binary,
+        &node,
+        &room,
+        "alpha",
+        &"cd".repeat(16),
+        "one turn",
+        data.path(),
+    )
+    .await
+    .status
+    .success());
+    assert!(run(
+        binary,
+        &["--node", &node, "--agent", "alpha", "--room", &room, "yield",],
+        data.path(),
+    )
+    .await
+    .status
+    .success());
+    let history = run(
+        binary,
+        &[
+            "--node", &node, "--agent", "alpha", "--room", &room, "history",
+        ],
+        data.path(),
+    )
+    .await;
+    assert!(history.status.success());
+    let history: Value = serde_json::from_slice(&history.stdout).unwrap();
+    assert_eq!(history["scenes"].as_array().unwrap().len(), 3);
+    assert_eq!(history["scenes"][2]["scene"]["body"]["type"], "speech");
+}
+
 async fn create(binary: &str, node: &str, cwd: &Path) -> String {
     let created = run(
         binary,

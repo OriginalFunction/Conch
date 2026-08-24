@@ -45,6 +45,60 @@ async fn create_writes_slug_ticket_and_prints_pinned_magnet() {
     assert_eq!(ticket.peers, vec![node]);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_output_and_captured_errors_never_log_the_room_capability() {
+    let data = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let server = daemon.start(loopback()).await.unwrap();
+    let node = format!("tcp://{}", server.addr());
+    let sentinel = "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5";
+
+    let created = Command::new(env!("CARGO_BIN_EXE_conch"))
+        .args([
+            "--node",
+            &node,
+            "--token",
+            sentinel,
+            "create",
+            "--name",
+            "Sentinel Secret",
+        ])
+        .current_dir(output_dir.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(created.status.success());
+    assert!(!String::from_utf8_lossy(&created.stdout).contains(sentinel));
+    assert!(!String::from_utf8_lossy(&created.stderr).contains(sentinel));
+    let reply: Value = serde_json::from_slice(&created.stdout).unwrap();
+    assert!(!reply["magnet"].as_str().unwrap().contains("x.cap="));
+    let ticket = Ticket::from_json_slice(
+        &fs::read(output_dir.path().join("sentinel-secret.conch")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ticket.token.unwrap().to_string(), sentinel);
+
+    let rejected = Command::new(env!("CARGO_BIN_EXE_conch"))
+        .args([
+            "--node",
+            &node,
+            "--token",
+            sentinel,
+            "create",
+            "--name",
+            "Rejected Secret",
+            "--open",
+        ])
+        .current_dir(output_dir.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(!String::from_utf8_lossy(&rejected.stdout).contains(sentinel));
+    assert!(!String::from_utf8_lossy(&rejected.stderr).contains(sentinel));
+}
+
 #[tokio::test]
 async fn create_observe_rejected_before_connecting() {
     let output_dir = TempDir::new().unwrap();

@@ -9,7 +9,7 @@ use conch_core::{
     ticket::JoinRole,
     types::{AgentId, FloorConfig, Hash32, StakePolicy},
 };
-use conchd::tcp::{read_frame, Daemon};
+use conchd::tcp::{read_frame, Daemon, TransportMode};
 use tempfile::TempDir;
 use tokio::{io::AsyncWriteExt, net::TcpStream};
 
@@ -137,8 +137,11 @@ async fn malformed_client_request_gets_an_invalid_reply() {
 async fn listen_file_and_advertise_feed_new_tickets() {
     let data = TempDir::new().unwrap();
     let daemon = Daemon::open(data.path()).unwrap();
+    daemon
+        .configure_transport(TransportMode::Lan, None)
+        .unwrap();
     daemon.advertise("tcp://conch.example.test:7421").unwrap();
-    daemon.advertise("wss://conch.example.test/swarm").unwrap();
+    daemon.advertise("ws://conch.example.test/swarm").unwrap();
     let tcp = daemon.start(loopback()).await.unwrap();
     let http = daemon.start_http(loopback()).await.unwrap();
     let listen: serde_json::Value =
@@ -157,8 +160,12 @@ async fn listen_file_and_advertise_feed_new_tickets() {
     let ticket = daemon
         .create_ticket("advertised", StakePolicy::default(), FloorConfig::stick(30))
         .unwrap();
-    assert_eq!(ticket.peers[0], "tcp://conch.example.test:7421");
-    assert_eq!(ticket.trackers[0], "wss://conch.example.test/swarm");
+    assert!(ticket
+        .peers
+        .contains(&"tcp://conch.example.test:7421".into()));
+    assert!(ticket
+        .trackers
+        .contains(&"ws://conch.example.test/swarm".into()));
 }
 
 #[tokio::test]
@@ -178,6 +185,7 @@ async fn observer_learns_roster_peer_endpoints_through_pex() {
         .join_ticket(ticket.clone(), JoinRole::Stake)
         .await
         .unwrap();
+    let room = ticket.id;
     observer
         .join_ticket(ticket, JoinRole::Observe)
         .await
@@ -186,7 +194,10 @@ async fn observer_learns_roster_peer_endpoints_through_pex() {
     let peers: serde_json::Value =
         serde_json::from_slice(&fs::read(observer_data.path().join("peers.json")).unwrap())
             .unwrap();
-    assert!(peers.get(second.node_id().to_string()).is_some());
+    assert!(peers
+        .get(room.to_string())
+        .and_then(|room| room.get(second.node_id().to_string()))
+        .is_some());
 }
 
 fn loopback() -> SocketAddr {

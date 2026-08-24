@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
     env,
     fs::{self, OpenOptions},
@@ -33,18 +35,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let Arguments {
         node,
         agent,
+        tls_ca,
         request,
         output,
     } = parsed;
     if let ParsedRequest::Mcp { room } = &request {
-        return conch_mcp::run(node, agent, *room).await.map_err(Into::into);
+        return conch_mcp::run(node, agent, *room, tls_ca)
+            .await
+            .map_err(Into::into);
     }
     let follow = matches!(
         &request,
         ParsedRequest::Ready(request)
             if matches!(request.as_ref(), ClientRequest::History { follow: true, .. })
     );
-    let (request, raw) = request.resolve().await?;
+    let (request, raw) = request.resolve(tls_ca.as_deref()).await?;
     let mut stream = TcpStream::connect(parse_node_addr(&node)?).await?;
     write_frame(&mut stream, &ClientRequest::Attach { agent }).await?;
     let attached: ClientReply = read_frame(&mut stream).await?;
@@ -76,19 +81,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let data = reply.data.unwrap_or_default();
     let output = match output {
         Output::Json => data,
-        Output::Create { ticket_path } => {
+        Output::Create {
+            ticket_path,
+            show_secret,
+        } => {
             let ticket: Ticket = serde_json::from_value(
                 data.get("ticket")
                     .cloned()
                     .ok_or("daemon create reply omitted ticket")?,
             )?;
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&ticket_path)?;
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut file = options.open(&ticket_path)?;
             serde_json::to_writer(&mut file, &ticket)?;
             file.sync_all()?;
-            let magnet = ticket.to_magnet();
+            let magnet = if show_secret {
+                ticket.to_magnet()
+            } else {
+                let mut public = ticket.clone();
+                public.token = None;
+                public.to_magnet()
+            };
             serde_json::json!({
                 "ticket_path": format!("./{}", ticket_path.display()),
                 "magnet": magnet,
@@ -100,16 +115,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn fetch_ticket(
+    source: &str,
+    token: Option<Hash32>,
+    tls_ca: Option<&std::path::Path>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    conch_mcp::fetch_ticket(source, token, tls_ca)
+        .await
+        .map_err(|error| io::Error::other(error).into())
+}
+
 struct Arguments {
     node: String,
     agent: AgentId,
+    tls_ca: Option<PathBuf>,
     request: ParsedRequest,
     output: Output,
 }
 
 enum Output {
     Json,
-    Create { ticket_path: PathBuf },
+    Create {
+        ticket_path: PathBuf,
+        show_secret: bool,
+    },
 }
 
 enum ParsedRequest {
@@ -129,7 +158,10 @@ enum ParsedRequest {
 }
 
 impl ParsedRequest {
-    async fn resolve(self) -> Result<(ClientRequest, Option<Vec<u8>>), Box<dyn std::error::Error>> {
+    async fn resolve(
+        self,
+        tls_ca: Option<&std::path::Path>,
+    ) -> Result<(ClientRequest, Option<Vec<u8>>), Box<dyn std::error::Error>> {
         match self {
             Self::Ready(request) => Ok((*request, None)),
             Self::Join {
@@ -141,12 +173,7 @@ impl ParsedRequest {
                     TicketSource::Inline(ticket) => *ticket,
                     TicketSource::File(path) => Ticket::from_json_slice(&fs::read(path)?)?,
                     TicketSource::Http(url) => {
-                        let client = reqwest::Client::new();
-                        let mut request = client.get(url);
-                        if let Some(token) = token {
-                            request = request.bearer_auth(token.to_string());
-                        }
-                        let bytes = request.send().await?.error_for_status()?.bytes().await?;
+                        let bytes = fetch_ticket(&url, token, tls_ca).await?;
                         Ticket::from_json_slice(&bytes)?
                     }
                 };
@@ -204,6 +231,7 @@ impl Arguments {
         let mut arguments = arguments.peekable();
         let mut node = env::var("CONCH_NODE").unwrap_or_else(|_| "tcp://127.0.0.1:7421".into());
         let mut agent = env::var("CONCH_AGENT").unwrap_or_else(|_| "local".into());
+        let mut tls_ca = env::var_os("CONCH_TLS_CA").map(PathBuf::from);
         let mut room = env::var("CONCH_ROOM").ok().or_else(read_current_room);
         let mut token = env::var("CONCH_TOKEN")
             .ok()
@@ -235,11 +263,40 @@ impl Arguments {
                             .map_err(|error| error.to_string())?,
                     );
                 }
+                "--tls-ca" => {
+                    arguments.next();
+                    tls_ca = Some(PathBuf::from(
+                        arguments.next().ok_or("--tls-ca requires a PEM file")?,
+                    ));
+                }
+                "--version" | "-V" => {
+                    println!("conch {}", env!("CARGO_PKG_VERSION"));
+                    std::process::exit(0);
+                }
+                "--help" | "-h" => {
+                    print_help();
+                    std::process::exit(0);
+                }
                 _ => break,
             }
         }
 
         let command = arguments.next().ok_or("a command is required")?;
+        if command == "help" {
+            if let Some(command) = arguments.next() {
+                print_command_help(&command)?;
+            } else {
+                print_help();
+            }
+            std::process::exit(0);
+        }
+        if arguments
+            .peek()
+            .is_some_and(|argument| argument == "--help" || argument == "-h")
+        {
+            print_command_help(&command)?;
+            std::process::exit(0);
+        }
         let resolve_room = || -> Result<RoomId, String> {
             room.as_deref()
                 .ok_or("--room is required for this command")?
@@ -254,6 +311,8 @@ impl Arguments {
                 let mut moderator_agent = None;
                 let mut moderator_node = None;
                 let mut create_token = token;
+                let mut open = false;
+                let mut show_secret = false;
                 while let Some(flag) = arguments.next() {
                     match flag.as_str() {
                         "--name" => {
@@ -284,6 +343,8 @@ impl Arguments {
                             );
                         }
                         "--observe" => return Err("create cannot use --observe".into()),
+                        "--open" => open = true,
+                        "--show-secret" => show_secret = true,
                         "--token" => {
                             create_token = Some(
                                 arguments
@@ -293,8 +354,32 @@ impl Arguments {
                                     .map_err(|error| error.to_string())?,
                             );
                         }
+                        "--token-file" => {
+                            let path = arguments.next().ok_or("--token-file requires a path")?;
+                            let mut value = String::new();
+                            if path == "-" {
+                                io::stdin()
+                                    .read_to_string(&mut value)
+                                    .map_err(|error| error.to_string())?;
+                            } else {
+                                value =
+                                    fs::read_to_string(path).map_err(|error| error.to_string())?;
+                            }
+                            create_token = Some(
+                                value
+                                    .trim()
+                                    .parse::<Hash32>()
+                                    .map_err(|error| error.to_string())?,
+                            );
+                        }
                         _ => return Err(format!("unknown create argument: {flag}")),
                     }
+                }
+                if open && create_token.is_some() {
+                    return Err("--open conflicts with --token/--token-file".into());
+                }
+                if !open && create_token.is_none() {
+                    create_token = Some(Hash32::from_bytes(random::<[u8; 32]>()));
                 }
                 let name = name.ok_or("--name is required")?;
                 let moderator = match (mode, moderator_agent, moderator_node) {
@@ -316,7 +401,10 @@ impl Arguments {
                         ticket_path.display()
                     ));
                 }
-                output = Output::Create { ticket_path };
+                output = Output::Create {
+                    ticket_path,
+                    show_secret,
+                };
                 ready(ClientRequest::Create {
                     name,
                     stake: StakePolicy::default(),
@@ -594,10 +682,63 @@ impl Arguments {
         Ok(Self {
             node,
             agent: AgentId::new(agent).map_err(|error| error.to_string())?,
+            tls_ca,
             request,
             output,
         })
     }
+}
+
+fn print_help() {
+    println!(
+        "conch {}\n\
+         Floor-controlled rooms for people and coding agents.\n\n\
+         Usage: conch [GLOBAL OPTIONS] <COMMAND> [ARGS]\n\n\
+         Global options:\n\
+           --node URL            Local daemon [default: tcp://127.0.0.1:7421]\n\
+           --agent ID            Stable mouth identity [default: local]\n\
+           --room ID             Room id (or CONCH_ROOM/current-room)\n\
+           --token HEX           32-byte room capability\n\
+           --tls-ca FILE         Additional CA bundle for HTTPS tickets\n\
+           -V, --version         Print version\n\
+           -h, --help            Print help\n\n\
+         Commands:\n\
+           create, join, status, history, raise-hand, wait-for-floor\n\
+           speak, yield, grant, yank, config, breakout, blob, leave, mcp\n\n\
+         Run `conch help <command>` for command-specific usage.",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+fn print_command_help(command: &str) -> Result<(), String> {
+    let usage = match command {
+        "create" => {
+            "conch create --name NAME [--open | --token HEX | --token-file FILE] [--show-secret]\n\
+             Creates a private room by default and writes ./<slug>.conch mode 0600.\n\
+             --open is local/LAN only; a public-mode daemon refuses tokenless rooms."
+        }
+        "join" => {
+            "conch [--tls-ca CA.pem] join TICKET|MAGNET|HTTPS_URL [--stake | --observe]"
+        }
+        "status" => "conch [--room ID] status",
+        "history" => "conch --room ID history [--from N] [--follow]",
+        "raise-hand" => "conch --room ID raise-hand",
+        "wait-for-floor" => "conch --room ID wait-for-floor [--timeout SECONDS]",
+        "speak" => "printf 'text' | conch --room ID speak --file - [--request-id ID]",
+        "yield" => "conch --room ID yield",
+        "grant" => "conch --room ID grant --agent ID --node NODE_ID",
+        "yank" => "conch --room ID yank",
+        "config" => {
+            "conch --room ID config [--mode stick|moderator] [--moderator ID --moderator-node NODE_ID] [--stake-json JSON]"
+        }
+        "breakout" => "conch --room ID breakout --name NAME [--members NODE_ID,...]",
+        "blob" => "conch --room ID blob put FILE",
+        "leave" => "conch --room ID leave [--vacate]",
+        "mcp" => "conch [--room ID] --agent ID mcp",
+        _ => return Err(format!("unknown command: {command}")),
+    };
+    println!("{usage}");
+    Ok(())
 }
 
 async fn write_frame<T: Serialize>(
@@ -680,4 +821,129 @@ fn read_current_room() -> Option<String> {
     serde_json::from_slice::<RoomId>(&bytes)
         .ok()
         .map(|room| room.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        time::{timeout, Duration},
+    };
+
+    async fn read_request(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            request.push(byte[0]);
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ticket_fetch_follows_only_bounded_same_origin_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut first).await;
+            assert!(request.contains("authorization: Bearer "));
+            first
+                .write_all(b"HTTP/1.1 302 Found\r\nLocation: /ticket\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let (mut second, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut second).await;
+            assert!(request.starts_with("GET /ticket HTTP/1.1\r\n"));
+            assert!(request.contains("authorization: Bearer "));
+            second
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+        });
+        let token = Hash32::from_bytes([7; 32]);
+        assert_eq!(
+            fetch_ticket(&format!("http://{address}/start"), Some(token), None)
+                .await
+                .unwrap(),
+            b"{}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ticket_fetch_rejects_cross_origin_before_forwarding_capability() {
+        let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_address = source.local_addr().unwrap();
+        let target_address = target.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = source.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            assert!(request.contains("authorization: Bearer "));
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{target_address}/ticket\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let token = Hash32::from_bytes([9; 32]);
+        let error = fetch_ticket(&format!("http://{source_address}/start"), Some(token), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("changed origin"));
+        server.await.unwrap();
+        assert!(timeout(Duration::from_millis(100), target.accept())
+            .await
+            .is_err());
+    }
+
+    async fn redirect_chain(redirects: usize) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = (redirects + 1).min(6);
+        let server = tokio::spawn(async move {
+            for index in 0..attempts {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                assert!(request.contains("authorization: Bearer "));
+                if index < redirects {
+                    let response = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: /hop{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        index + 1
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                } else {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        (address, server)
+    }
+
+    #[tokio::test]
+    async fn cli_ticket_fetch_accepts_five_redirects_and_rejects_the_sixth() {
+        let token = Hash32::from_bytes([11; 32]);
+        let (allowed, allowed_server) = redirect_chain(5).await;
+        assert_eq!(
+            fetch_ticket(&format!("http://{allowed}/start"), Some(token), None)
+                .await
+                .unwrap(),
+            b"{}"
+        );
+        allowed_server.await.unwrap();
+
+        let (rejected, rejected_server) = redirect_chain(6).await;
+        let error = fetch_ticket(&format!("http://{rejected}/start"), Some(token), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("redirect limit exceeded"));
+        rejected_server.await.unwrap();
+    }
 }
