@@ -16,3 +16,34 @@ pipelines:
           - cargo fmt --all -- --check
           - cargo test --workspace --locked
           - cargo clippy --workspace --all-targets --locked -- -D warnings
+    - step:
+        name: Packaging
+        caches:
+          - cargo-registry
+          - cargo-target
+        script:
+          - apt-get update && apt-get install -y --no-install-recommends bash gzip tar openssl dpkg-dev
+          - bash scripts/check-packaging.sh
+          - |
+            deb="$(find dist -maxdepth 1 -name '*.deb' -print -quit)"
+            test -n "$deb"
+            dpkg-deb --info "$deb"
+            stage="$(mktemp -d)"
+            trap 'rm -rf "$stage"' EXIT
+            dpkg-deb --extract "$deb" "$stage"
+            "$stage/usr/bin/conch" --version
+            "$stage/usr/bin/conchd" --version
+  tags:
+    'v*':
+      - step:
+          name: Verify tag (GitHub publishes the release)
+          caches:
+            - cargo-registry
+            - cargo-target
+          script:
+            - source scripts/common.sh
+            - test "$BITBUCKET_TAG" = "v$(conch_version "$BITBUCKET_CLONE_DIR")"
+            - cargo fmt --all -- --check
+            - cargo test --workspace --locked
+            - cargo clippy --workspace --all-targets --locked -- -D warnings
+            - echo "Attested release publication is delegated to GitHub Actions release.yml."

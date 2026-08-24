@@ -1,0 +1,5 @@
+conch (1.0.0) stable; urgency=medium
+
+  * Initial production release of conch and conchd.
+
+ -- Conch packagers <conch@localhost>  Mon, 24 Aug 2026 00:00:00 +0000

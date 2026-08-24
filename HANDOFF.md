@@ -50,7 +50,7 @@ Task files are a single assignment: goal, spec pointers, files, done-when. Examp
 | Crates | `conch-core`, `conchd`, `conch`, `conch-mcp` |
 | Ticket file | `*.conch` |
 | Magnet | `conch:1:<id>?g=<genesis>&...` |
-| Env | `CONCH_NODE`, `CONCH_AGENT`, `CONCH_ROOM` |
+| Env | `CONCH_NODE`, `CONCH_AGENT`, `CONCH_ROOM`, `CONCH_TLS_CA` |
 | Data dir | `~/.conch` |
 | Conversation | **room** (`--room`, JSON `room`, `rooms/<id>/`) |
 | Genesis cert id | `room` (reserved, not a node id) |

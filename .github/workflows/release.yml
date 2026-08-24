@@ -1,0 +1,199 @@
+name: GitHub Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  RUST_TOOLCHAIN: 1.95.0
+
+jobs:
+  verify:
+    name: Verify release source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      epoch: ${{ steps.metadata.outputs.epoch }}
+      commit: ${{ steps.metadata.outputs.commit }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - name: Validate tag and source metadata
+        id: metadata
+        shell: bash
+        run: |
+          source scripts/common.sh
+          version="$(conch_version "$GITHUB_WORKSPACE")"
+          tag="${GITHUB_REF_NAME}"
+          test "$tag" = "v${version}" || {
+            echo "tag $tag does not match workspace version $version" >&2
+            exit 1
+          }
+          commit="$(git rev-parse 'HEAD^{commit}')"
+          epoch="$(git show -s --format=%ct "$commit")"
+          {
+            echo "version=$version"
+            echo "epoch=$epoch"
+            echo "commit=$commit"
+          } >> "$GITHUB_OUTPUT"
+      - name: Test release helpers
+        run: python3 .github/scripts/test_release_scripts.py
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+      - name: Check formatting
+        run: cargo +"$RUST_TOOLCHAIN" fmt --all -- --check
+      - name: Run workspace tests
+        run: cargo +"$RUST_TOOLCHAIN" test --workspace --locked
+      - name: Run Clippy
+        run: cargo +"$RUST_TOOLCHAIN" clippy --workspace --all-targets --locked -- -D warnings
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            deb: true
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            deb: true
+          - platform: darwin-amd64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            deb: false
+          - platform: darwin-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            deb: false
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "${{ matrix.target }}"
+      - name: Install Debian packaging tools
+        if: matrix.deb
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dpkg-dev
+      - name: Build target binaries
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.verify.outputs.epoch }}
+        run: |
+          export RUSTFLAGS="-C strip=symbols --remap-path-prefix=${GITHUB_WORKSPACE}=."
+          cargo +"$RUST_TOOLCHAIN" build --workspace --release --locked --bins --target "${{ matrix.target }}"
+          "target/${{ matrix.target }}/release/conch" --version
+          "target/${{ matrix.target }}/release/conchd" --version
+      - name: Build deterministic archive
+        run: |
+          python3 .github/scripts/package_release.py \
+            --bin-dir "target/${{ matrix.target }}/release" \
+            --readme README.md \
+            --out-dir out \
+            --version "${{ needs.verify.outputs.version }}" \
+            --platform "${{ matrix.platform }}" \
+            --epoch "${{ needs.verify.outputs.epoch }}"
+      - name: Build Debian package
+        if: matrix.deb
+        env:
+          BIN_DIR: ${{ github.workspace }}/target/${{ matrix.target }}/release
+          SOURCE_DATE_EPOCH: ${{ needs.verify.outputs.epoch }}
+        run: |
+          mkdir -p dist
+          : > dist/SHA256SUMS
+          bash scripts/build-deb.sh
+          deb="$(find dist -maxdepth 1 -name '*.deb' -print -quit)"
+          test -n "$deb"
+          stage="${deb%.deb}"
+          dpkg-deb --root-owner-group --build "$stage" "$deb"
+          dpkg-deb --info "$deb"
+          cp "$deb" out/
+          cd out
+          sha256sum "$(basename "$deb")" > "$(basename "$deb").sha256"
+      - name: Attest archive provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: out/*.tar.gz
+      - name: Attest Debian package provenance
+        if: matrix.deb
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: out/*.deb
+      - name: Upload platform assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs: [verify, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Download platform assets
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Assemble checksums, manifest, and Homebrew formula
+        run: |
+          python3 .github/scripts/assemble_release.py \
+            --dist dist \
+            --formula-template packaging/homebrew/conch.rb.in \
+            --repo "$GITHUB_REPOSITORY" \
+            --version "${{ needs.verify.outputs.version }}" \
+            --tag "$GITHUB_REF_NAME" \
+            --commit "${{ needs.verify.outputs.commit }}"
+          cd dist
+          sha256sum --check SHA256SUMS
+      - name: Attest release metadata
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: |
+            dist/SHA256SUMS
+            dist/manifest.json
+            dist/conch.rb
+      - name: Upload assembled release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-bundle-${{ needs.verify.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --generate-notes \
+            --title "Conch ${{ needs.verify.outputs.version }}"

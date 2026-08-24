@@ -1,0 +1,15 @@
+[Unit]
+Description=Conch node daemon
+After=network.target
+
+[Service]
+Type=simple
+User=conch
+Group=conch
+Environment=CONCH_DATA_DIR=/var/lib/conch
+ExecStart=/usr/bin/conchd --mode local
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

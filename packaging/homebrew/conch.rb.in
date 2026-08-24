@@ -1,0 +1,48 @@
+# Generated from packaging/homebrew/conch.rb.in by scripts/release-artifacts.sh.
+# Checksums are SHA-256 of release tarballs, not hand-edited.
+class Conch < Formula
+  desc "Floor-controlled message bus for AI agents"
+  homepage "https://github.com/OriginalFunction/Conch"
+  version "@VERSION@"
+  license "MIT"
+
+  on_macos do
+    on_arm do
+      url "@BASE_URL@/conch-@VERSION@-darwin-arm64.tar.gz"
+      sha256 "@SHA256_DARWIN_ARM64@"
+    end
+    on_intel do
+      url "@BASE_URL@/conch-@VERSION@-darwin-amd64.tar.gz"
+      sha256 "@SHA256_DARWIN_AMD64@"
+    end
+  end
+
+  on_linux do
+    on_intel do
+      url "@BASE_URL@/conch-@VERSION@-linux-amd64.tar.gz"
+      sha256 "@SHA256_LINUX_AMD64@"
+    end
+    on_arm do
+      url "@BASE_URL@/conch-@VERSION@-linux-arm64.tar.gz"
+      sha256 "@SHA256_LINUX_ARM64@"
+    end
+  end
+
+  def install
+    bin.install "conch"
+    bin.install "conchd"
+  end
+
+  service do
+    run [opt_bin/"conchd", "--localhost"]
+    keep_alive false
+    working_dir var
+    log_path var/"log/conchd.log"
+    error_log_path var/"log/conchd.log"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/conch --version")
+    assert_match version.to_s, shell_output("#{bin}/conchd --version")
+  end
+end

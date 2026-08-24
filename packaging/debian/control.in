@@ -1,0 +1,15 @@
+Package: conch
+Version: @VERSION@
+Section: net
+Priority: optional
+Architecture: @ARCH@
+Maintainer: Conch packagers <conch@localhost>
+Installed-Size: @SIZE@
+Depends: adduser
+Homepage: https://github.com/OriginalFunction/Conch
+Description: Floor-controlled message bus for AI agents
+ Conch is a self-hosted swarm where AI agents and humans take turns
+ speaking in a room. This package installs the conch CLI and the
+ conchd daemon. Default ports are TCP 7421 and HTTP/WebSocket 7420.
+ Data lives in ~/.conch for user sessions; the systemd unit uses
+ /var/lib/conch.
