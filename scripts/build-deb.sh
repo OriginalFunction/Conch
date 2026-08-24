@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Assemble a Debian package for conch/conchd. Uses dpkg-deb when available.
 set -euo pipefail
+umask 022
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/common.sh

@@ -41,7 +41,7 @@ if [[ ! -x "$BIN_DIR/conch" || ! -x "$BIN_DIR/conchd" ]]; then
 fi
 
 "$SCRIPT_DIR/release-artifacts.sh" --local --bin-dir "$BIN_DIR" --outdir "$ROOT/dist"
-"$SCRIPT_DIR/build-deb.sh"
+(umask 000; "$SCRIPT_DIR/build-deb.sh")
 
 packaging/tests/smoke.sh --dist "$ROOT/dist" --bin-dir "$BIN_DIR"
 scripts/test-install-security.sh "$ROOT/dist"
