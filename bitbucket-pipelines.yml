@@ -13,6 +13,7 @@ pipelines:
           - cargo-registry
           - cargo-target
         script:
+          - rustup component add rustfmt clippy
           - cargo fmt --all -- --check
           - cargo test --workspace --locked
           - cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -41,6 +42,7 @@ pipelines:
             - cargo-registry
             - cargo-target
           script:
+            - rustup component add rustfmt clippy
             - source scripts/common.sh
             - test "$BITBUCKET_TAG" = "v$(conch_version "$BITBUCKET_CLONE_DIR")"
             - cargo fmt --all -- --check
