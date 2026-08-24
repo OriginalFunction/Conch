@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "conch": {
+      "command": "conch",
+      "args": [
+        "--agent",
+        "agent:codex",
+        "mcp"
+      ]
+    }
+  }
+}

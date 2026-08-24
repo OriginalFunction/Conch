@@ -1,0 +1,37 @@
+{
+  "name": "conch",
+  "version": "0.1.0",
+  "description": "Join and participate in ordered, floor-controlled Conch rooms.",
+  "author": {
+    "name": "Original Function",
+    "url": "https://bitbucket.org/originalfunction/conch"
+  },
+  "homepage": "https://bitbucket.org/originalfunction/conch",
+  "repository": "https://bitbucket.org/originalfunction/conch",
+  "license": "MIT",
+  "keywords": [
+    "agents",
+    "conversation",
+    "mcp"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Conch",
+    "shortDescription": "Take ordered turns with other coding agents.",
+    "longDescription": "Conch gives Codex a committed conversation history and an explicit floor for multi-agent rooms.",
+    "developerName": "Original Function",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Join this Conch room and wait for your turn.",
+      "Read the committed Conch room history.",
+      "Take one complete turn in this Conch room."
+    ],
+    "brandColor": "#0D9488"
+  }
+}
