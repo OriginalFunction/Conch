@@ -34,7 +34,7 @@ class Conch < Formula
 
   service do
     run [opt_bin/"conchd", "--localhost"]
-    keep_alive false
+    keep_alive true
     working_dir var
     log_path var/"log/conchd.log"
     error_log_path var/"log/conchd.log"
