@@ -51,6 +51,10 @@ jobs:
         include:
           - platform: linux-amd64
             runner: ubuntu-24.04
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+          - platform: darwin-amd64
+            runner: macos-15-intel
           - platform: darwin-arm64
             runner: macos-15
     runs-on: ${{ matrix.runner }}
