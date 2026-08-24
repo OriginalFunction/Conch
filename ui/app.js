@@ -9,6 +9,7 @@ const state = {
   history: [],
   liveGrant: null,
   refreshing: false,
+  refreshBlocked: false,
   readOnly: false,
 };
 
@@ -80,7 +81,7 @@ function rpc(payload) {
 }
 
 async function refresh() {
-  if (!state.room || state.refreshing || state.pending.length) return;
+  if (!state.room || state.refreshing || state.refreshBlocked || state.pending.length) return;
   state.refreshing = true;
   try {
     let page;
@@ -92,7 +93,12 @@ async function refresh() {
         headers,
         cache: "no-store",
       });
-      if (!response.ok) throw new Error(`History unavailable (${response.status}).`);
+      if (!response.ok) {
+        if (response.status === 401 || response.status === 403) {
+          forgetRoom(`Session expired (${response.status}). Open the room again.`);
+        }
+        throw new Error(`History unavailable (${response.status}).`);
+      }
       page = await response.json();
       state.readOnly = true;
       setConnection("online", "Verified read-only ledger");
@@ -181,25 +187,24 @@ async function joinRoom() {
   el.joinButton.disabled = true;
   try {
     const ticket = await parseTicket(el.ticketSource.value.trim());
-    state.room = ticket.id;
-    state.token = ticket.token || "";
-    localStorage.setItem("conch.room", state.room);
-    if (state.token) {
-      const capability = state.token;
+    const candidateRoom = ticket.id;
+    const capability = ticket.token || "";
+    if (capability) {
       let session;
       try {
-        session = await fetch(`/session/${encodeURIComponent(state.room)}`, {
+        session = await fetch(`/session/${encodeURIComponent(candidateRoom)}`, {
           method: "POST",
           headers: { Authorization: `Bearer ${capability}` },
           credentials: "same-origin",
         });
       } finally {
-        state.token = "";
         el.ticketSource.value = "";
       }
       if (!session.ok) throw new Error(`Session authorization failed (${session.status}); join this ticket with the local conch CLI first.`);
+      selectRoom(candidateRoom);
       await connect();
     } else {
+      selectRoom(candidateRoom);
       state.readOnly = true;
       if (state.socket) state.socket.close();
       await refresh();
@@ -210,6 +215,29 @@ async function joinRoom() {
   } finally {
     el.joinButton.disabled = false;
   }
+}
+
+function selectRoom(room) {
+  state.room = room;
+  state.token = "";
+  state.refreshBlocked = false;
+  localStorage.setItem("conch.room", room);
+}
+
+function forgetRoom(message) {
+  state.refreshBlocked = true;
+  state.socket?.close();
+  state.socket = null;
+  state.room = null;
+  state.token = "";
+  state.history = [];
+  state.liveGrant = null;
+  state.readOnly = false;
+  localStorage.removeItem("conch.room");
+  el.transcript.innerHTML = `<div class="empty-state"><span>◎</span><h2>The ledger is quiet</h2><p>Open a room. Only wrapped scenes will appear here.</p></div>`;
+  setConnection("offline", message);
+  renderFacts();
+  updateFloor();
 }
 
 async function parseTicket(source) {

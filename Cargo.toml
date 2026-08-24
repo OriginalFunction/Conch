@@ -5,7 +5,7 @@ members = ["crates/conch-core", "crates/conchd", "crates/conch", "crates/conch-m
 [workspace.package]
 edition = "2021"
 license = "MIT"
-version = "1.0.0"
+version = "1.0.1"
 
 [workspace.dependencies]
 ed25519-dalek = "2.2.0"

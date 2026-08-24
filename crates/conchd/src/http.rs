@@ -1156,6 +1156,27 @@ mod tests {
     }
 
     #[test]
+    fn browser_ui_persists_a_private_room_only_after_session_authorization() {
+        let app = include_str!("../../../ui/app.js");
+        let join = app
+            .split_once("async function joinRoom()")
+            .expect("joinRoom exists")
+            .1;
+        let authorized = join
+            .find("if (!session.ok)")
+            .expect("session status is checked");
+        let persisted = join
+            .find("selectRoom(candidateRoom)")
+            .expect("the authorized room is persisted");
+        assert!(
+            authorized < persisted,
+            "a failed browser session must not persist a retrying private room"
+        );
+        assert!(app.contains("localStorage.removeItem(\"conch.room\")"));
+        assert!(app.contains("state.refreshBlocked = true"));
+    }
+
+    #[test]
     fn slow_reader_queue_is_bounded_by_frames_and_encoded_bytes() {
         let (sender, _receiver) = mpsc::channel(MAX_QUEUE_FRAMES);
         let queued = AtomicUsize::new(0);
