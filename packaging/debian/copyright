@@ -1,6 +1,6 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: conch
-Source: https://bitbucket.org/ofunc/conch
+Source: https://github.com/OriginalFunction/Conch
 
 Files: *
 Copyright: 2026 Conch contributors

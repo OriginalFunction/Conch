@@ -37,13 +37,23 @@ def add_bytes(archive: tarfile.TarFile, name: str, data: bytes, mode: int, epoch
     archive.addfile(tar_info(name, mode, epoch, len(data)), io.BytesIO(data))
 
 
-def package(bin_dir: Path, readme: Path, out_dir: Path, version: str, platform: str, epoch: int) -> Path:
+def package(
+    bin_dir: Path,
+    readme: Path,
+    license_file: Path,
+    out_dir: Path,
+    version: str,
+    platform: str,
+    epoch: int,
+) -> Path:
     binaries = [bin_dir / "conch", bin_dir / "conchd"]
     for binary in binaries:
         if not binary.is_file():
             raise SystemExit(f"missing release binary: {binary}")
     if not readme.is_file():
         raise SystemExit(f"missing README: {readme}")
+    if not license_file.is_file():
+        raise SystemExit(f"missing license: {license_file}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     root = f"conch-{version}-{platform}"
@@ -60,6 +70,7 @@ def package(bin_dir: Path, readme: Path, out_dir: Path, version: str, platform: 
                 add_bytes(archive, f"{root}/conch", binaries[0].read_bytes(), 0o755, epoch)
                 add_bytes(archive, f"{root}/conchd", binaries[1].read_bytes(), 0o755, epoch)
                 add_bytes(archive, f"{root}/README.md", readme.read_bytes(), 0o644, epoch)
+                add_bytes(archive, f"{root}/LICENSE", license_file.read_bytes(), 0o644, epoch)
 
     checksum = sha256(output)
     output.with_name(f"{output.name}.sha256").write_text(
@@ -72,6 +83,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bin-dir", type=Path, required=True)
     parser.add_argument("--readme", type=Path, required=True)
+    parser.add_argument("--license", dest="license_file", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--platform", choices=PLATFORMS, required=True)
@@ -82,6 +94,7 @@ def main() -> None:
     output = package(
         args.bin_dir,
         args.readme,
+        args.license_file,
         args.out_dir,
         args.version,
         args.platform,

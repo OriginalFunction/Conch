@@ -54,6 +54,8 @@ class ReleaseScriptsTest(unittest.TestCase):
             (bin_dir / "conchd").write_bytes(b"conchd executable\n")
             readme = work / "README.md"
             readme.write_text("# Conch\n", encoding="utf-8")
+            license_file = work / "LICENSE"
+            license_file.write_text("MIT License\n", encoding="utf-8")
 
             outputs = []
             for index in range(2):
@@ -66,6 +68,8 @@ class ReleaseScriptsTest(unittest.TestCase):
                         str(bin_dir),
                         "--readme",
                         str(readme),
+                        "--license",
+                        str(license_file),
                         "--out-dir",
                         str(out),
                         "--version",
@@ -84,7 +88,13 @@ class ReleaseScriptsTest(unittest.TestCase):
             with tarfile.open(outputs[0], "r:gz") as archive:
                 self.assertEqual(
                     archive.getnames(),
-                    [root, f"{root}/conch", f"{root}/conchd", f"{root}/README.md"],
+                    [
+                        root,
+                        f"{root}/conch",
+                        f"{root}/conchd",
+                        f"{root}/README.md",
+                        f"{root}/LICENSE",
+                    ],
                 )
                 for member in archive.getmembers():
                     self.assertEqual(member.mtime, EPOCH)
@@ -92,7 +102,9 @@ class ReleaseScriptsTest(unittest.TestCase):
                     self.assertEqual(member.gid, 0)
                 self.assertEqual(archive.getmember(f"{root}/conch").mode, 0o755)
                 self.assertEqual(archive.getmember(f"{root}/README.md").mode, 0o644)
+                self.assertEqual(archive.getmember(f"{root}/LICENSE").mode, 0o644)
                 self.assertEqual(archive.extractfile(f"{root}/conch").read(), b"conch executable\n")
+                self.assertEqual(archive.extractfile(f"{root}/LICENSE").read(), b"MIT License\n")
 
     def test_assembler_verifies_and_fills_every_platform(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

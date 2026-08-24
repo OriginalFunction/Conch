@@ -52,6 +52,10 @@ fi
 
 TAR_SHA="$(conch_lookup_sum "$DIST/SHA256SUMS" "$TAR")"
 conch_verify_sha256 "$DIST/$TAR" "$TAR_SHA"
+if ! tar -tzf "$DIST/$TAR" | grep -qE '/LICENSE$'; then
+  echo "release archive is missing LICENSE" >&2
+  exit 1
+fi
 
 if ! grep -q "$TAR_SHA" "$DIST/conch.rb"; then
   echo "Homebrew formula does not contain the current tarball checksum" >&2

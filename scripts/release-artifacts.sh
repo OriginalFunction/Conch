@@ -64,7 +64,7 @@ rm -rf "${OUT:?}/${NAME:?}"
 mkdir -p "$OUT/$NAME"
 cp "$BIN_DIR/conch" "$BIN_DIR/conchd" "$OUT/$NAME/"
 chmod 755 "$OUT/$NAME/conch" "$OUT/$NAME/conchd"
-cp "$ROOT/README.md" "$OUT/$NAME/"
+cp "$ROOT/README.md" "$ROOT/LICENSE" "$OUT/$NAME/"
 
 TAR="$OUT/${NAME}.tar.gz"
 tar -C "$OUT" -czf "$TAR" "$NAME"

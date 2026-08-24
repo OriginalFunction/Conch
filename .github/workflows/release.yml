@@ -108,6 +108,7 @@ jobs:
           python3 .github/scripts/package_release.py \
             --bin-dir "target/${{ matrix.target }}/release" \
             --readme README.md \
+            --license LICENSE \
             --out-dir out \
             --version "${{ needs.verify.outputs.version }}" \
             --platform "${{ matrix.platform }}" \
