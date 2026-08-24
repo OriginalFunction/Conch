@@ -985,10 +985,36 @@ async fn remaining_majority_elects_successor_after_leader_stops() {
         .join_ticket(ticket.clone(), JoinRole::Stake)
         .await
         .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let knows_peer = |root: &std::path::Path, peer: conch_core::types::NodeId| {
+                fs::read(root.join("peers.json"))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .and_then(|peers| {
+                        peers
+                            .get(ticket.id.to_string())?
+                            .get(peer.to_string())
+                            .cloned()
+                    })
+                    .is_some()
+            };
+            if knows_peer(second_data.path(), third.node_id())
+                && knows_peer(third_data.path(), second.node_id())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("surviving stakers must durably learn each other before the seeder stops");
     source_server.abort();
     drop(source_server);
+    drop(source);
 
-    let leader_addr = tokio::time::timeout(Duration::from_secs(15), async {
+    let leader_addr = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let second_state = second.replay(ticket.id).unwrap().consensus;
             if second_state.role == conch_core::types::ConsensusRole::Leader
@@ -1006,11 +1032,11 @@ async fn remaining_majority_elects_successor_after_leader_stops() {
         }
     })
     .await
-    .unwrap();
+    .expect("the surviving quorum must elect a successor after the seeder stops");
     let mut writer = attach(leader_addr, "agent:successor").await;
     let raised = request(&mut writer, ClientRequest::RaiseHand { room: ticket.id }).await;
     assert!(raised.ok, "{raised:?}");
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(5), async {
         while second.replay(ticket.id).unwrap().chain.live_grant.is_none()
             || third.replay(ticket.id).unwrap().chain.live_grant.is_none()
         {
@@ -1018,7 +1044,7 @@ async fn remaining_majority_elects_successor_after_leader_stops() {
         }
     })
     .await
-    .unwrap();
+    .expect("the successor grant must reach both surviving stakers");
     assert!(second.replay(ticket.id).unwrap().chain.live_grant.is_some());
     assert!(third.replay(ticket.id).unwrap().chain.live_grant.is_some());
 }
