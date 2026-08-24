@@ -51,7 +51,8 @@ fi
 printf '%s\n' '#!/usr/bin/env bash' \
   'set -euo pipefail' \
   'url=""; dest=""' \
-  'while [[ $# -gt 0 ]]; do case "$1" in -o) dest="$2"; shift 2 ;; -*) shift ;; *) url="$1"; shift ;; esac; done' \
+  'printf "%s\n" "$*" >>"${FAKE_CURL_LOG:-/dev/null}"' \
+  'while [[ $# -gt 0 ]]; do case "$1" in -o|--output) dest="$2"; shift 2 ;; --proto|--proto-redir) shift 2 ;; -*) shift ;; *) url="$1"; shift ;; esac; done' \
   'cp "$FAKE_RELEASE_DIR/${url##*/}" "$dest"' >"$WORK/bin/curl"
 # shellcheck disable=SC2016
 printf '%s\n' '#!/usr/bin/env bash' \
@@ -79,11 +80,15 @@ printf '%s\n' '#!/usr/bin/env bash' \
   'exit 0' >"$WORK/bin/apt-get"
 chmod 755 "$WORK/bin/brew" "$WORK/bin/apt-get"
 
-PATH="$WORK/bin:$PATH" FAKE_RELEASE_DIR="$WORK/remote" \
+CURL_LOG="$WORK/curl.log"
+: >"$CURL_LOG"
+PATH="$WORK/bin:$PATH" FAKE_RELEASE_DIR="$WORK/remote" FAKE_CURL_LOG="$CURL_LOG" \
   "$SCRIPT_DIR/install.sh" --version "$VERSION" --prefix "$WORK/prefix-valid" \
   --base-url "https://downloads.invalid/v${VERSION}" --os "$OS" --arch "$ARCH"
 test -x "$WORK/prefix-valid/bin/conch"
 test -x "$WORK/prefix-valid/bin/conchd"
+grep -Fq -- "--proto =https" "$CURL_LOG"
+grep -Fq -- "--proto-redir =https" "$CURL_LOG"
 
 expect_failure env PATH="$WORK/bin:$PATH" FAKE_RELEASE_DIR="$WORK/remote" FAIL_IDENTITY=1 \
   "$SCRIPT_DIR/install.sh" --version "$VERSION" --prefix "$WORK/prefix-identity" \
@@ -108,6 +113,20 @@ PATH="$WORK/bin:$PATH" FAKE_RELEASE_DIR="$WORK/remote" FAKE_PACKAGE_LOG="$PACKAG
   FAKE_BREW_ROOT="$FAKE_BREW_ROOT" \
   "$SCRIPT_DIR/install-homebrew.sh" --version "$VERSION"
 grep -Fq 'install --formula' "$PACKAGE_LOG"
+
+CURRENT_SHA="$(conch_sha256 "$DIST/$TAR")"
+ZERO_SHA="0000000000000000000000000000000000000000000000000000000000000000"
+awk -v current="$CURRENT_SHA" -v zero="$ZERO_SHA" '
+  !replaced && index($0, current) { sub(current, zero); replaced = 1 }
+  { print }
+' "$DIST/conch.rb" >"$WORK/current-placeholder.rb"
+expect_failure env PATH="$WORK/bin:$PATH" FAKE_PACKAGE_LOG="$PACKAGE_LOG" \
+  FAKE_BREW_ROOT="$FAKE_BREW_ROOT" \
+  "$SCRIPT_DIR/install-homebrew.sh" --formula "$WORK/current-placeholder.rb"
+
+expect_failure env PATH="/usr/bin:/bin" \
+  "$SCRIPT_DIR/install-homebrew.sh" --formula "$DIST/conch.rb"
+
 : >"$PACKAGE_LOG"
 expect_failure env PATH="$WORK/bin:$PATH" FAKE_RELEASE_DIR="$WORK/remote" \
   FAKE_PACKAGE_LOG="$PACKAGE_LOG" FAIL_IDENTITY=1 \
@@ -121,6 +140,18 @@ if [[ -f "$DIST/$DEB" ]]; then
   PATH="$WORK/bin:$PATH" FAKE_RELEASE_DIR="$WORK/remote" FAKE_PACKAGE_LOG="$PACKAGE_LOG" \
     "$SCRIPT_DIR/install-debian.sh" --version "$VERSION"
   grep -Fq 'install -y' "$PACKAGE_LOG"
+
+  ABS_DEB="$(cd "$DIST" && pwd)/$DEB"
+  ABS_SUMS="$(cd "$DIST" && pwd)/SHA256SUMS"
+  : >"$PACKAGE_LOG"
+  PATH="$WORK/bin:$PATH" FAKE_PACKAGE_LOG="$PACKAGE_LOG" \
+    "$SCRIPT_DIR/install-debian.sh" --deb "$ABS_DEB" --sums "$ABS_SUMS"
+  grep -Fq "install -y $ABS_DEB" "$PACKAGE_LOG"
+  if grep -Fq './/' "$PACKAGE_LOG"; then
+    echo "absolute package path was prefixed with ./" >&2
+    exit 1
+  fi
+
   : >"$PACKAGE_LOG"
   expect_failure env PATH="$WORK/bin:$PATH" FAKE_RELEASE_DIR="$WORK/remote" \
     FAKE_PACKAGE_LOG="$PACKAGE_LOG" FAIL_ATTEST=1 \

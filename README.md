@@ -156,17 +156,29 @@ Download and verify a release before installing it:
 ```bash
 gh release download v1.0.0 --repo OriginalFunction/Conch --dir conch-release
 cd conch-release
+gh attestation verify SHA256SUMS \
+  --repo OriginalFunction/Conch \
+  --signer-workflow github.com/OriginalFunction/Conch/.github/workflows/release.yml \
+  --source-ref refs/tags/v1.0.0 \
+  --deny-self-hosted-runners
 sha256sum --check SHA256SUMS       # Linux
 # shasum --algorithm 256 --check SHA256SUMS  # macOS
-gh attestation verify conch-1.0.0-linux-amd64.tar.gz --repo OriginalFunction/Conch
+gh attestation verify conch-1.0.0-linux-amd64.tar.gz \
+  --repo OriginalFunction/Conch \
+  --signer-workflow github.com/OriginalFunction/Conch/.github/workflows/release.yml \
+  --source-ref refs/tags/v1.0.0 \
+  --deny-self-hosted-runners
 ```
 
 The downloaded formula and Debian package can then be installed locally:
 
 ```bash
-brew install --formula ./conch.rb
+cd ..
+scripts/install-homebrew.sh --formula conch-release/conch.rb
 # Debian/Ubuntu; choose the package matching the host architecture
-sudo apt install ./conch_1.0.0_amd64.deb
+sudo scripts/install-debian.sh \
+  --deb "$PWD/conch-release/conch_1.0.0_amd64.deb" \
+  --sums "$PWD/conch-release/SHA256SUMS"
 ```
 
 GitHub Releases contain standalone `.deb` files, not an apt repository; the signed-repository path remains a separate deployment operation.

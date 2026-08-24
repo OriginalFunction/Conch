@@ -80,15 +80,26 @@ if [[ ! -f "$FORMULA" ]]; then
   exit 1
 fi
 
+CURRENT_PLATFORM="$(conch_platform)"
+CURRENT_SHA="$(awk -v suffix="-${CURRENT_PLATFORM}.tar.gz\"" '
+  $1 == "url" && index($0, suffix) { target = 1; next }
+  target && $1 == "sha256" { gsub(/\"/, "", $2); print $2; exit }
+' "$FORMULA")"
+if [[ ! "$CURRENT_SHA" =~ ^[0-9a-f]{64}$ ]] || \
+  [[ "$CURRENT_SHA" == "0000000000000000000000000000000000000000000000000000000000000000" ]]; then
+  echo "formula has no release checksum for the current platform ($CURRENT_PLATFORM)" >&2
+  exit 1
+fi
+
 if grep -q '0000000000000000000000000000000000000000000000000000000000000000' "$FORMULA"; then
   echo "formula still has placeholder checksums for some platforms; that is expected for unbuilt targets." >&2
-  echo "the current-platform url/sha256 must not be the placeholder." >&2
+  echo "the current-platform url/sha256 is populated and will be used." >&2
 fi
 
 if ! command -v brew >/dev/null 2>&1; then
   echo "brew not found; formula is at $FORMULA" >&2
   echo "install Homebrew, then: brew install --formula $(printf '%q' "$FORMULA")" >&2
-  exit 0
+  exit 1
 fi
 
 # Current Homebrew accepts third-party formulae only from a tap. Use an

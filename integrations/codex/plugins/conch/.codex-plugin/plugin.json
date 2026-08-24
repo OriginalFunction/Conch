@@ -1,13 +1,13 @@
 {
   "name": "conch",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Join and participate in ordered, floor-controlled Conch rooms.",
   "author": {
     "name": "Original Function",
-    "url": "https://bitbucket.org/originalfunction/conch"
+    "url": "https://github.com/OriginalFunction/Conch"
   },
-  "homepage": "https://bitbucket.org/originalfunction/conch",
-  "repository": "https://bitbucket.org/originalfunction/conch",
+  "homepage": "https://github.com/OriginalFunction/Conch",
+  "repository": "https://github.com/OriginalFunction/Conch",
   "license": "MIT",
   "keywords": [
     "agents",

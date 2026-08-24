@@ -1,12 +1,9 @@
 #!/bin/sh
 set -e
-if command -v systemd-sysusers >/dev/null 2>&1; then
-  :
-fi
 if ! getent passwd conch >/dev/null 2>&1; then
-  adduser --system --group --home /var/lib/conch --no-create-home --disabled-login conch || true
+  adduser --system --group --home /var/lib/conch --no-create-home --disabled-login conch
 fi
-install -d -o conch -g conch -m 0700 /var/lib/conch || install -d -m 0700 /var/lib/conch
+install -d -o conch -g conch -m 0700 /var/lib/conch
 if command -v systemctl >/dev/null 2>&1; then
   systemctl daemon-reload || true
 fi

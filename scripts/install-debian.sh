@@ -60,7 +60,11 @@ done
 install_deb() {
   local deb="$1"
   if command -v apt-get >/dev/null 2>&1; then
-    apt-get install -y "./$deb"
+    if [[ "$deb" == /* ]]; then
+      apt-get install -y "$deb"
+    else
+      apt-get install -y "./$deb"
+    fi
   else
     dpkg -i "$deb"
   fi

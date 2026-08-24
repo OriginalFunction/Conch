@@ -92,9 +92,11 @@ conch_download() {
   local url="$1"
   local dest="$2"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$dest"
+    curl --fail --silent --show-error --location \
+      --proto '=https' --proto-redir '=https' \
+      "$url" --output "$dest"
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$dest" "$url"
+    wget --https-only -qO "$dest" "$url"
   else
     echo "need curl or wget to download $url" >&2
     return 1
