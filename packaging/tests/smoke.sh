@@ -52,7 +52,7 @@ fi
 
 TAR_SHA="$(conch_lookup_sum "$DIST/SHA256SUMS" "$TAR")"
 conch_verify_sha256 "$DIST/$TAR" "$TAR_SHA"
-if ! tar -tzf "$DIST/$TAR" | grep -qE '/LICENSE$'; then
+if ! tar -tzf "$DIST/$TAR" | awk '/\/LICENSE$/ { found = 1 } END { exit found ? 0 : 1 }'; then
   echo "release archive is missing LICENSE" >&2
   exit 1
 fi
