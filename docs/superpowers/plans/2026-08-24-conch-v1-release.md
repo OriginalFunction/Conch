@@ -43,7 +43,7 @@
 - [x] Homebrew formula generation and installation wrapper.
 - [x] Debian package builder and verify-before-install apt/deb wrapper.
 - [x] systemd and launchd service examples, uninstall path, and package smoke script.
-- [ ] Exercise `.deb` creation/install in Linux CI and Homebrew formula install on macOS CI.
+- [x] Exercise `.deb` creation/install in Linux CI and Homebrew formula install on macOS CI.
 - [x] Release workflow attests/signs checksums and artifacts against the pinned `OriginalFunction/Conch/.github/workflows/release.yml` identity and exact release tag.
 - [x] Portable remote installs require HTTPS and verify that attestation/signature before trusting `SHA256SUMS`; any bypass is explicit. Debian and Homebrew wrappers use the same pinned identity. Tests reject substituted checksums, wrong identity, bad attestations, and HTTP.
 
@@ -52,7 +52,7 @@
 - [x] `cargo fmt --all -- --check`.
 - [x] `cargo test --workspace --locked` including release-gating integration tests.
 - [x] `cargo clippy --workspace --all-targets --locked -- -D warnings`.
-- [ ] Release builds and package smoke tests on supported macOS/Linux architectures.
-- [ ] Security addendum reviewed by Claude and Grok; all live feedback resolved or explicitly accepted by Ray.
+- [x] Release builds and package smoke tests on supported macOS/Linux architectures.
+- [x] Security addendum reviewed by Claude and Grok; all live feedback resolved or explicitly accepted by Ray.
 - [x] Two independent coding agents join, take ordered turns, restart/catch up, and verify the same committed ledger through CLI, MCP, and UI.
-- [ ] Tag and publish v1 only after every preceding checkbox is satisfied.
+- [x] Tag and publish v1 only after every preceding checkbox is satisfied.
