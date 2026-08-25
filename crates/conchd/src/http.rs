@@ -572,9 +572,10 @@ async fn ws_operator_client(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response<Body> {
-    if require_operator_endpoint(&state, peer).is_err()
-        || authorize_operator(&state, &headers, true).is_err()
-    {
+    if require_operator_endpoint(&state, peer).is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if authorize_operator(&state, &headers, true).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Ok(allowed_room) = parse_room(&id) else {

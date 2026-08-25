@@ -210,6 +210,28 @@ fn expiry_boundary_and_consumption_leave_the_next_intent_queued() {
 }
 
 #[test]
+fn consumed_intent_cannot_block_the_same_mouths_next_turn() {
+    let key = SigningKey::from_bytes(&[1; 32]);
+    let holder = mouth(&key, "codex");
+    let room = RoomId::from_bytes([3; 32]);
+    let old = intent(&key, room, "codex", 250, 50);
+    let next = intent(&key, room, "codex", 1, 10);
+    let mut chain = state(room, vec![holder.node], None);
+    let mut floor = FloorEngine::new(holder.node);
+    floor.upsert_intent(&chain, old.clone()).unwrap();
+    chain.consumed_intents.insert(old.id);
+
+    assert!(floor.upsert_intent(&chain, next.clone()).unwrap());
+    assert_eq!(floor.queue_head(&chain, 11).unwrap().id, next.id);
+
+    floor.observe_committed(&chain);
+    assert_eq!(floor.intents().count(), 1);
+    chain.consumed_intents.insert(next.id);
+    floor.observe_committed(&chain);
+    assert_eq!(floor.intents().count(), 0);
+}
+
+#[test]
 fn old_grant_freeze_and_other_room_commit_do_not_close_current_take() {
     let key = SigningKey::from_bytes(&[1; 32]);
     let holder = mouth(&key, "codex");

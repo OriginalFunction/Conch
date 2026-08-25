@@ -143,7 +143,8 @@ Create accepts `{name, mode?, timeout_secs?}`. Private capability generation is
 the same OS-CSPRNG 32-byte rule as CLI create. It returns the newly created
 ticket once so the UI can download `<slug>.conch`; catalog/detail never returns
 it. Join accepts `{ticket, role}` and runs the same ticket validation and catch-up
-path as the CLI.
+path as the CLI. A successful operator create or join selects that room as the
+daemon's current room, matching the existing CLI create/join behavior.
 
 ## 9. Accessibility and interaction
 

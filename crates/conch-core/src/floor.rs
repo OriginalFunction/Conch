@@ -130,6 +130,10 @@ impl FloorEngine {
             node: intent.node,
         };
         if let Some(current) = self.intents.get(&mouth) {
+            if state.consumed_intents.contains(&current.id) {
+                self.intents.insert(mouth, intent);
+                return Ok(true);
+            }
             if current.id == intent.id && (current.ts != intent.ts || current.kind != intent.kind) {
                 return Err(FloorError::InvalidIntent);
             }
@@ -165,6 +169,8 @@ impl FloorEngine {
             self.take = None;
             return;
         };
+        self.intents
+            .retain(|_, intent| !state.consumed_intents.contains(&intent.id));
         let Some(grant) = &state.live_grant else {
             self.take = None;
             return;

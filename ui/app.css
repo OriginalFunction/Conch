@@ -23,7 +23,7 @@
 html, body { height: 100%; }
 body { margin: 0; overflow: hidden; color: var(--ink); background: var(--paper); }
 button, textarea, input { font: inherit; }
-button { min-height: 42px; border: 0; border-radius: 999px; padding: .68rem 1rem; color: white; background: var(--coral); font-weight: 760; cursor: pointer; }
+button { min-height: 44px; border: 0; border-radius: 999px; padding: .68rem 1rem; color: white; background: var(--coral); font-weight: 760; cursor: pointer; }
 button:hover:not(:disabled) { filter: brightness(.96); }
 button.secondary { color: var(--deep); background: transparent; box-shadow: inset 0 0 0 1px var(--sea); }
 button:disabled { cursor: not-allowed; opacity: .42; }
@@ -67,6 +67,7 @@ input, textarea { width: 100%; border: 1px solid var(--line-dark); border-radius
 .room-copy small { margin-top: .25rem; color: var(--muted); font-size: .7rem; }
 .room-side { align-self: stretch; display: flex; flex-direction: column; align-items: flex-end; justify-content: space-between; }
 .room-side time { color: var(--muted); font-size: .62rem; }
+.unread-badge { display: grid; min-width: 20px; height: 20px; place-items: center; border-radius: 999px; padding: 0 .35rem; color: white; background: var(--coral); font-size: .6rem; font-weight: 850; }
 .role-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--sea); }
 .role-dot.observe { background: #a6a197; }
 .node-card { display: flex; gap: .7rem; align-items: center; margin-top: auto; padding: 1rem 1.25rem; border-top: 1px solid var(--line); background: rgb(255 255 255 / .28); }
@@ -98,6 +99,8 @@ input, textarea { width: 100%; border: 1px solid var(--line-dark); border-radius
 .home-guide li p { margin: .2rem 0 0; color: var(--muted); font-size: .74rem; line-height: 1.4; }
 
 .room-view { height: 100%; min-height: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto auto; }
+.room-view.room-blocked { grid-template-rows: auto minmax(0, 1fr); }
+.room-view.room-blocked > [data-room-content] { display: none; }
 .room-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1.05rem 1.4rem; border-bottom: 1px solid var(--line); background: rgb(255 253 248 / .7); }
 .room-title { min-width: 0; display: flex; gap: .72rem; align-items: center; }
 .room-icon { display: grid; flex: 0 0 auto; width: 42px; height: 42px; place-items: center; border-radius: 50% 44% 52% 45%; color: #f7e1cc; background: var(--deep); font: italic 1.3rem Georgia, serif; }
@@ -115,6 +118,11 @@ input, textarea { width: 100%; border: 1px solid var(--line-dark); border-radius
 .floor-banner p { margin: 0; }
 .floor-banner p:last-child { font-size: .82rem; }
 .floor-orb { width: 27px; height: 27px; border: 2px solid var(--coral); border-radius: 50%; box-shadow: inset 0 0 0 5px var(--panel), inset 0 0 0 7px var(--coral); }
+.room-state { align-self: center; max-width: 520px; margin: auto; padding: 3rem 1.5rem; color: var(--muted); text-align: center; }
+.room-state > span { color: var(--coral); font: 3.2rem Georgia, serif; }
+.room-state h3 { margin: .55rem 0; color: var(--ink); font: 700 1.8rem Georgia, serif; }
+.room-state p { margin: 0 auto; max-width: 430px; font-size: .86rem; line-height: 1.55; }
+.room-state div { display: flex; justify-content: center; gap: .6rem; margin-top: 1.4rem; }
 
 .transcript-frame { position: relative; min-height: 0; }
 .transcript { position: absolute; inset: 0; overflow-y: auto; overscroll-behavior: contain; padding: 1rem 1.4rem 1.4rem; scroll-behavior: smooth; }
@@ -158,13 +166,15 @@ input, textarea { width: 100%; border: 1px solid var(--line-dark); border-radius
 .person-avatar i { position: absolute; right: 0; bottom: 1px; width: 10px; height: 10px; border: 2px solid var(--paper-deep); border-radius: 50%; background: #a6a197; }
 .person.recent .person-avatar i { background: #69bd8f; }
 .person-main { min-width: 0; }
-.person-main > strong, .person-main > code { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.person-main > strong, .person-main > code, .agent-empty { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .person-main > strong { font-size: .79rem; }
+.agent-empty { margin-top: .15rem; color: var(--muted); font-size: .61rem; }
 .person-main > code { margin-top: .18rem; color: var(--muted); font-size: .59rem; }
 .badges { display: flex; flex-wrap: wrap; gap: .25rem; margin-top: .4rem; }
 .badge.local { color: #864327; background: var(--coral-soft); }
 .badge.leader { color: #75510f; background: #f2dfb6; }
 .badge.floor { color: white; background: var(--coral); }
+.badge.moderator { color: #5f3c08; background: #efd19c; }
 .legend { margin-top: auto; padding: 1rem 1.2rem; border-top: 1px solid var(--line); background: rgb(255 255 255 / .28); }
 .legend dl { margin: 0; }
 .legend dl div { display: grid; grid-template-columns: 50px 1fr; gap: .45rem; margin-top: .45rem; }
@@ -176,7 +186,7 @@ dialog::backdrop { background: rgb(10 29 25 / .58); backdrop-filter: blur(3px); 
 dialog form, .ticket-success { padding: 1.45rem; }
 .dialog-heading { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 1.2rem; }
 .dialog-heading h2, .ticket-success h2 { margin: .2rem 0 0; font: 700 1.8rem Georgia, serif; }
-.close-button { min-width: 42px; padding: 0; color: var(--muted); background: transparent; font-size: 1.7rem; }
+.close-button { min-width: 44px; padding: 0; color: var(--muted); background: transparent; font-size: 1.7rem; }
 dialog label { display: block; margin-top: .9rem; font-size: .76rem; font-weight: 800; }
 dialog label input, dialog label textarea { margin-top: .42rem; }
 .label-hint { display: block; margin-top: .15rem; color: var(--muted); font-size: .62rem; font-weight: 400; }

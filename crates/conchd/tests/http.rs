@@ -572,15 +572,23 @@ async fn ui_html_is_embedded_and_served_at_root_and_ui() {
         assert!(html.contains("Conch"));
         assert!(html.contains("id=\"transcript\""));
         assert!(html.contains("id=\"speech\""));
+        assert!(html.contains("id=\"room-state\""));
+        assert!(html.contains("No attached agents observed"));
+        assert!(html.contains("aria-live=\"polite\" aria-atomic=\"true\""));
     }
     let script = http_get(server.addr(), "/ui/app.js", None).await;
     assert_eq!(script.0, 200);
     let script = String::from_utf8(script.1).unwrap();
     assert!(script.contains("BOTTOM_THRESHOLD_PX = 48"));
+    assert!(script.contains("RETRY_MAX_MS = 30000"));
+    assert!(script.contains("state.roomStatus === \"locked\""));
+    assert!(script.contains("isCurrentRoom(room, epoch)"));
+    assert!(script.contains("browser_mutable === false"));
     assert!(script.contains("history.pushState"));
     assert!(script.contains("from=${from}"));
     assert!(!script.contains("scrollIntoView"));
     assert!(!script.contains("localStorage"));
+    assert!(!script.contains("roomList.replaceChildren"));
 }
 
 #[tokio::test]
@@ -825,6 +833,7 @@ async fn local_operator_catalog_create_detail_and_history_do_not_disclose_capabi
     .await;
     assert_eq!(status, 201);
     let created: Value = serde_json::from_slice(&created).unwrap();
+    assert_eq!(created["room"]["room"]["browser_mutable"], true);
     let ticket: Ticket = serde_json::from_value(created["ticket"].clone()).unwrap();
     let token = ticket.token.expect("new local rooms are private");
 

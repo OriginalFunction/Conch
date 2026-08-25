@@ -3937,19 +3937,17 @@ impl Daemon {
             &self.inner.node_key,
             &conch_core::encoding::signed_object_digest(&serde_json::to_value(&intent)?),
         ));
-        floor
-            .engine
-            .lock()
-            .expect("floor lock is not poisoned")
-            .upsert_intent(&replay.chain, intent)?;
-        let stored = floor
-            .engine
-            .lock()
-            .expect("floor lock is not poisoned")
-            .intents()
-            .find(|intent| intent.id == id)
-            .cloned()
-            .expect("upserted intent is present");
+        let stored = {
+            let mut engine = floor.engine.lock().expect("floor lock is not poisoned");
+            engine.upsert_intent(&replay.chain, intent)?;
+            let stored = engine
+                .intents()
+                .find(|intent| intent.agent == mouth.agent && intent.node == mouth.node)
+                .cloned()
+                .ok_or(DaemonError::Protocol("queued mouth is missing its intent"))?;
+            stored
+        };
+        let id = stored.id;
         let store = self.store(room)?;
         let prior = replaced.filter(|prior| *prior != id);
         let gossip = stored.clone();
@@ -5552,8 +5550,25 @@ impl Daemon {
             .collect::<Vec<_>>();
         let mut summaries = rooms
             .into_iter()
-            .map(|room| self.operator_room_summary(room))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|room| {
+                self.operator_room_summary(room).unwrap_or_else(|_| {
+                    json!({
+                        "id": room,
+                        "name": "Unavailable room",
+                        "parent": null,
+                        "role": JoinRole::Observe,
+                        "head_n": null,
+                        "head_hash": null,
+                        "last_activity": 0,
+                        "syncing": false,
+                        "valid": false,
+                        "browser_mutable": false,
+                        "roster_size": 0,
+                        "floor": { "state": "unavailable" },
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
         summaries.sort_by(|left, right| {
             right["last_activity"]
                 .as_u64()
@@ -5568,13 +5583,16 @@ impl Daemon {
 
     fn operator_room_summary(&self, room: RoomId) -> Result<Value, DaemonError> {
         let replay = self.replay(room)?;
-        let (name, parent) = replay
+        let (name, parent, browser_mutable) = replay
             .history
             .first()
             .and_then(|record| match &record.scene.body {
                 Body::Genesis {
-                    name, parent_room, ..
-                } => Some((name.clone(), *parent_room)),
+                    name,
+                    parent_room,
+                    token_sha256,
+                    ..
+                } => Some((name.clone(), *parent_room, token_sha256.is_some())),
                 _ => None,
             })
             .ok_or(DaemonError::Protocol("room has no genesis scene"))?;
@@ -5610,6 +5628,7 @@ impl Daemon {
             "last_activity": replay.history.last().map(|record| record.scene.ts).unwrap_or(0),
             "syncing": syncing,
             "valid": true,
+            "browser_mutable": browser_mutable,
             "roster_size": replay.chain.roster.len(),
             "floor": floor,
         }))
@@ -5620,14 +5639,6 @@ impl Daemon {
         let summary = self.operator_room_summary(room)?;
         let local = self.node_id();
         let now = unix_timestamp();
-        let local_role = self
-            .inner
-            .joins
-            .read()
-            .expect("join registry lock is not poisoned")
-            .get(&room)
-            .map(|join| join.role)
-            .unwrap_or(JoinRole::Observe);
         let declarations = self
             .inner
             .declarations
@@ -5655,17 +5666,35 @@ impl Daemon {
         for node in &replay.chain.roster {
             nodes.insert(*node, (JoinRole::Stake, BTreeSet::new()));
         }
-        nodes.entry(local).or_insert((local_role, BTreeSet::new()));
+        nodes.entry(local).or_insert((
+            if replay.chain.roster.contains(&local) {
+                JoinRole::Stake
+            } else {
+                JoinRole::Observe
+            },
+            BTreeSet::new(),
+        ));
         for (node, declaration) in declarations {
-            let entry = nodes
-                .entry(node)
-                .or_insert((declaration.role, BTreeSet::new()));
-            entry.0 = declaration.role;
+            let recent = node == local
+                || last_seen
+                    .get(&node)
+                    .is_some_and(|seen| now.saturating_sub(*seen) <= 10);
+            if !recent {
+                continue;
+            }
+            let entry = nodes.entry(node).or_insert((
+                if replay.chain.roster.contains(&node) {
+                    JoinRole::Stake
+                } else {
+                    JoinRole::Observe
+                },
+                BTreeSet::new(),
+            ));
             entry.1.extend(declaration.agents);
         }
         nodes
             .entry(local)
-            .or_insert((local_role, BTreeSet::new()))
+            .or_insert((JoinRole::Observe, BTreeSet::new()))
             .1
             .extend(local_agents);
         for record in &replay.history {
@@ -6814,6 +6843,61 @@ fn unix_timestamp() -> u64 {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn expired_operator_session_is_rejected_and_pruned() {
+        let data = TempDir::new().unwrap();
+        let daemon = Daemon::open(data.path()).unwrap();
+        let origin = "http://127.0.0.1:7420".to_owned();
+        let raw = daemon.create_operator_session(origin.clone());
+        assert!(daemon.validate_operator_session(&raw, &origin));
+        daemon.inner.operator_sessions.lock().unwrap()[0].expires = 0;
+
+        assert!(!daemon.validate_operator_session(&raw, &origin));
+        assert!(daemon.inner.operator_sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn operator_participant_role_comes_from_roster_and_presence_expires() {
+        let data = TempDir::new().unwrap();
+        let peer_data = TempDir::new().unwrap();
+        let daemon = Daemon::open(data.path()).unwrap();
+        let peer = Daemon::open(peer_data.path()).unwrap();
+        let room = daemon.create_genesis("participant authority").unwrap();
+        let declaration = Declaration::signed(
+            room,
+            JoinRole::Stake,
+            vec![AgentId::new("agent:not-yet-a-staker").unwrap()],
+            unix_timestamp(),
+            &peer.inner.node_key,
+        );
+        daemon.remember_declaration(peer.node_id(), &declaration);
+        daemon.mark_peer_seen(room, peer.node_id()).unwrap();
+
+        let detail = daemon.operator_room_detail(room).unwrap();
+        let participant = detail["participants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|participant| participant["node"] == json!(peer.node_id()))
+            .unwrap();
+        assert_eq!(participant["role"], json!(JoinRole::Observe));
+
+        daemon
+            .inner
+            .last_seen
+            .write()
+            .unwrap()
+            .get_mut(&room)
+            .unwrap()
+            .insert(peer.node_id(), unix_timestamp().saturating_sub(11));
+        let detail = daemon.operator_room_detail(room).unwrap();
+        assert!(!detail["participants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|participant| participant["node"] == json!(peer.node_id())));
+    }
 
     #[test]
     fn restart_commits_exact_pending_hash_before_a_fresh_body() {

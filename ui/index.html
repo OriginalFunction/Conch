@@ -92,13 +92,23 @@
             </div>
           </header>
 
-          <section class="floor-banner" aria-live="polite">
+          <section id="room-state" class="room-state" role="status" aria-live="polite" hidden>
+            <span aria-hidden="true">◎</span>
+            <h3 id="room-state-title">Room unavailable</h3>
+            <p id="room-state-copy"></p>
+            <div>
+              <button id="reauthorize-room" class="secondary" hidden>Join with ticket</button>
+              <button id="room-state-back">Back to rooms</button>
+            </div>
+          </section>
+
+          <section class="floor-banner" aria-live="polite" data-room-content>
             <span class="floor-orb" aria-hidden="true"></span>
             <div><p class="eyebrow">The floor</p><p id="floor-status">Loading the committed floor…</p></div>
             <button id="take-button" class="secondary" disabled>Raise hand</button>
           </section>
 
-          <div class="transcript-frame">
+          <div class="transcript-frame" data-room-content>
             <section id="transcript" class="transcript" aria-label="Committed room history" tabindex="0">
               <div id="history-start" class="history-start">Beginning of committed history</div>
               <div id="scene-list"></div>
@@ -108,14 +118,14 @@
                 <p>The first wrapped take will appear here.</p>
               </div>
             </section>
-            <button id="new-messages" class="new-messages" hidden><span id="new-message-count">1</span> new message</button>
+            <button id="new-messages" class="new-messages" aria-live="polite" aria-atomic="true" hidden><span id="new-message-count">1</span> new message</button>
           </div>
 
-          <section id="draft-preview" class="draft-preview" hidden aria-live="polite">
+          <section id="draft-preview" class="draft-preview" hidden aria-live="polite" data-room-content>
             <span>Live draft · not committed</span><p id="draft-text"></p>
           </section>
 
-          <section class="composer" aria-label="Speak while holding Conch">
+          <section class="composer" aria-label="Speak while holding Conch" data-room-content>
             <label for="speech">Your take</label>
             <textarea id="speech" rows="3" disabled placeholder="You can write when human:operator holds the floor."></textarea>
             <div class="composer-actions">
@@ -134,13 +144,13 @@
           <div><p class="eyebrow">Room presence</p><h2>People</h2></div>
           <span id="people-count" class="count-badge">0</span>
         </div>
-        <div id="people-list" class="people-list"></div>
+        <nav id="people-list" class="people-list" aria-label="Room participants"></nav>
         <div id="people-empty" class="rail-empty">
           <span aria-hidden="true">◇</span><strong>No room open</strong><p>Choose a room to see nodes, agents, and roles.</p>
         </div>
         <section class="legend" aria-label="Participant badge legend">
           <p class="eyebrow">Badges</p>
-          <dl><div><dt>Stake</dt><dd>Votes on committed scenes</dd></div><div><dt>Observe</dt><dd>Reads and participates without a vote</dd></div></dl>
+          <dl><div><dt>Stake</dt><dd>Votes on committed scenes</dd></div><div><dt>Observe</dt><dd>Reads and participates without a vote</dd></div><div><dt>Moderator</dt><dd>Can grant, yank, and configure the floor</dd></div></dl>
         </section>
       </aside>
     </div>
@@ -175,13 +185,13 @@
     </dialog>
 
     <template id="room-item-template">
-      <a class="room-item"><span class="room-avatar">C</span><span class="room-copy"><strong></strong><small class="room-preview"></small></span><span class="room-side"><time></time><span class="role-dot"></span></span></a>
+      <a class="room-item"><span class="room-avatar">C</span><span class="room-copy"><strong></strong><small class="room-preview"></small></span><span class="room-side"><time></time><span class="unread-badge" hidden></span><span class="role-dot"></span></span></a>
     </template>
     <template id="scene-template">
       <article class="scene"><div class="scene-marker"><span></span></div><div class="scene-content"><header><div><strong></strong><span class="scene-kind"></span></div><time></time></header><p></p><footer></footer></div></article>
     </template>
     <template id="person-template">
-      <article class="person"><div class="person-avatar"><span></span><i></i></div><div class="person-main"><strong></strong><code></code><div class="badges"></div></div></article>
+      <article class="person"><div class="person-avatar"><span></span><i></i></div><div class="person-main"><strong></strong><span class="agent-empty" hidden>No attached agents observed</span><code></code><div class="badges"></div></div></article>
     </template>
     <div id="toast" class="toast" role="status" hidden></div>
     <script src="/ui/app.js" defer></script>
