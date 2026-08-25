@@ -1,3 +1,10 @@
+conch (1.2.2) stable; urgency=medium
+
+  * Retransmit durable local floor intents to a newly elected leader so queued
+    hands survive loss of the original seeder.
+
+ -- Conch packagers <conch@localhost>  Tue, 25 Aug 2026 18:30:00 -0400
+
 conch (1.2.1) stable; urgency=medium
 
   * Derive stable MCP speech request ids and keep agents responsible for

@@ -60,6 +60,7 @@ const MAX_CONNECTIONS: usize = 1024;
 const MAX_CONNECTIONS_PER_SOURCE: usize = 64;
 const AUTH_FAILURE_BURST: u32 = 20;
 const AUTH_FAILURE_DECAY_INTERVAL: Duration = Duration::from_secs(6);
+const INTENT_FORWARD_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const REMOVE_AFTER_SECONDS: u64 = 300;
 const MAX_HISTORY_WAIT_SECS: u64 = 300;
 
@@ -130,6 +131,7 @@ struct Inner {
     last_seen: RwLock<BTreeMap<RoomId, BTreeMap<NodeId, u64>>>,
     declarations: RwLock<BTreeMap<RoomId, BTreeMap<NodeId, Declaration>>>,
     election_deadlines: Mutex<BTreeMap<RoomId, Instant>>,
+    intent_forwards: Mutex<BTreeMap<RoomId, IntentForwardState>>,
     syncing: RwLock<BTreeSet<RoomId>>,
     transport: RwLock<TransportConfig>,
     browser_sessions: Mutex<Vec<BrowserSession>>,
@@ -144,6 +146,13 @@ struct Inner {
 struct AuthFailureBucket {
     failures: u32,
     updated: Instant,
+}
+
+struct IntentForwardState {
+    leader: NodeId,
+    rpc_term: u64,
+    ids: BTreeSet<Hash32>,
+    retry_after: Instant,
 }
 
 pub(crate) struct ConnectionGuard {
@@ -417,6 +426,7 @@ impl Daemon {
                 last_seen: RwLock::new(last_seen),
                 declarations: RwLock::new(BTreeMap::new()),
                 election_deadlines: Mutex::new(BTreeMap::new()),
+                intent_forwards: Mutex::new(BTreeMap::new()),
                 syncing: RwLock::new(BTreeSet::new()),
                 transport: RwLock::new(TransportConfig {
                     mode: TransportMode::Local,
@@ -1894,6 +1904,11 @@ impl Daemon {
             .write()
             .expect("join registry lock is not poisoned")
             .remove(&room);
+        self.inner
+            .intent_forwards
+            .lock()
+            .expect("intent-forward lock is not poisoned")
+            .remove(&room);
         let path = self.room_path(room);
         match fs::remove_dir_all(path) {
             Ok(()) => sync_dir(&self.inner.data_dir.join("rooms"))?,
@@ -2394,12 +2409,19 @@ impl Daemon {
                     if declared_for_room
                         && heartbeat.leader == peer.node
                         && self.room_authorized(heartbeat.room, &authed)?
-                        && self.accept_heartbeat(&heartbeat)?
                     {
+                        let catch_up = self.accept_heartbeat(&heartbeat)?;
                         let daemon = self.clone();
-                        let peer = peer.node;
+                        let leader = peer.node;
+                        let room = heartbeat.room;
+                        let rpc_term = heartbeat.rpc_term;
                         tokio::spawn(async move {
-                            let _ = daemon.sync_from_known_peer(peer, heartbeat.room).await;
+                            if catch_up {
+                                let _ = daemon.sync_from_known_peer(leader, room).await;
+                            }
+                            daemon
+                                .forward_local_intents_to_leader(room, leader, rpc_term)
+                                .await;
                         });
                     }
                 }
@@ -4071,6 +4093,106 @@ impl Daemon {
                 continue;
             };
             let _ = write_message(&mut stream, &SwarmMsg::Intent(intent.clone())).await;
+        }
+    }
+
+    /// Repair the best-effort initial intent gossip after a leader change.
+    ///
+    /// A follower repeats its own still-live intents to the verified leader at
+    /// a bounded rate. This closes the race where the old leader disappears
+    /// after accepting the client request but before the eventual winner has
+    /// durably received it. Replays are harmless because intent ids are
+    /// signed and `receive_intent` is idempotent.
+    async fn forward_local_intents_to_leader(&self, room: RoomId, leader: NodeId, rpc_term: u64) {
+        let Ok(replay) = self.replay(room) else {
+            return;
+        };
+        if replay.consensus.role != ConsensusRole::Follower
+            || replay.consensus.leader_id != Some(leader)
+            || replay.consensus.current_term != rpc_term
+        {
+            return;
+        }
+        let Ok(floor) = self.floor(room) else {
+            return;
+        };
+        let node = self.node_id();
+        let now = unix_timestamp();
+        let intents = floor
+            .engine
+            .lock()
+            .expect("floor lock is not poisoned")
+            .intents()
+            .filter(|intent| {
+                intent.node == node
+                    && !replay.chain.consumed_intents.contains(&intent.id)
+                    && now < intent.exp
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let ids = intents
+            .iter()
+            .map(|intent| intent.id)
+            .collect::<BTreeSet<_>>();
+        if ids.is_empty() {
+            self.inner
+                .intent_forwards
+                .lock()
+                .expect("intent-forward lock is not poisoned")
+                .remove(&room);
+            return;
+        }
+
+        let instant = Instant::now();
+        {
+            let mut forwards = self
+                .inner
+                .intent_forwards
+                .lock()
+                .expect("intent-forward lock is not poisoned");
+            if forwards.get(&room).is_some_and(|state| {
+                state.leader == leader
+                    && state.rpc_term == rpc_term
+                    && state.ids == ids
+                    && instant < state.retry_after
+            }) {
+                return;
+            }
+            forwards.insert(
+                room,
+                IntentForwardState {
+                    leader,
+                    rpc_term,
+                    ids: ids.clone(),
+                    retry_after: instant + Duration::from_millis(500),
+                },
+            );
+        }
+
+        let forwarded = async {
+            let mut stream = self.connect_known_peer(leader, room).await?;
+            for intent in intents {
+                write_message(&mut stream, &SwarmMsg::Intent(intent)).await?;
+            }
+            Ok::<(), DaemonError>(())
+        }
+        .await
+        .is_ok();
+
+        let mut forwards = self
+            .inner
+            .intent_forwards
+            .lock()
+            .expect("intent-forward lock is not poisoned");
+        if let Some(state) = forwards.get_mut(&room) {
+            if state.leader == leader && state.rpc_term == rpc_term && state.ids == ids {
+                state.retry_after = Instant::now()
+                    + if forwarded {
+                        INTENT_FORWARD_RETRY_INTERVAL
+                    } else {
+                        Duration::from_millis(500)
+                    };
+            }
         }
     }
 

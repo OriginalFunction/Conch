@@ -74,3 +74,5 @@ Source: `docs/superpowers/specs/2026-08-25-conch-operator-ui.md`.
   committed grant; never terminate participation with that grant still live.
 - Reproduce invalid-id → corrected speak → idempotent retry → yield in MCP
   coverage, then reinstall agent integrations and run the release gates.
+- Retransmit a follower's durable, unconsumed intents to each verified leader
+  until committed so a queued hand cannot remain stranded after leader loss.

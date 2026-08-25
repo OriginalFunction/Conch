@@ -10,7 +10,8 @@ use conch_core::{
     encoding::scene_hash,
     ticket::JoinRole,
     types::{
-        AgentId, BlobRef, Body, FloorConfig, FloorMode, Hash32, Mouth, SignatureBytes, StakePolicy,
+        AgentId, BlobRef, Body, ConsensusRole, FloorConfig, FloorMode, Hash32, Mouth,
+        SignatureBytes, StakePolicy,
     },
 };
 use conchd::tcp::{read_frame, write_frame, Daemon, TransportMode};
@@ -893,7 +894,9 @@ async fn learned_pex_mesh_wraps_after_initial_seeder_exits() {
     let third = Daemon::open(third_data.path()).unwrap();
     let source_server = source.start(loopback()).await.unwrap();
     let second_server = second.start(loopback()).await.unwrap();
-    let _third_server = third.start(loopback()).await.unwrap();
+    let third_server = third.start(loopback()).await.unwrap();
+    let second_addr = second_server.addr();
+    let third_addr = third_server.addr();
     let ticket = source
         .create_ticket(
             "kill seeder",
@@ -934,13 +937,48 @@ async fn learned_pex_mesh_wraps_after_initial_seeder_exits() {
     drop(source_server);
     drop(source);
 
-    let mut client = attach(second_server.addr(), "agent:survivor").await;
-    assert!(
-        request(&mut client, ClientRequest::RaiseHand { room: ticket.id })
-            .await
-            .ok
-    );
-    tokio::time::timeout(Duration::from_secs(15), async {
+    let second_won = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let second_replay = second.replay(ticket.id).unwrap();
+            let third_replay = third.replay(ticket.id).unwrap();
+            let second_won = second_replay.consensus.role == ConsensusRole::Leader
+                && third_replay.consensus.leader_id == Some(second.node_id());
+            let third_won = third_replay.consensus.role == ConsensusRole::Leader
+                && second_replay.consensus.leader_id == Some(third.node_id());
+            if second_won || third_won {
+                break second_won;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the surviving PEX mesh must elect a leader");
+
+    // Make the initial intent gossip deterministically miss the current
+    // leader. Its first heartbeat after restart must cause the follower to
+    // retransmit the durable intent; otherwise the queued hand freezes.
+    let _restarted_leader = if second_won {
+        second_server.abort();
+        drop(second_server);
+        let mut client = attach(third_addr, "agent:survivor").await;
+        assert!(
+            request(&mut client, ClientRequest::RaiseHand { room: ticket.id })
+                .await
+                .ok
+        );
+        second.start(second_addr).await.unwrap()
+    } else {
+        third_server.abort();
+        drop(third_server);
+        let mut client = attach(second_addr, "agent:survivor").await;
+        assert!(
+            request(&mut client, ClientRequest::RaiseHand { room: ticket.id })
+                .await
+                .ok
+        );
+        third.start(third_addr).await.unwrap()
+    };
+    let wrapped = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if second.replay(ticket.id).unwrap().chain.live_grant.is_some()
                 && third.replay(ticket.id).unwrap().chain.live_grant.is_some()
@@ -950,8 +988,16 @@ async fn learned_pex_mesh_wraps_after_initial_seeder_exits() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
-    .await
-    .expect("the PEX mesh must elect and wrap without the seeder");
+    .await;
+    if wrapped.is_err() {
+        panic!(
+            "the PEX mesh must elect and wrap without the seeder\nsecond={:#?}\nthird={:#?}\nsecond_peers={}\nthird_peers={}",
+            second.replay(ticket.id).unwrap(),
+            third.replay(ticket.id).unwrap(),
+            fs::read_to_string(second_data.path().join("peers.json")).unwrap_or_default(),
+            fs::read_to_string(third_data.path().join("peers.json")).unwrap_or_default(),
+        );
+    }
     assert_eq!(
         second.replay(ticket.id).unwrap().chain.head_hash,
         third.replay(ticket.id).unwrap().chain.head_hash
