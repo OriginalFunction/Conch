@@ -331,7 +331,7 @@ impl FloorWatch {
     }
 }
 
-fn valid_request_id(request_id: &str) -> bool {
+pub fn valid_request_id(request_id: &str) -> bool {
     request_id.len() >= 32
         && request_id.len().is_multiple_of(2)
         && request_id

@@ -8,9 +8,11 @@ use std::{
 
 use conch_core::{
     client::{ClientReply, ClientRequest},
+    encoding::signed_object_digest,
+    floor::valid_request_id,
     frame::{self, MAX_FRAME_BYTES},
     ticket::{JoinRole, Ticket, TicketSource},
-    types::{AgentId, FloorConfig, FloorMode, Mouth, NodeId, RoomId, StakePolicy},
+    types::{AgentId, FloorConfig, FloorMode, Hash32, Mouth, NodeId, RoomId, StakePolicy},
 };
 use rand::random;
 use serde::de::DeserializeOwned;
@@ -234,17 +236,25 @@ impl Server {
                 },
                 None,
             ),
-            "speak" => (
-                ClientRequest::Speak {
-                    room: room()?,
-                    text: arguments.string("text")?,
-                    request_id: arguments
-                        .optional_string("request_id")
-                        .map(str::to_owned)
-                        .unwrap_or_else(random_request_id),
-                },
-                None,
-            ),
+            "speak" => {
+                let room = room()?;
+                let text = arguments.string("text")?;
+                let request_id = match arguments.optional_string("request_id") {
+                    Some(request_id) if valid_request_id(request_id) => request_id.to_owned(),
+                    Some(_) => {
+                        return Err("request_id must be even-length lowercase hex containing at least 16 bytes (32 characters); omit it to let Conch derive a stable id".into())
+                    }
+                    None => derived_request_id(&room, &self.agent, &text),
+                };
+                (
+                    ClientRequest::Speak {
+                        room,
+                        text,
+                        request_id,
+                    },
+                    None,
+                )
+            }
             "yield" => (ClientRequest::Yield { room: room()? }, None),
             "raise_hand" => (ClientRequest::RaiseHand { room: room()? }, None),
             "grant" => (
@@ -645,11 +655,14 @@ fn parse_node_addr(node: &str) -> Result<SocketAddr, String> {
         .map_err(|error| format!("invalid node address: {error}"))
 }
 
-fn random_request_id() -> String {
-    random::<[u8; 16]>()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+fn derived_request_id(room: &RoomId, agent: &AgentId, text: &str) -> String {
+    let payload = json!({
+        "agent": agent,
+        "room": room,
+        "text": text,
+        "v": 1,
+    });
+    Hash32::from_bytes(signed_object_digest(&payload)).to_string()
 }
 
 fn json_rpc_error(id: Value, code: i64, message: &str) -> Value {
@@ -747,10 +760,16 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "speak",
-            "Append text to this agent's current take",
+            "Append text to this agent's current take; retry correctable input errors while the grant remains open",
             object_schema(
                 room_properties(json!({
-                    "text": { "type": "string" }, "request_id": { "type": "string" }
+                    "text": { "type": "string" },
+                    "request_id": {
+                        "type": "string",
+                        "minLength": 32,
+                        "pattern": "^[0-9a-f]{32}(?:[0-9a-f]{2})*$",
+                        "description": "Optional even-length lowercase hex id of at least 16 bytes. Normally omit it: Conch derives a stable id from the room, agent, and exact text so an identical retry remains idempotent."
+                    }
                 })),
                 &["text"],
             ),

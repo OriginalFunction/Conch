@@ -65,6 +65,23 @@ async fn initialize_and_tools_list_use_current_mcp_envelopes() {
     assert!(names.contains(&"raise_hand"));
     assert!(names.contains(&"blob_put"));
     assert!(names.contains(&"breakout"));
+
+    let speak = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "speak")
+        .unwrap();
+    assert_eq!(
+        speak["inputSchema"]["properties"]["request_id"]["pattern"],
+        "^[0-9a-f]{32}(?:[0-9a-f]{2})*$"
+    );
+    assert!(
+        speak["inputSchema"]["properties"]["request_id"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Normally omit")
+    );
 }
 
 #[tokio::test]
@@ -222,18 +239,52 @@ async fn mcp_calls_the_same_daemon_floor_protocol() {
         .unwrap();
     assert_eq!(raised["result"]["isError"], false);
 
-    let spoke = server
+    let rejected = server
         .handle_message(json!({
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "speak",
+                "arguments": {
+                    "text": "hello from MCP",
+                    "request_id": "codex-round-1-guess-49"
+                }
+            }
+        }))
+        .await
+        .unwrap();
+    assert_eq!(rejected["result"]["isError"], true);
+    assert_eq!(rejected["result"]["structuredContent"]["code"], "invalid");
+    assert!(rejected["result"]["structuredContent"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("omit it"));
+
+    let spoke = server
+        .handle_message(json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
             "params": { "name": "speak", "arguments": { "text": "hello from MCP" } }
         }))
         .await
         .unwrap();
     assert_eq!(spoke["result"]["isError"], false);
+    assert_eq!(spoke["result"]["structuredContent"]["rev"], 1);
+
+    let retried = server
+        .handle_message(json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": { "name": "speak", "arguments": { "text": "hello from MCP" } }
+        }))
+        .await
+        .unwrap();
+    assert_eq!(retried["result"]["isError"], false);
+    assert_eq!(
+        retried["result"]["structuredContent"],
+        spoke["result"]["structuredContent"]
+    );
 
     let yielded = server
         .handle_message(json!({
-            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
             "params": { "name": "yield", "arguments": {} }
         }))
         .await
@@ -242,7 +293,7 @@ async fn mcp_calls_the_same_daemon_floor_protocol() {
 
     let history = server
         .handle_message(json!({
-            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
             "params": { "name": "history", "arguments": {} }
         }))
         .await
@@ -252,6 +303,7 @@ async fn mcp_calls_the_same_daemon_floor_protocol() {
         serde_json::from_str(history["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(page["scenes"].as_array().unwrap().len(), 3);
     assert_eq!(page["scenes"][2]["scene"]["body"]["type"], "speech");
+    assert_eq!(page["scenes"][2]["scene"]["body"]["text"], "hello from MCP");
     assert_eq!(page["complete"], true);
 
     let waiting_server = server.clone();

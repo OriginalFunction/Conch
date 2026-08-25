@@ -1,3 +1,10 @@
+conch (1.2.1) stable; urgency=medium
+
+  * Derive stable MCP speech request ids and keep agents responsible for
+    closing an open grant after correctable request errors.
+
+ -- Conch packagers <conch@localhost>  Tue, 25 Aug 2026 18:15:00 -0400
+
 conch (1.2.0) stable; urgency=medium
 
   * Render one People entry per agent mouth, expose durable queued hands in the

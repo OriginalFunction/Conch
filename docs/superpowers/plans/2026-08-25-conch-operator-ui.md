@@ -65,3 +65,12 @@ Source: `docs/superpowers/specs/2026-08-25-conch-operator-ui.md`.
   explicit terminal condition.
 - Add daemon/MCP/UI regression coverage, exercise refresh and active-holder
   queuing in a real browser, then run the full release gates.
+
+## 8. V1.2.1 grant-closure hotfix
+
+- Derive a stable valid MCP request id when callers omit it, and constrain any
+  supplied id in the tool schema before it reaches the daemon.
+- Treat correctable `speak` argument errors as retryable while the mouth owns a
+  committed grant; never terminate participation with that grant still live.
+- Reproduce invalid-id → corrected speak → idempotent retry → yield in MCP
+  coverage, then reinstall agent integrations and run the release gates.
