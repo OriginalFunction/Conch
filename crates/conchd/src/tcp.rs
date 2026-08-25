@@ -127,10 +127,12 @@ struct Inner {
     trackers: RwLock<Vec<String>>,
     peers: RwLock<BTreeMap<RoomId, BTreeMap<NodeId, Vec<String>>>>,
     last_seen: RwLock<BTreeMap<RoomId, BTreeMap<NodeId, u64>>>,
+    declarations: RwLock<BTreeMap<RoomId, BTreeMap<NodeId, Declaration>>>,
     election_deadlines: Mutex<BTreeMap<RoomId, Instant>>,
     syncing: RwLock<BTreeSet<RoomId>>,
     transport: RwLock<TransportConfig>,
     browser_sessions: Mutex<Vec<BrowserSession>>,
+    operator_sessions: Mutex<Vec<OperatorSession>>,
     connection_slots: Arc<Semaphore>,
     source_connections: Mutex<BTreeMap<IpAddr, usize>>,
     auth_failures: Mutex<BTreeMap<IpAddr, AuthFailureBucket>>,
@@ -190,6 +192,13 @@ impl Drop for ConnectionGuard {
 struct BrowserSession {
     digest: [u8; 32],
     room: RoomId,
+    origin: String,
+    created: u64,
+    expires: u64,
+}
+
+struct OperatorSession {
+    digest: [u8; 32],
     origin: String,
     created: u64,
     expires: u64,
@@ -405,6 +414,7 @@ impl Daemon {
                 trackers: RwLock::new(Vec::new()),
                 peers: RwLock::new(peers),
                 last_seen: RwLock::new(last_seen),
+                declarations: RwLock::new(BTreeMap::new()),
                 election_deadlines: Mutex::new(BTreeMap::new()),
                 syncing: RwLock::new(BTreeSet::new()),
                 transport: RwLock::new(TransportConfig {
@@ -412,6 +422,7 @@ impl Daemon {
                     tls_client: None,
                 }),
                 browser_sessions: Mutex::new(Vec::new()),
+                operator_sessions: Mutex::new(Vec::new()),
                 connection_slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
                 source_connections: Mutex::new(BTreeMap::new()),
                 auth_failures: Mutex::new(BTreeMap::new()),
@@ -629,6 +640,65 @@ impl Daemon {
         };
         let digest: [u8; 32] = Sha256::digest(raw).into();
         if let Ok(mut sessions) = self.inner.browser_sessions.lock() {
+            sessions.retain(|session| !bool::from(session.digest.ct_eq(&digest)));
+        }
+    }
+
+    pub(crate) fn create_operator_session(&self, origin: String) -> String {
+        let raw = random::<[u8; 32]>();
+        let digest: [u8; 32] = Sha256::digest(raw).into();
+        let now = unix_timestamp();
+        let mut sessions = self
+            .inner
+            .operator_sessions
+            .lock()
+            .expect("operator session lock is not poisoned");
+        sessions.retain(|session| session.expires > now);
+        if sessions.len() >= 4096 {
+            let oldest = sessions
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, session)| session.created)
+                .map(|(index, _)| index)
+                .expect("a full session table is non-empty");
+            sessions.swap_remove(oldest);
+        }
+        sessions.push(OperatorSession {
+            digest,
+            origin,
+            created: now,
+            expires: now.saturating_add(15 * 60),
+        });
+        hex::encode(raw)
+    }
+
+    pub(crate) fn validate_operator_session(&self, raw: &str, origin: &str) -> bool {
+        let Some(raw) = hex::decode(raw)
+            .ok()
+            .and_then(|raw| <[u8; 32]>::try_from(raw).ok())
+        else {
+            return false;
+        };
+        let digest: [u8; 32] = Sha256::digest(raw).into();
+        let now = unix_timestamp();
+        let Ok(mut sessions) = self.inner.operator_sessions.lock() else {
+            return false;
+        };
+        sessions.retain(|session| session.expires > now);
+        sessions
+            .iter()
+            .any(|session| bool::from(session.digest.ct_eq(&digest)) && session.origin == origin)
+    }
+
+    pub(crate) fn revoke_operator_session(&self, raw: &str) {
+        let Some(raw) = hex::decode(raw)
+            .ok()
+            .and_then(|raw| <[u8; 32]>::try_from(raw).ok())
+        else {
+            return;
+        };
+        let digest: [u8; 32] = Sha256::digest(raw).into();
+        if let Ok(mut sessions) = self.inner.operator_sessions.lock() {
             sessions.retain(|session| !bool::from(session.digest.ct_eq(&digest)));
         }
     }
@@ -1369,6 +1439,8 @@ impl Daemon {
         {
             return Err(DaemonError::Protocol("invalid room authorization response"));
         }
+        self.mark_peer_seen(room, peer.node)?;
+        self.remember_declaration(peer.node, &authed.declaration);
         peer.decl.retain(|known| known.room != room);
         peer.decl.push(authed.declaration);
         write_message(stream, &SwarmMsg::Pex(self.pex(room))).await?;
@@ -2088,6 +2160,11 @@ impl Daemon {
                     }
                 }
             }
+            if let Some(room) = swarm_message_room(&message) {
+                if authed.contains(&room) {
+                    self.mark_peer_seen(room, peer.node)?;
+                }
+            }
             match message {
                 SwarmMsg::Auth(auth) => {
                     let token_authorized = match self.authorize_room_token(auth.room, auth.token) {
@@ -2130,6 +2207,7 @@ impl Daemon {
                     accepted_auth.insert(auth.room, auth.clone());
                     authed.insert(auth.room);
                     self.mark_peer_seen(auth.room, peer.node)?;
+                    self.remember_declaration(peer.node, &auth.declaration);
                     peer.decl.retain(|known| known.room != auth.room);
                     peer.decl.push(auth.declaration.clone());
                     write_message(
@@ -5065,6 +5143,16 @@ impl Daemon {
         write_json_atomic(&self.inner.data_dir.join("last-seen.json"), &snapshot)
     }
 
+    fn remember_declaration(&self, node: NodeId, declaration: &Declaration) {
+        self.inner
+            .declarations
+            .write()
+            .expect("declaration lock is not poisoned")
+            .entry(declaration.room)
+            .or_default()
+            .insert(node, declaration.clone());
+    }
+
     async fn maybe_remove_unavailable(&self, room: RoomId) -> Result<(), DaemonError> {
         let replay = self.replay(room)?;
         let node = self.node_id();
@@ -5451,6 +5539,190 @@ impl Daemon {
         from_n: u64,
     ) -> Result<Value, DaemonError> {
         self.history_page(room, self.history_from(room, from_n)?)
+    }
+
+    pub(crate) fn operator_catalog(&self) -> Result<Value, DaemonError> {
+        let rooms = self
+            .inner
+            .rooms
+            .read()
+            .expect("room registry lock is not poisoned")
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut summaries = rooms
+            .into_iter()
+            .map(|room| self.operator_room_summary(room))
+            .collect::<Result<Vec<_>, _>>()?;
+        summaries.sort_by(|left, right| {
+            right["last_activity"]
+                .as_u64()
+                .cmp(&left["last_activity"].as_u64())
+                .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
+        });
+        Ok(json!({
+            "node": self.node_id(),
+            "rooms": summaries,
+        }))
+    }
+
+    fn operator_room_summary(&self, room: RoomId) -> Result<Value, DaemonError> {
+        let replay = self.replay(room)?;
+        let (name, parent) = replay
+            .history
+            .first()
+            .and_then(|record| match &record.scene.body {
+                Body::Genesis {
+                    name, parent_room, ..
+                } => Some((name.clone(), *parent_room)),
+                _ => None,
+            })
+            .ok_or(DaemonError::Protocol("room has no genesis scene"))?;
+        let role = self
+            .inner
+            .joins
+            .read()
+            .expect("join registry lock is not poisoned")
+            .get(&room)
+            .map(|join| join.role)
+            .unwrap_or(JoinRole::Observe);
+        let syncing = self
+            .inner
+            .syncing
+            .read()
+            .expect("sync registry lock is not poisoned")
+            .contains(&room);
+        let floor = replay
+            .chain
+            .live_grant
+            .as_ref()
+            .map(
+                |grant| json!({ "state": "held", "agent": &grant.to.agent, "node": grant.to.node }),
+            )
+            .unwrap_or_else(|| json!({ "state": "vacant" }));
+        Ok(json!({
+            "id": room,
+            "name": name,
+            "parent": parent,
+            "role": role,
+            "head_n": replay.chain.head_n,
+            "head_hash": replay.chain.head_hash,
+            "last_activity": replay.history.last().map(|record| record.scene.ts).unwrap_or(0),
+            "syncing": syncing,
+            "valid": true,
+            "roster_size": replay.chain.roster.len(),
+            "floor": floor,
+        }))
+    }
+
+    pub(crate) fn operator_room_detail(&self, room: RoomId) -> Result<Value, DaemonError> {
+        let replay = self.replay(room)?;
+        let summary = self.operator_room_summary(room)?;
+        let local = self.node_id();
+        let now = unix_timestamp();
+        let local_role = self
+            .inner
+            .joins
+            .read()
+            .expect("join registry lock is not poisoned")
+            .get(&room)
+            .map(|join| join.role)
+            .unwrap_or(JoinRole::Observe);
+        let declarations = self
+            .inner
+            .declarations
+            .read()
+            .expect("declaration lock is not poisoned")
+            .get(&room)
+            .cloned()
+            .unwrap_or_default();
+        let last_seen = self
+            .inner
+            .last_seen
+            .read()
+            .expect("last-seen lock is not poisoned")
+            .get(&room)
+            .cloned()
+            .unwrap_or_default();
+        let local_agents = self
+            .inner
+            .agents
+            .read()
+            .expect("agent registry lock is not poisoned")
+            .clone();
+
+        let mut nodes = BTreeMap::<NodeId, (JoinRole, BTreeSet<AgentId>)>::new();
+        for node in &replay.chain.roster {
+            nodes.insert(*node, (JoinRole::Stake, BTreeSet::new()));
+        }
+        nodes.entry(local).or_insert((local_role, BTreeSet::new()));
+        for (node, declaration) in declarations {
+            let entry = nodes
+                .entry(node)
+                .or_insert((declaration.role, BTreeSet::new()));
+            entry.0 = declaration.role;
+            entry.1.extend(declaration.agents);
+        }
+        nodes
+            .entry(local)
+            .or_insert((local_role, BTreeSet::new()))
+            .1
+            .extend(local_agents);
+        for record in &replay.history {
+            if let Body::Grant { to, .. } = &record.scene.body {
+                nodes
+                    .entry(to.node)
+                    .or_insert((
+                        if replay.chain.roster.contains(&to.node) {
+                            JoinRole::Stake
+                        } else {
+                            JoinRole::Observe
+                        },
+                        BTreeSet::new(),
+                    ))
+                    .1
+                    .insert(to.agent.clone());
+            }
+        }
+        if let Some(moderator) = &replay.chain.moderator {
+            nodes
+                .entry(moderator.node)
+                .or_insert((JoinRole::Observe, BTreeSet::new()))
+                .1
+                .insert(moderator.agent.clone());
+        }
+        let participants = nodes
+            .into_iter()
+            .map(|(node, (role, agents))| {
+                let seen = if node == local {
+                    Some(now)
+                } else {
+                    last_seen.get(&node).copied()
+                };
+                json!({
+                    "node": node,
+                    "role": role,
+                    "agents": agents,
+                    "local": node == local,
+                    "recent": seen.is_some_and(|seen| now.saturating_sub(seen) <= 10),
+                    "last_seen": seen,
+                    "leader": replay.consensus.leader_id == Some(node),
+                    "floor_holder": replay.chain.live_grant.as_ref().is_some_and(|grant| grant.to.node == node),
+                    "moderator": replay.chain.moderator.as_ref().is_some_and(|moderator| moderator.node == node),
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "room": summary,
+            "node": local,
+            "participants": participants,
+            "floor": {
+                "mode": replay.chain.floor_mode,
+                "timeout_secs": replay.chain.timeout_secs,
+                "holder": replay.chain.live_grant.as_ref().map(|grant| &grant.to),
+                "leader": replay.consensus.leader_id,
+            }
+        }))
     }
 
     fn history_page(

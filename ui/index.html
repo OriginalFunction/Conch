@@ -4,92 +4,186 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#102924">
-    <title>Conch · room ledger</title>
+    <meta name="color-scheme" content="light">
+    <title>Conch · one floor, one history</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='27' fill='%23102924' stroke='%23f4d9bf' stroke-width='5'/%3E%3Ctext x='32' y='43' text-anchor='middle' font-family='serif' font-style='italic' font-size='36' fill='%23f4d9bf'%3EC%3C/text%3E%3C/svg%3E">
     <link rel="stylesheet" href="/ui/app.css">
   </head>
   <body>
     <header class="masthead">
-      <a class="brand" href="/ui/" aria-label="Conch home">
+      <a class="brand" href="/" data-home aria-label="Conch rooms home">
         <span class="brand-mark" aria-hidden="true">C</span>
         <span><strong>Conch</strong><small>one floor, one history</small></span>
       </a>
-      <div class="connection"><span id="connection-dot"></span><span id="connection-label">Connecting</span></div>
+      <div class="header-actions">
+        <button class="icon-button mobile-only" id="rooms-toggle" aria-controls="rooms-rail" aria-expanded="false">Rooms</button>
+        <div class="connection connecting" id="connection" role="status">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="connection-label">Starting local console</span>
+        </div>
+        <button class="icon-button mobile-only" id="people-toggle" aria-controls="people-rail" aria-expanded="false">People</button>
+      </div>
     </header>
 
-    <div class="shell">
-      <aside class="sidebar">
-        <section>
-          <p class="eyebrow">Current room</p>
-          <h1 id="room-name">No room open</h1>
-          <dl class="facts">
-            <div><dt>Room</dt><dd id="room-id">—</dd></div>
-            <div><dt>This node</dt><dd id="node-id">—</dd></div>
-            <div><dt>Wrapped head</dt><dd id="head-number">—</dd></div>
-          </dl>
-        </section>
-
-        <section class="join-panel">
-          <p class="eyebrow">Open a locally joined room</p>
-          <label for="ticket-source">Ticket, magnet, or URL</label>
-          <textarea id="ticket-source" rows="4" placeholder="Paste a .conch JSON object or conch:1:… magnet"></textarea>
-          <div class="join-row">
-            <select id="join-role" aria-label="Join role" hidden>
-              <option value="stake">Stake</option>
-              <option value="observe">Observe</option>
-            </select>
-            <button id="join-button" class="secondary">Open room</button>
+    <div class="app-shell">
+      <aside class="rail rooms-rail" id="rooms-rail" aria-label="Rooms">
+        <div class="rail-heading">
+          <div>
+            <p class="eyebrow">This node</p>
+            <h1>Rooms</h1>
           </div>
-          <p id="join-error" class="error" role="alert"></p>
-        </section>
+          <span id="room-count" class="count-badge">0</span>
+        </div>
+        <div class="room-actions">
+          <button id="create-room-button">New room</button>
+          <button id="join-room-button" class="secondary">Join</button>
+        </div>
+        <label class="room-search"><span class="sr-only">Search rooms</span><input id="room-search" type="search" placeholder="Search rooms" autocomplete="off"></label>
+        <nav id="room-list" class="room-list" aria-label="Locally stored rooms"></nav>
+        <div id="rooms-empty" class="rail-empty">
+          <span aria-hidden="true">◌</span>
+          <strong>No rooms yet</strong>
+          <p>Create one here or join with a ticket.</p>
+        </div>
+        <footer class="node-card">
+          <span class="status-dot online" aria-hidden="true"></span>
+          <div><strong>Local daemon</strong><code id="local-node">Discovering…</code></div>
+        </footer>
       </aside>
 
-      <main>
-        <section class="floor-bar" aria-live="polite">
-          <div>
-            <p class="eyebrow">The floor</p>
-            <p id="floor-status">Open a room to see who holds Conch.</p>
-          </div>
-          <button id="take-button" class="secondary" disabled>Raise hand</button>
-        </section>
-
-        <section id="transcript" class="transcript" aria-label="Wrapped transcript">
-          <div class="empty-state">
-            <span aria-hidden="true">◎</span>
-            <h2>The ledger is quiet</h2>
-            <p>Join a room. Only wrapped scenes will appear here.</p>
-          </div>
-        </section>
-
-        <section id="draft-preview" class="draft-preview" hidden>
-          <span>Live draft · unverified</span>
-          <p id="draft-text"></p>
-        </section>
-
-        <section class="composer" aria-label="Speak while holding Conch">
-          <label for="speech">Your take</label>
-          <textarea id="speech" rows="4" disabled placeholder="You can write when this human holds the floor."></textarea>
-          <div class="composer-actions">
-            <p id="compose-hint">The wrapped grant controls this composer.</p>
-            <div>
-              <button id="yield-button" class="secondary" disabled>Yield</button>
-              <button id="wrap-button" disabled>Wrap &amp; yield</button>
+      <main class="conversation" id="conversation">
+        <section id="home-view" class="home-view">
+          <div class="home-hero">
+            <span class="conch-rings" aria-hidden="true"><i></i><i></i><i></i></span>
+            <p class="eyebrow">Local conversation ledger</p>
+            <h2>One floor.<br>One shared history.</h2>
+            <p>Open a room to follow its committed conversation, see who is present, and take the floor without losing your place.</p>
+            <div class="hero-actions">
+              <button id="home-create-button">Create a room</button>
+              <button id="home-join-button" class="secondary">Join from ticket</button>
             </div>
           </div>
+          <section class="home-guide" aria-labelledby="quick-start-title">
+            <p class="eyebrow">Quick start</p>
+            <h3 id="quick-start-title">Your daemon remembers the rooms.</h3>
+            <ol>
+              <li><span>1</span><div><strong>Create or join</strong><p>Tickets are used once. Conch stores the room locally.</p></div></li>
+              <li><span>2</span><div><strong>Share the ticket</strong><p>Invite another node as a staker or observer.</p></div></li>
+              <li><span>3</span><div><strong>Raise your hand</strong><p>Only the current floor holder can wrap the next take.</p></div></li>
+            </ol>
+          </section>
+        </section>
+
+        <section id="room-view" class="room-view" hidden>
+          <header class="room-header">
+            <div class="room-title">
+              <div class="room-icon" aria-hidden="true">C</div>
+              <div>
+                <div class="title-line">
+                  <h2 id="room-name">Room</h2>
+                  <span id="room-role" class="role-badge">observer</span>
+                </div>
+                <button id="copy-room-id" class="room-id" title="Copy room id"><span id="room-id"></span><span aria-hidden="true">⧉</span></button>
+              </div>
+            </div>
+            <div class="room-meta">
+              <div><span>Wrapped head</span><strong id="head-number">—</strong></div>
+              <div><span>Floor mode</span><strong id="floor-mode">—</strong></div>
+            </div>
+          </header>
+
+          <section class="floor-banner" aria-live="polite">
+            <span class="floor-orb" aria-hidden="true"></span>
+            <div><p class="eyebrow">The floor</p><p id="floor-status">Loading the committed floor…</p></div>
+            <button id="take-button" class="secondary" disabled>Raise hand</button>
+          </section>
+
+          <div class="transcript-frame">
+            <section id="transcript" class="transcript" aria-label="Committed room history" tabindex="0">
+              <div id="history-start" class="history-start">Beginning of committed history</div>
+              <div id="scene-list"></div>
+              <div id="history-empty" class="empty-state">
+                <span aria-hidden="true">◎</span>
+                <h3>The ledger is quiet</h3>
+                <p>The first wrapped take will appear here.</p>
+              </div>
+            </section>
+            <button id="new-messages" class="new-messages" hidden><span id="new-message-count">1</span> new message</button>
+          </div>
+
+          <section id="draft-preview" class="draft-preview" hidden aria-live="polite">
+            <span>Live draft · not committed</span><p id="draft-text"></p>
+          </section>
+
+          <section class="composer" aria-label="Speak while holding Conch">
+            <label for="speech">Your take</label>
+            <textarea id="speech" rows="3" disabled placeholder="You can write when human:operator holds the floor."></textarea>
+            <div class="composer-actions">
+              <p id="compose-hint">The committed grant controls this composer.</p>
+              <div>
+                <button id="yield-button" class="secondary" disabled>Yield empty</button>
+                <button id="wrap-button" disabled>Wrap &amp; yield</button>
+              </div>
+            </div>
+          </section>
         </section>
       </main>
+
+      <aside class="rail people-rail" id="people-rail" aria-label="Participants">
+        <div class="rail-heading">
+          <div><p class="eyebrow">Room presence</p><h2>People</h2></div>
+          <span id="people-count" class="count-badge">0</span>
+        </div>
+        <div id="people-list" class="people-list"></div>
+        <div id="people-empty" class="rail-empty">
+          <span aria-hidden="true">◇</span><strong>No room open</strong><p>Choose a room to see nodes, agents, and roles.</p>
+        </div>
+        <section class="legend" aria-label="Participant badge legend">
+          <p class="eyebrow">Badges</p>
+          <dl><div><dt>Stake</dt><dd>Votes on committed scenes</dd></div><div><dt>Observe</dt><dd>Reads and participates without a vote</dd></div></dl>
+        </section>
+      </aside>
     </div>
 
-    <template id="scene-template">
-      <article class="scene">
-        <div class="scene-index"></div>
-        <div class="scene-content">
-          <header><strong></strong><time></time></header>
-          <p></p>
-          <footer></footer>
-        </div>
-      </article>
+    <dialog id="create-dialog">
+      <form id="create-form">
+        <div class="dialog-heading"><div><p class="eyebrow">Start a conversation</p><h2>Create a room</h2></div><button type="button" class="close-button" data-close aria-label="Close">×</button></div>
+        <label>Room name<input id="create-name" name="name" maxlength="128" required placeholder="Architecture review"></label>
+        <label>Floor timeout<span class="label-hint">Seconds before an idle holder is closed</span><input id="create-timeout" name="timeout" type="number" min="1" value="30" required></label>
+        <p id="create-error" class="error" role="alert"></p>
+        <div class="dialog-actions"><button type="button" class="secondary" data-close>Cancel</button><button type="submit">Create room</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="join-dialog">
+      <form id="join-form">
+        <div class="dialog-heading"><div><p class="eyebrow">Add to this node</p><h2>Join a room</h2></div><button type="button" class="close-button" data-close aria-label="Close">×</button></div>
+        <label>Ticket, magnet, or URL<textarea id="ticket-source" rows="6" required placeholder="Paste .conch JSON, a conch:1:… magnet, or an HTTPS ticket URL"></textarea></label>
+        <fieldset><legend>Join role</legend><label class="radio-card"><input type="radio" name="join-role" value="stake" checked><span><strong>Staker</strong><small>Vote on committed scenes</small></span></label><label class="radio-card"><input type="radio" name="join-role" value="observe"><span><strong>Observer</strong><small>Participate without a vote</small></span></label></fieldset>
+        <p id="join-error" class="error" role="alert"></p>
+        <div class="dialog-actions"><button type="button" class="secondary" data-close>Cancel</button><button type="submit">Join room</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="ticket-dialog">
+      <div class="ticket-success">
+        <span class="success-mark" aria-hidden="true">✓</span><p class="eyebrow">Room created</p><h2>Your invitation is ready</h2>
+        <p>Download or copy it now. For safety, Conch will not show this private capability again.</p>
+        <div class="ticket-actions"><button id="download-ticket">Download .conch</button><button id="copy-magnet" class="secondary">Copy magnet</button></div>
+        <button id="finish-ticket" class="text-button">Done</button>
+      </div>
+    </dialog>
+
+    <template id="room-item-template">
+      <a class="room-item"><span class="room-avatar">C</span><span class="room-copy"><strong></strong><small class="room-preview"></small></span><span class="room-side"><time></time><span class="role-dot"></span></span></a>
     </template>
+    <template id="scene-template">
+      <article class="scene"><div class="scene-marker"><span></span></div><div class="scene-content"><header><div><strong></strong><span class="scene-kind"></span></div><time></time></header><p></p><footer></footer></div></article>
+    </template>
+    <template id="person-template">
+      <article class="person"><div class="person-avatar"><span></span><i></i></div><div class="person-main"><strong></strong><code></code><div class="badges"></div></div></article>
+    </template>
+    <div id="toast" class="toast" role="status" hidden></div>
     <script src="/ui/app.js" defer></script>
   </body>
 </html>

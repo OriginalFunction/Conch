@@ -256,7 +256,7 @@ dependencies = [
 
 [[package]]
 name = "conch"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "conch-core",
  "conch-mcp",
@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "conch-core"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "ed25519-dalek",
  "form_urlencoded",
@@ -286,7 +286,7 @@ dependencies = [
 
 [[package]]
 name = "conch-mcp"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "conch-core",
  "conchd",
@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "conchd"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "axum",
  "axum-server",

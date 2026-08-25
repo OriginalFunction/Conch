@@ -22,6 +22,7 @@ use axum::{
     Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
+use rand::random;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::{
@@ -41,7 +42,8 @@ use url::{Host, Url};
 use conch_core::{
     client::ClientReply,
     frame,
-    types::{Hash32, RoomId},
+    ticket::{JoinRole, Ticket},
+    types::{FloorConfig, Hash32, RoomId, StakePolicy},
 };
 
 use crate::tcp::{
@@ -59,6 +61,7 @@ const HTTP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 struct HttpState {
     daemon: Daemon,
     secure: bool,
+    operator: bool,
 }
 
 pub struct RunningHttpServer {
@@ -237,7 +240,8 @@ impl Daemon {
         let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
         self.remember_http_addr(addr)?;
-        let router = router(self.clone(), false);
+        let operator = self.transport_mode() == TransportMode::Local && addr.ip().is_loopback();
+        let router = router(self.clone(), false, operator);
         let listener = GuardedListener {
             listener,
             daemon: self.clone(),
@@ -254,14 +258,16 @@ impl Daemon {
 
     pub async fn serve_http(&self, addr: SocketAddr) -> Result<(), DaemonError> {
         let listener = TcpListener::bind(addr).await?;
-        self.remember_http_addr(listener.local_addr()?)?;
+        let addr = listener.local_addr()?;
+        self.remember_http_addr(addr)?;
+        let operator = self.transport_mode() == TransportMode::Local && addr.ip().is_loopback();
         let listener = GuardedListener {
             listener,
             daemon: self.clone(),
         };
         axum::serve(
             listener,
-            router(self.clone(), false).into_make_service_with_connect_info::<HttpPeer>(),
+            router(self.clone(), false, operator).into_make_service_with_connect_info::<HttpPeer>(),
         )
         .await?;
         Ok(())
@@ -282,7 +288,9 @@ impl Daemon {
                         daemon: self.clone(),
                     })
             })
-            .serve(router(self.clone(), true).into_make_service_with_connect_info::<HttpPeer>())
+            .serve(
+                router(self.clone(), true, false).into_make_service_with_connect_info::<HttpPeer>(),
+            )
             .await
             .map_err(std::io::Error::other)?;
         Ok(())
@@ -331,18 +339,36 @@ impl Daemon {
     }
 }
 
-fn router(daemon: Daemon, secure: bool) -> Router {
+fn router(daemon: Daemon, secure: bool, operator: bool) -> Router {
     Router::new()
         .route("/ticket/{id}", get(get_ticket))
         .route("/history/{id}", get(get_history))
+        .route("/room/{id}", get(get_room_detail))
         .route("/swarm", get(ws_swarm))
         .route("/client", get(ws_client))
         .route("/session/{id}", post(create_session).delete(delete_session))
+        .route(
+            "/operator/session",
+            post(create_operator_session).delete(delete_operator_session),
+        )
+        .route(
+            "/operator/rooms",
+            get(operator_rooms).post(operator_create_room),
+        )
+        .route("/operator/rooms/join", post(operator_join_room))
+        .route("/operator/rooms/{id}", get(operator_room))
+        .route("/operator/rooms/{id}/history", get(operator_room_history))
+        .route("/operator/client/{id}", get(ws_operator_client))
         .route("/", get(index))
+        .route("/rooms/{id}", get(index))
         .route("/ui/", get(index))
         .route("/ui/app.js", get(app_js))
         .route("/ui/app.css", get(app_css))
-        .with_state(HttpState { daemon, secure })
+        .with_state(HttpState {
+            daemon,
+            secure,
+            operator,
+        })
 }
 
 async fn index() -> Response<Body> {
@@ -377,6 +403,291 @@ fn static_asset(contents: &'static str, content_type: &'static str) -> Response<
     response
 }
 
+async fn create_operator_session(
+    State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<HttpPeer>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, HttpError> {
+    require_operator_endpoint(&state, peer)?;
+    let origin = operator_origin(&headers, true)?;
+    let raw = state.daemon.create_operator_session(origin);
+    let cookie = format!("conch_operator={raw}; Path=/; HttpOnly; SameSite=Strict; Max-Age=900");
+    let mut response = (StatusCode::CREATED, Json(json!({ "ok": true }))).into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie).map_err(|_| HttpError::BadRequest("invalid cookie"))?,
+    );
+    Ok(operator_no_store(response))
+}
+
+async fn delete_operator_session(
+    State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<HttpPeer>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, HttpError> {
+    require_operator_endpoint(&state, peer)?;
+    let raw = authorize_operator(&state, &headers, true)?;
+    state.daemon.revoke_operator_session(raw);
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_static("conch_operator=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"),
+    );
+    Ok(operator_no_store(response))
+}
+
+async fn operator_rooms(
+    State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<HttpPeer>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, HttpError> {
+    require_operator_endpoint(&state, peer)?;
+    authorize_operator(&state, &headers, false)?;
+    Ok(operator_no_store(
+        Json(state.daemon.operator_catalog()?).into_response(),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateRoomRequest {
+    name: String,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default = "default_timeout_secs")]
+    timeout_secs: u64,
+}
+
+fn default_timeout_secs() -> u64 {
+    30
+}
+
+async fn operator_create_room(
+    State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<HttpPeer>,
+    headers: HeaderMap,
+    Json(request): Json<CreateRoomRequest>,
+) -> Result<Response<Body>, HttpError> {
+    require_operator_endpoint(&state, peer)?;
+    authorize_operator(&state, &headers, true)?;
+    let name = request.name.trim();
+    if name.is_empty() || name.chars().count() > 128 {
+        return Err(HttpError::BadRequest(
+            "room name must contain 1-128 characters",
+        ));
+    }
+    if request.mode.as_deref().is_some_and(|mode| mode != "stick") {
+        return Err(HttpError::BadRequest(
+            "the local console currently creates stick-floor rooms",
+        ));
+    }
+    if request.timeout_secs == 0 {
+        return Err(HttpError::BadRequest("timeout_secs must be at least 1"));
+    }
+    let daemon = state.daemon.clone();
+    let name = name.to_owned();
+    let timeout_secs = request.timeout_secs;
+    let ticket = task::spawn_blocking(move || {
+        daemon.create_ticket_with_token(
+            &name,
+            StakePolicy::default(),
+            FloorConfig::stick(timeout_secs),
+            Some(Hash32::from_bytes(random::<[u8; 32]>())),
+        )
+    })
+    .await??;
+    let room = state.daemon.operator_room_detail(ticket.id)?;
+    Ok(operator_no_store(
+        (
+            StatusCode::CREATED,
+            Json(json!({ "ticket": ticket, "room": room })),
+        )
+            .into_response(),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JoinRoomRequest {
+    ticket: Ticket,
+    #[serde(default)]
+    role: JoinRole,
+}
+
+async fn operator_join_room(
+    State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<HttpPeer>,
+    headers: HeaderMap,
+    Json(request): Json<JoinRoomRequest>,
+) -> Result<Response<Body>, HttpError> {
+    require_operator_endpoint(&state, peer)?;
+    authorize_operator(&state, &headers, true)?;
+    let room = request.ticket.id;
+    state
+        .daemon
+        .join_ticket(request.ticket, request.role)
+        .await?;
+    Ok(operator_no_store(
+        (
+            StatusCode::CREATED,
+            Json(state.daemon.operator_room_detail(room)?),
+        )
+            .into_response(),
+    ))
+}
+
+async fn operator_room(
+    State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<HttpPeer>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, HttpError> {
+    require_operator_endpoint(&state, peer)?;
+    authorize_operator(&state, &headers, false)?;
+    let room = parse_room(&id)?;
+    Ok(operator_no_store(
+        Json(state.daemon.operator_room_detail(room)?).into_response(),
+    ))
+}
+
+async fn operator_room_history(
+    State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<HttpPeer>,
+    Path(id): Path<String>,
+    Query(query): Query<HistoryQuery>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, HttpError> {
+    require_operator_endpoint(&state, peer)?;
+    authorize_operator(&state, &headers, false)?;
+    let room = parse_room(&id)?;
+    Ok(operator_no_store(
+        Json(state.daemon.history_page_from(room, query.from)?).into_response(),
+    ))
+}
+
+async fn ws_operator_client(
+    State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<HttpPeer>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response<Body> {
+    if require_operator_endpoint(&state, peer).is_err()
+        || authorize_operator(&state, &headers, true).is_err()
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Ok(allowed_room) = parse_room(&id) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if state.daemon.replay(allowed_room).is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !state
+        .daemon
+        .token_sha256(allowed_room)
+        .is_ok_and(|token| token.is_some())
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    upgrade
+        .max_message_size(MAX_QUEUE_BYTES)
+        .max_frame_size(MAX_QUEUE_BYTES)
+        .on_upgrade(move |socket| async move {
+            websocket_bridge(
+                socket,
+                state.daemon,
+                ConnectionProtocol::Client { allowed_room },
+                Some(allowed_room),
+                peer.ip(),
+            )
+            .await;
+        })
+        .into_response()
+}
+
+fn require_operator_endpoint(state: &HttpState, peer: HttpPeer) -> Result<(), HttpError> {
+    if state.operator && !state.secure && peer.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err(HttpError::NotFound)
+    }
+}
+
+fn authorize_operator<'a>(
+    state: &HttpState,
+    headers: &'a HeaderMap,
+    require_origin: bool,
+) -> Result<&'a str, HttpError> {
+    let origin = operator_origin(headers, require_origin)?;
+    let raw = named_cookie(headers, "conch_operator").ok_or(HttpError::Forbidden)?;
+    if state.daemon.validate_operator_session(raw, &origin) {
+        Ok(raw)
+    } else {
+        Err(HttpError::Forbidden)
+    }
+}
+
+fn operator_origin(headers: &HeaderMap, require_origin: bool) -> Result<String, HttpError> {
+    let origin = if require_origin {
+        canonical_origin(headers, false).map_err(|_| HttpError::Forbidden)?
+    } else {
+        request_origin(headers, false)?
+    };
+    let url = Url::parse(&origin).map_err(|_| HttpError::Forbidden)?;
+    let literal_loopback = match url.host() {
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        Some(Host::Domain(_)) | None => false,
+    };
+    literal_loopback
+        .then_some(origin)
+        .ok_or(HttpError::Forbidden)
+}
+
+fn request_origin(headers: &HeaderMap, secure: bool) -> Result<String, HttpError> {
+    let hosts = headers.get_all(header::HOST).iter().collect::<Vec<_>>();
+    if hosts.len() != 1 {
+        return Err(HttpError::Forbidden);
+    }
+    let host = hosts[0].to_str().map_err(|_| HttpError::Forbidden)?;
+    if !host.is_ascii()
+        || host.contains([',', '@', '/', '?', '#'])
+        || host.trim() != host
+        || host.is_empty()
+    {
+        return Err(HttpError::Forbidden);
+    }
+    let scheme = if secure { "https" } else { "http" };
+    let url = Url::parse(&format!("{scheme}://{host}/")).map_err(|_| HttpError::Forbidden)?;
+    origin_tuple(&url).map_err(|_| HttpError::Forbidden)
+}
+
+fn named_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .find_map(|(key, value)| (key == name).then_some(value))
+}
+
+fn operator_no_store(mut response: Response<Body>) -> Response<Body> {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        header::HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    response.headers_mut().insert(
+        header::HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
 async fn get_ticket(
     State(state): State<HttpState>,
     ConnectInfo(peer): ConnectInfo<HttpPeer>,
@@ -387,7 +698,7 @@ async fn get_ticket(
         return Err(HttpError::Unauthorized);
     }
     let room = parse_room(&id)?;
-    if let Err(error) = authorize(&state.daemon, room, &headers) {
+    if let Err(error) = authorize_read(&state, room, &headers) {
         state.daemon.record_auth_failure(peer.ip());
         return Err(error);
     }
@@ -414,12 +725,31 @@ async fn get_history(
         return Err(HttpError::Unauthorized);
     }
     let room = parse_room(&id)?;
-    if let Err(error) = authorize(&state.daemon, room, &headers) {
+    if let Err(error) = authorize_read(&state, room, &headers) {
         state.daemon.record_auth_failure(peer.ip());
         return Err(error);
     }
     Ok(no_store(
         Json(state.daemon.history_page_from(room, query.from)?).into_response(),
+    ))
+}
+
+async fn get_room_detail(
+    State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<HttpPeer>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, HttpError> {
+    if !state.daemon.auth_allowed(peer.ip()) {
+        return Err(HttpError::Unauthorized);
+    }
+    let room = parse_room(&id)?;
+    if let Err(error) = authorize_read(&state, room, &headers) {
+        state.daemon.record_auth_failure(peer.ip());
+        return Err(error);
+    }
+    Ok(no_store(
+        Json(state.daemon.operator_room_detail(room)?).into_response(),
     ))
 }
 
@@ -596,13 +926,7 @@ fn session_cookie(headers: &HeaderMap, secure: bool) -> Option<&str> {
     } else {
         "conch_session"
     };
-    headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(';'))
-        .filter_map(|pair| pair.trim().split_once('='))
-        .find_map(|(key, value)| (key == name).then_some(value))
+    named_cookie(headers, name)
 }
 
 fn canonical_origin(headers: &HeaderMap, secure: bool) -> Result<String, HttpError> {
@@ -1017,10 +1341,25 @@ fn authorize(daemon: &Daemon, room: RoomId, headers: &HeaderMap) -> Result<(), H
     }
 }
 
+fn authorize_read(state: &HttpState, room: RoomId, headers: &HeaderMap) -> Result<(), HttpError> {
+    if authorize(&state.daemon, room, headers).is_ok() {
+        return Ok(());
+    }
+    let origin = request_origin(headers, state.secure).map_err(|_| HttpError::Unauthorized)?;
+    let raw = session_cookie(headers, state.secure).ok_or(HttpError::Unauthorized)?;
+    state
+        .daemon
+        .validate_browser_session(raw, Some(room), &origin)
+        .ok_or(HttpError::Unauthorized)?;
+    Ok(())
+}
+
 #[derive(Debug)]
 enum HttpError {
     BadRequest(&'static str),
     Unauthorized,
+    Forbidden,
+    NotFound,
     Daemon(DaemonError),
     Json(serde_json::Error),
     Join(tokio::task::JoinError),
@@ -1049,6 +1388,8 @@ impl IntoResponse for HttpError {
         let (status, message) = match self {
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message.to_owned()),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "bearer token required".into()),
+            Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden".into()),
+            Self::NotFound => (StatusCode::NOT_FOUND, "not found".into()),
             Self::Daemon(DaemonError::UnknownRoom(_)) => {
                 (StatusCode::NOT_FOUND, "unknown room".into())
             }
@@ -1156,24 +1497,24 @@ mod tests {
     }
 
     #[test]
-    fn browser_ui_persists_a_private_room_only_after_session_authorization() {
+    fn browser_ui_keeps_only_deep_link_state_after_authorization() {
         let app = include_str!("../../../ui/app.js");
         let join = app
-            .split_once("async function joinRoom()")
+            .split_once("async function joinRoom(event)")
             .expect("joinRoom exists")
             .1;
         let authorized = join
-            .find("if (!session.ok)")
-            .expect("session status is checked");
-        let persisted = join
-            .find("selectRoom(candidateRoom)")
-            .expect("the authorized room is persisted");
-        assert!(
-            authorized < persisted,
-            "a failed browser session must not persist a retrying private room"
-        );
-        assert!(app.contains("localStorage.removeItem(\"conch.room\")"));
-        assert!(app.contains("state.refreshBlocked = true"));
+            .find("if (!response.ok)")
+            .expect("join/session status is checked");
+        let opened = join
+            .find("await openRoom(ticket.id)")
+            .expect("the authorized room is opened");
+        assert!(authorized < opened, "authorization precedes navigation");
+        assert!(app.contains("history.pushState({}, \"\", `/rooms/${room}`)"));
+        assert!(app.contains("function roomFromPath()"));
+        assert!(!app.contains("localStorage"));
+        assert!(!app.contains("sessionStorage"));
+        assert!(!app.contains("scrollIntoView"));
     }
 
     #[test]

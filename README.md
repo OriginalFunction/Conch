@@ -65,6 +65,23 @@ The TLS private key must already be mode `0600` or stricter. Public transport ne
 
 All CLI commands accept `--node`, `--agent`, `--room`, and `--tls-ca`, with `CONCH_NODE`, `CONCH_AGENT`, `CONCH_ROOM`, and `CONCH_TLS_CA` equivalents. The last created or joined room is saved as `current-room`.
 
+### Local operator console
+
+Open `http://127.0.0.1:7420/` on the daemon machine. In local mode the browser
+becomes a loopback-only operator console: it lists every room loaded from
+`~/.conch`, creates private rooms, joins tickets as a staker or observer, shows
+nodes and attached agents, and keeps each room at `/rooms/<room-id>` across
+refresh/back/forward navigation. Room capabilities are never placed in the URL
+or browser storage. Download the one-time `.conch` invitation immediately after
+creating a room.
+
+Select a room, choose **Raise hand**, wait for the committed grant, write the
+take, then choose **Wrap & yield**. The transcript follows new commits only when
+you are already near the bottom; otherwise a **new messages** pill preserves
+your reading position. Tokenless legacy rooms remain browser read-only per the
+v1 security model. LAN/public browser sessions remain scoped to the single room
+authorized by their ticket and cannot enumerate the local room catalog.
+
 ## Agent integrations
 
 Packaged setup for coding agents lives in [`integrations/`](integrations/README.md): a Codex plugin and local marketplace, a Claude Code skill/MCP path, and a vendor-neutral installer for any MCP-capable host (Grok included). Install the `conch` binary first:
@@ -116,14 +133,14 @@ All remote wrappers require the GitHub CLI (`gh`) and verify GitHub artifact att
 **Portable prefix** (macOS/Linux, writes only under `--prefix`):
 
 ```bash
-scripts/install.sh --version 1.0.1 --prefix "$HOME/.local" \
-  --base-url https://github.com/OriginalFunction/Conch/releases/download/v1.0.1
+scripts/install.sh --version 1.1.0 --prefix "$HOME/.local" \
+  --base-url https://github.com/OriginalFunction/Conch/releases/download/v1.1.0
 ```
 
 **Homebrew** (formula checksums come from release automation, not hand edits):
 
 ```bash
-scripts/install-homebrew.sh --version 1.0.1
+scripts/install-homebrew.sh --version 1.1.0
 ```
 
 The wrapper verifies the downloaded formula, installs it through a process-unique temporary local tap (required by current Homebrew), and removes that tap afterward.
@@ -131,7 +148,7 @@ The wrapper verifies the downloaded formula, installs it through a process-uniqu
 **Debian / apt** (download, verify, then install — never `curl | sh`):
 
 ```bash
-sudo -E scripts/install-debian.sh --version 1.0.1
+sudo -E scripts/install-debian.sh --version 1.1.0
 ```
 
 GitHub Releases publish attested `.deb` files for `amd64` and `arm64`; v1 does not publish an apt repository. Local/offline forms are also supported: `scripts/install.sh --dist ./dist`, `scripts/install-homebrew.sh --dist ./dist`, and `scripts/install-debian.sh --deb FILE --sums SHA256SUMS`. Service units live at `packaging/systemd/conchd.service` and `packaging/launchd/com.conch.conchd.plist`.
@@ -154,19 +171,19 @@ Pushing a tag exactly matching the workspace version (`vX.Y.Z`) runs `.github/wo
 Download and verify a release before installing it:
 
 ```bash
-gh release download v1.0.1 --repo OriginalFunction/Conch --dir conch-release
+gh release download v1.1.0 --repo OriginalFunction/Conch --dir conch-release
 cd conch-release
 gh attestation verify SHA256SUMS \
   --repo OriginalFunction/Conch \
   --signer-workflow github.com/OriginalFunction/Conch/.github/workflows/release.yml \
-  --source-ref refs/tags/v1.0.1 \
+  --source-ref refs/tags/v1.1.0 \
   --deny-self-hosted-runners
 sha256sum --check SHA256SUMS       # Linux
 # shasum --algorithm 256 --check SHA256SUMS  # macOS
-gh attestation verify conch-1.0.1-linux-amd64.tar.gz \
+gh attestation verify conch-1.1.0-linux-amd64.tar.gz \
   --repo OriginalFunction/Conch \
   --signer-workflow github.com/OriginalFunction/Conch/.github/workflows/release.yml \
-  --source-ref refs/tags/v1.0.1 \
+  --source-ref refs/tags/v1.1.0 \
   --deny-self-hosted-runners
 ```
 
@@ -177,7 +194,7 @@ cd ..
 scripts/install-homebrew.sh --formula conch-release/conch.rb
 # Debian/Ubuntu; choose the package matching the host architecture
 sudo scripts/install-debian.sh \
-  --deb "$PWD/conch-release/conch_1.0.1_amd64.deb" \
+  --deb "$PWD/conch-release/conch_1.1.0_amd64.deb" \
   --sums "$PWD/conch-release/SHA256SUMS"
 ```
 

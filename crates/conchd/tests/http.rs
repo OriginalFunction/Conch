@@ -573,6 +573,14 @@ async fn ui_html_is_embedded_and_served_at_root_and_ui() {
         assert!(html.contains("id=\"transcript\""));
         assert!(html.contains("id=\"speech\""));
     }
+    let script = http_get(server.addr(), "/ui/app.js", None).await;
+    assert_eq!(script.0, 200);
+    let script = String::from_utf8(script.1).unwrap();
+    assert!(script.contains("BOTTOM_THRESHOLD_PX = 48"));
+    assert!(script.contains("history.pushState"));
+    assert!(script.contains("from=${from}"));
+    assert!(!script.contains("scrollIntoView"));
+    assert!(!script.contains("localStorage"));
 }
 
 #[tokio::test]
@@ -756,6 +764,233 @@ async fn browser_session_requires_private_capability_and_exact_origin() {
     assert!(cookie.contains("HttpOnly"));
     assert!(cookie.contains("SameSite=Strict"));
     assert!(!cookie.contains(&private_token.to_string()));
+    let cookie_pair = cookie.split(';').next().unwrap();
+    for path in [
+        format!("/history/{}?from=0", private.id),
+        format!("/room/{}", private.id),
+    ] {
+        assert_eq!(
+            http_operator_request(server.addr(), "GET", &path, None, Some(cookie_pair), b"",)
+                .await
+                .0,
+            200,
+            "a room-scoped browser cookie can restore {path} after refresh"
+        );
+    }
+}
+
+#[tokio::test]
+async fn local_operator_catalog_create_detail_and_history_do_not_disclose_capabilities() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let server = daemon.start_http(loopback()).await.unwrap();
+    let origin = format!("http://{}", server.addr());
+
+    let (status, cookie, _) = http_operator_request(
+        server.addr(),
+        "POST",
+        "/operator/session",
+        Some(&origin),
+        None,
+        b"",
+    )
+    .await;
+    assert_eq!(status, 201);
+    let cookie = cookie.expect("operator bootstrap sets a cookie");
+    let cookie = cookie.split(';').next().unwrap();
+
+    let (status, _, catalog) = http_operator_request(
+        server.addr(),
+        "GET",
+        "/operator/rooms",
+        None,
+        Some(cookie),
+        b"",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(serde_json::from_slice::<Value>(&catalog).unwrap()["rooms"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let (status, _, created) = http_operator_request(
+        server.addr(),
+        "POST",
+        "/operator/rooms",
+        Some(&origin),
+        Some(cookie),
+        br#"{"name":"Operator room","mode":"stick","timeout_secs":45}"#,
+    )
+    .await;
+    assert_eq!(status, 201);
+    let created: Value = serde_json::from_slice(&created).unwrap();
+    let ticket: Ticket = serde_json::from_value(created["ticket"].clone()).unwrap();
+    let token = ticket.token.expect("new local rooms are private");
+
+    for path in [
+        "/operator/rooms".to_owned(),
+        format!("/operator/rooms/{}", ticket.id),
+        format!("/operator/rooms/{}/history?from=0", ticket.id),
+    ] {
+        let (status, _, body) =
+            http_operator_request(server.addr(), "GET", &path, None, Some(cookie), b"").await;
+        assert_eq!(status, 200, "{path}");
+        assert!(
+            !String::from_utf8_lossy(&body).contains(&token.to_string()),
+            "operator read response disclosed the room capability: {path}"
+        );
+    }
+    assert_eq!(
+        Ticket::from_json_slice(
+            &std::fs::read(
+                data.path()
+                    .join("rooms")
+                    .join(ticket.id.to_string())
+                    .join("ticket.conch"),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .token,
+        None,
+        "the persisted/served ticket remains stripped"
+    );
+
+    let (status, _, page) = http_operator_request(
+        server.addr(),
+        "GET",
+        &format!("/rooms/{}", ticket.id),
+        None,
+        None,
+        b"",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(String::from_utf8_lossy(&page).contains("Conch"));
+}
+
+#[tokio::test]
+async fn operator_session_requires_loopback_local_mode_and_exact_origin() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    daemon
+        .configure_transport(conchd::tcp::TransportMode::Lan, None)
+        .unwrap();
+    let server = daemon.start_http(loopback()).await.unwrap();
+    let origin = format!("http://{}", server.addr());
+    assert_eq!(
+        http_operator_request(
+            server.addr(),
+            "POST",
+            "/operator/session",
+            Some(&origin),
+            None,
+            b"",
+        )
+        .await
+        .0,
+        404
+    );
+
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let server = daemon.start_http(loopback()).await.unwrap();
+    assert_eq!(
+        http_operator_request(
+            server.addr(),
+            "POST",
+            "/operator/session",
+            Some("http://evil.invalid"),
+            None,
+            b"",
+        )
+        .await
+        .0,
+        403
+    );
+    let mut rebound = TcpStream::connect(server.addr()).await.unwrap();
+    rebound
+        .write_all(
+            b"POST /operator/session HTTP/1.1\r\nHost: evil.invalid\r\nOrigin: http://evil.invalid\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    rebound.read_to_end(&mut response).await.unwrap();
+    assert!(
+        response.starts_with(b"HTTP/1.1 403"),
+        "a rebinding-style non-literal Host must not mint operator authority"
+    );
+}
+
+#[tokio::test]
+async fn operator_websocket_is_bound_to_its_path_room() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let allowed = daemon
+        .create_ticket_with_token(
+            "operator allowed",
+            StakePolicy::default(),
+            FloorConfig::stick(30),
+            Some(Hash32::from_bytes([73; 32])),
+        )
+        .unwrap()
+        .id;
+    let other = daemon.create_genesis("operator other").unwrap();
+    let server = daemon.start_http(loopback()).await.unwrap();
+    let origin = format!("http://{}", server.addr());
+    let (status, cookie, _) = http_operator_request(
+        server.addr(),
+        "POST",
+        "/operator/session",
+        Some(&origin),
+        None,
+        b"",
+    )
+    .await;
+    assert_eq!(status, 201);
+    let cookie = cookie.unwrap();
+    let cookie = cookie.split(';').next().unwrap();
+    let mut request = format!("ws://{}/operator/client/{allowed}", server.addr())
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("Origin", HeaderValue::from_str(&origin).unwrap());
+    request
+        .headers_mut()
+        .insert("Cookie", HeaderValue::from_str(cookie).unwrap());
+    let mut socket = connect_async(request).await.unwrap().0;
+    socket
+        .send(json_message(&ClientRequest::Attach {
+            agent: AgentId::new("agent:operator-browser").unwrap(),
+        }))
+        .await
+        .unwrap();
+    assert!(next_reply(&mut socket).await.ok);
+    socket
+        .send(json_message(&ClientRequest::History {
+            room: other,
+            from_n: 0,
+            follow: false,
+        }))
+        .await
+        .unwrap();
+    let reply = next_reply(&mut socket).await;
+    assert!(!reply.ok);
+    assert_eq!(reply.error.unwrap().code, "unauthorized");
+
+    let mut open_request = format!("ws://{}/operator/client/{other}", server.addr())
+        .into_client_request()
+        .unwrap();
+    open_request
+        .headers_mut()
+        .insert("Origin", HeaderValue::from_str(&origin).unwrap());
+    open_request
+        .headers_mut()
+        .insert("Cookie", HeaderValue::from_str(cookie).unwrap());
+    assert!(connect_async(open_request).await.is_err());
 }
 
 async fn tcp_request(addr: SocketAddr, request: ClientRequest) -> ClientReply {
@@ -904,6 +1139,56 @@ async fn http_get(
         .parse()
         .unwrap();
     (status, response[split + 4..].to_vec(), headers.to_owned())
+}
+
+async fn http_operator_request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    origin: Option<&str>,
+    cookie: Option<&str>,
+    body: &[u8],
+) -> (u16, Option<String>, Vec<u8>) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let origin = origin
+        .map(|value| format!("Origin: {value}\r\n"))
+        .unwrap_or_default();
+    let cookie_header = cookie
+        .map(|value| format!("Cookie: {value}\r\n"))
+        .unwrap_or_default();
+    let content_type = if body.is_empty() {
+        ""
+    } else {
+        "Content-Type: application/json\r\n"
+    };
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{origin}{cookie_header}{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream.write_all(body).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap();
+    let headers = std::str::from_utf8(&response[..split]).unwrap();
+    let status = headers
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let cookie = headers.lines().find_map(|line| {
+        line.split_once(':')
+            .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+            .map(|(_, value)| value.trim().to_owned())
+    });
+    (status, cookie, response[split + 4..].to_vec())
 }
 
 async fn https_request(addr: SocketAddr, config: Arc<ClientConfig>, request: &str) -> Vec<u8> {
