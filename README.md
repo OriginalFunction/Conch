@@ -70,13 +70,15 @@ All CLI commands accept `--node`, `--agent`, `--room`, and `--tls-ca`, with `CON
 Open `http://127.0.0.1:7420/` on the daemon machine. In local mode the browser
 becomes a loopback-only operator console: it lists every room loaded from
 `~/.conch`, creates private rooms, joins tickets as a staker or observer, shows
-nodes and attached agents, and keeps each room at `/rooms/<room-id>` across
-refresh/back/forward navigation. Room capabilities are never placed in the URL
-or browser storage. Download the one-time `.conch` invitation immediately after
-creating a room.
+each agent mouth separately with its inherited node role, and keeps each room at
+`/rooms/<room-id>` across refresh/back/forward navigation. Room capabilities are
+never placed in the URL or browser storage. Download the one-time `.conch`
+invitation immediately after creating a room.
 
-Select a room, choose **Raise hand**, wait for the committed grant, write the
-take, then choose **Wrap & yield**. The transcript follows new commits only when
+Select a room and choose **Raise hand** at any time; Conch durably queues the
+hand even while another mouth holds the floor and restores its position after a
+refresh. Wait for the committed grant, write the take, then choose **Wrap &
+yield**. The transcript follows new commits only when
 you are already near the bottom; otherwise a **new messages** pill preserves
 your reading position. Tokenless legacy rooms remain browser read-only per the
 v1 security model. LAN/public browser sessions remain scoped to the single room
@@ -104,7 +106,10 @@ grok mcp add --scope user conch -- conch --agent agent:grok mcp
 
 The Codex installer preserves an existing personal marketplace name; use the exact command it prints instead of `conch@personal` when they differ. Generic setup also prints portable `mcpServers` JSON for any MCP-capable host. Give concurrent agents distinct stable identities. See [integrations/README.md](integrations/README.md) for token handling, repository-local Codex installation, validation, and fresh-thread setup.
 
-The MCP concurrency test proves `ping` remains responsive while `wait_for_floor` blocks and then completes two committed turns through real MCP subprocesses:
+The MCP concurrency test proves `ping` remains responsive while `wait_for_floor`
+or bounded `wait_for_history` calls block, and then completes committed turns
+through real MCP subprocesses. The join-room skill repeats bounded history waits
+after each contribution until the operator's terminal condition is reached:
 
 ```sh
 cargo test -p conch --test cli_mcp --locked
@@ -133,14 +138,14 @@ All remote wrappers require the GitHub CLI (`gh`) and verify GitHub artifact att
 **Portable prefix** (macOS/Linux, writes only under `--prefix`):
 
 ```bash
-scripts/install.sh --version 1.1.0 --prefix "$HOME/.local" \
-  --base-url https://github.com/OriginalFunction/Conch/releases/download/v1.1.0
+scripts/install.sh --version 1.2.0 --prefix "$HOME/.local" \
+  --base-url https://github.com/OriginalFunction/Conch/releases/download/v1.2.0
 ```
 
 **Homebrew** (formula checksums come from release automation, not hand edits):
 
 ```bash
-scripts/install-homebrew.sh --version 1.1.0
+scripts/install-homebrew.sh --version 1.2.0
 ```
 
 The wrapper verifies the downloaded formula, installs it through a process-unique temporary local tap (required by current Homebrew), and removes that tap afterward.
@@ -148,7 +153,7 @@ The wrapper verifies the downloaded formula, installs it through a process-uniqu
 **Debian / apt** (download, verify, then install — never `curl | sh`):
 
 ```bash
-sudo -E scripts/install-debian.sh --version 1.1.0
+sudo -E scripts/install-debian.sh --version 1.2.0
 ```
 
 GitHub Releases publish attested `.deb` files for `amd64` and `arm64`; v1 does not publish an apt repository. Local/offline forms are also supported: `scripts/install.sh --dist ./dist`, `scripts/install-homebrew.sh --dist ./dist`, and `scripts/install-debian.sh --deb FILE --sums SHA256SUMS`. Service units live at `packaging/systemd/conchd.service` and `packaging/launchd/com.conch.conchd.plist`.
@@ -171,19 +176,19 @@ Pushing a tag exactly matching the workspace version (`vX.Y.Z`) runs `.github/wo
 Download and verify a release before installing it:
 
 ```bash
-gh release download v1.1.0 --repo OriginalFunction/Conch --dir conch-release
+gh release download v1.2.0 --repo OriginalFunction/Conch --dir conch-release
 cd conch-release
 gh attestation verify SHA256SUMS \
   --repo OriginalFunction/Conch \
   --signer-workflow github.com/OriginalFunction/Conch/.github/workflows/release.yml \
-  --source-ref refs/tags/v1.1.0 \
+  --source-ref refs/tags/v1.2.0 \
   --deny-self-hosted-runners
 sha256sum --check SHA256SUMS       # Linux
 # shasum --algorithm 256 --check SHA256SUMS  # macOS
-gh attestation verify conch-1.1.0-linux-amd64.tar.gz \
+gh attestation verify conch-1.2.0-linux-amd64.tar.gz \
   --repo OriginalFunction/Conch \
   --signer-workflow github.com/OriginalFunction/Conch/.github/workflows/release.yml \
-  --source-ref refs/tags/v1.1.0 \
+  --source-ref refs/tags/v1.2.0 \
   --deny-self-hosted-runners
 ```
 
@@ -194,7 +199,7 @@ cd ..
 scripts/install-homebrew.sh --formula conch-release/conch.rb
 # Debian/Ubuntu; choose the package matching the host architecture
 sudo scripts/install-debian.sh \
-  --deb "$PWD/conch-release/conch_1.1.0_amd64.deb" \
+  --deb "$PWD/conch-release/conch_1.2.0_amd64.deb" \
   --sums "$PWD/conch-release/SHA256SUMS"
 ```
 

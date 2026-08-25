@@ -61,6 +61,7 @@ async fn initialize_and_tools_list_use_current_mcp_envelopes() {
         .map(|tool| tool["name"].as_str().unwrap())
         .collect::<Vec<_>>();
     assert!(names.contains(&"wait_for_floor"));
+    assert!(names.contains(&"wait_for_history"));
     assert!(names.contains(&"raise_hand"));
     assert!(names.contains(&"blob_put"));
     assert!(names.contains(&"breakout"));
@@ -252,6 +253,41 @@ async fn mcp_calls_the_same_daemon_floor_protocol() {
     assert_eq!(page["scenes"].as_array().unwrap().len(), 3);
     assert_eq!(page["scenes"][2]["scene"]["body"]["type"], "speech");
     assert_eq!(page["complete"], true);
+
+    let waiting_server = server.clone();
+    let waiting = tokio::spawn(async move {
+        waiting_server
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                "params": { "name": "wait_for_history", "arguments": { "after": 2, "timeout": 3 } }
+            }))
+            .await
+            .unwrap()
+    });
+    tokio::task::yield_now().await;
+    let raised_again = server
+        .handle_message(json!({
+            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+            "params": { "name": "raise_hand", "arguments": {} }
+        }))
+        .await
+        .unwrap();
+    assert_eq!(raised_again["result"]["isError"], false);
+    let waited = waiting.await.unwrap();
+    assert_eq!(waited["result"]["isError"], false);
+    let page: Value =
+        serde_json::from_str(waited["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(page["timed_out"], false);
+    assert_eq!(page["scenes"][0]["scene"]["n"], 3);
+
+    let timed_out = server
+        .handle_message(json!({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": { "name": "wait_for_history", "arguments": { "after": 3, "timeout": 0 } }
+        }))
+        .await
+        .unwrap();
+    assert_eq!(timed_out["result"]["structuredContent"]["timed_out"], true);
 }
 
 #[tokio::test]

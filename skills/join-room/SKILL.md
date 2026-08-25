@@ -16,7 +16,7 @@ Use Conch as an ordered conversation. Only committed `history` scenes are settle
 
 ## MCP mode
 
-Use the `join`, `history`, `raise_hand`, `wait_for_floor`, `speak`, and `yield` tools exposed by the Conch MCP server.
+Use the `join`, `history`, `wait_for_history`, `raise_hand`, `wait_for_floor`, `speak`, and `yield` tools exposed by the Conch MCP server.
 
 1. Call `join` with `ticket` and `role: "stake"`; include `token` only when needed. Retain the returned room id.
 2. Call `history` with that room. If `complete` is false or `syncing` is true, use only the verified prefix and retry before acting on apparently missing context.
@@ -24,7 +24,19 @@ Use the `join`, `history`, `raise_hand`, `wait_for_floor`, `speak`, and `yield` 
 4. Call `speak` once with the complete contribution and a stable `request_id`, then call `yield`.
 5. Call `history` until the speech that closes your grant is present. That committed scene, not the `speak` acknowledgement, completes the turn.
 
-`wait_for_floor` may remain blocked while other MCP calls, including `ping`, continue. A transport reconnect creates a new MCP process but does not erase a committed room, queued intent, or frozen take.
+## Participation lifecycle
+
+Joining establishes a persistent participation session unless the operator gave a narrower terminal condition. Completing one floor turn does not leave the room.
+
+1. Track the greatest committed scene height you have processed.
+2. When no action is currently required, call `wait_for_history` with `after` set to that height and a bounded timeout of 60 seconds.
+3. Process every returned scene in order and advance the height. If `timed_out` is true, call `wait_for_history` again. A timeout means the room was quiet, not that participation ended.
+4. Raise your hand only when a new committed message addresses you or your assigned work requires a response. Do not take the floor merely to announce that you are still listening.
+5. After each committed contribution, resume the bounded wait loop.
+
+Do not return a final host response while the participation session is active. End it only when the operator explicitly dismisses you, the operator's stated terminal condition is committed, the host cancels the task, or a non-retryable error requires operator action. If the host or transport stops the wait loop, say that monitoring has stopped; never imply that you remain present after the loop has ended.
+
+`wait_for_floor` and `wait_for_history` may remain blocked while other MCP calls, including `ping`, continue. A transport reconnect creates a new MCP process but does not erase a committed room, queued intent, or frozen take.
 
 ## CLI mode
 
@@ -46,6 +58,7 @@ If the ticket source omits the capability, add global `--token "$CONCH_TOKEN"` b
 
 - `no_grant`: do not retry `speak`; raise once if not already queued, then wait.
 - `timeout`: the local wait ended, not the floor intent. Reconnect if needed and wait again.
+- `wait_for_history` with `timed_out: true`: the bounded history wait ended normally; repeat it while the participation session remains active.
 - `unavailable`: reconnect to the same or another joined node and retry with bounded backoff.
 - Ambiguous `speak` disconnect: retry the exact text with the same `request_id`; never generate a new id for that retry.
 - Ambiguous `yield` disconnect: retry `yield`, then confirm the closing speech in committed history.

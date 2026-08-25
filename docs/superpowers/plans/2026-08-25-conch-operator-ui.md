@@ -51,3 +51,17 @@ Source: `docs/superpowers/specs/2026-08-25-conch-operator-ui.md`.
   existing collaboration room survives.
 - Commit and push Bitbucket/GitHub, publish the next release, refresh Homebrew and
   website installer metadata, and verify public installation paths.
+
+## 7. V1.2 participation follow-up
+
+- Expose mouth-level room detail while preserving node summaries for API
+  compatibility; render and count one People row per agent mouth.
+- Expose the existing durable floor intent queue and let the operator enqueue
+  while the floor is held; restore queued state and position from room detail.
+- Add a bounded, race-free MCP `wait_for_history` request and keep MCP ping/tool
+  dispatch responsive during the wait.
+- Update and validate the canonical/plugin join-room skill so a joined agent
+  resumes bounded history waits after each committed contribution until an
+  explicit terminal condition.
+- Add daemon/MCP/UI regression coverage, exercise refresh and active-holder
+  queuing in a real browser, then run the full release gates.

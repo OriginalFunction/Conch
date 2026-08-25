@@ -75,6 +75,12 @@ pub enum ClientRequest {
         #[serde(default)]
         follow: bool,
     },
+    WaitForHistory {
+        room: RoomId,
+        after_n: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_secs: Option<u64>,
+    },
     Status {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         room: Option<RoomId>,

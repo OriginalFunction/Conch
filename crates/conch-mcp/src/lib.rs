@@ -25,6 +25,7 @@ use tokio::{
 const LATEST_PROTOCOL: &str = "2025-06-18";
 const SUPPORTED_PROTOCOLS: &[&str] = &["2024-11-05", "2025-03-26", LATEST_PROTOCOL];
 const MAX_BLOB_BYTES: usize = 32 * 1024 * 1024;
+const MAX_HISTORY_WAIT_SECS: u64 = 300;
 
 #[derive(Clone)]
 pub struct Server {
@@ -71,7 +72,7 @@ impl Server {
                         "title": "Conch Room Server",
                         "version": env!("CARGO_PKG_VERSION")
                     },
-                    "instructions": "Join a room, inspect committed history, then use Conch floor tools. Do not speak without a grant."
+                    "instructions": "Join a room, inspect committed history, then use Conch floor tools. Do not speak without a grant. Unless the operator gave a terminal condition, remain present by repeatedly calling wait_for_history after the latest committed height."
                 }))
             }
             Some("ping") => Ok(json!({})),
@@ -208,6 +209,24 @@ impl Server {
                 },
                 None,
             ),
+            "wait_for_history" => {
+                let timeout_secs = arguments.optional_u64("timeout").unwrap_or(60);
+                if timeout_secs > MAX_HISTORY_WAIT_SECS {
+                    return Err(format!(
+                        "timeout must be at most {MAX_HISTORY_WAIT_SECS} seconds"
+                    ));
+                }
+                (
+                    ClientRequest::WaitForHistory {
+                        room: room()?,
+                        after_n: arguments
+                            .optional_u64("after")
+                            .ok_or("wait_for_history requires after")?,
+                        timeout_secs: Some(timeout_secs),
+                    },
+                    None,
+                )
+            }
             "wait_for_floor" => (
                 ClientRequest::WaitForFloor {
                     room: room()?,
@@ -703,6 +722,17 @@ fn tool_definitions() -> Vec<Value> {
                     "from": { "type": "integer", "minimum": 0 }
                 })),
                 &[],
+            ),
+        ),
+        tool(
+            "wait_for_history",
+            "Wait for committed scenes after a known height; a timeout is a successful empty result",
+            object_schema(
+                room_properties(json!({
+                    "after": { "type": "integer", "minimum": 0, "description": "Last committed height already processed" },
+                    "timeout": { "type": "integer", "minimum": 0, "maximum": 300, "default": 60 }
+                })),
+                &["after"],
             ),
         ),
         tool(

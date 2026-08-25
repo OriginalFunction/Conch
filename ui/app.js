@@ -26,6 +26,7 @@ const state = {
   retryDelay: RETRY_INITIAL_MS,
   composerBusy: false,
   floorHolderKey: null,
+  queuedIntent: null,
   seenHeads: new Map(),
 };
 
@@ -205,6 +206,7 @@ function resetRoom(room) {
   state.polling = false;
   state.roomStatus = "opening";
   state.floorHolderKey = null;
+  state.queuedIntent = null;
   state.composerBusy = false;
   resetReconnect();
   el.speech.value = "";
@@ -233,6 +235,7 @@ function showHome(push = true) {
   state.detail = null;
   state.history = [];
   state.liveGrant = null;
+  state.queuedIntent = null;
   el.homeView.hidden = false;
   el.roomView.hidden = true;
   renderRooms();
@@ -270,6 +273,9 @@ function renderRoomDetail() {
   state.liveGrant = holder
     ? { to: holder, hash: null }
     : null;
+  state.queuedIntent = (state.detail.floor?.queue || []).find((intent) =>
+    intent.agent === OPERATOR_AGENT && intent.node === state.node
+  ) || null;
   state.floorHolderKey = nextHolder;
   if (previousHolder !== null && previousHolder !== nextHolder) hideDraft();
   renderPeople();
@@ -277,35 +283,41 @@ function renderRoomDetail() {
 }
 
 function renderPeople() {
-  const participants = state.detail?.participants || [];
-  const existing = new Map([...el.peopleList.querySelectorAll("[data-node]")].map((article) => [article.dataset.node, article]));
+  const mouths = Array.isArray(state.detail?.mouths)
+    ? state.detail.mouths
+    : (state.detail?.participants || []).flatMap((participant) =>
+        (participant.agents || []).map((agent) => ({ ...participant, agent }))
+      );
+  const existing = new Map([...el.peopleList.querySelectorAll("[data-person]")].map((article) => [article.dataset.person, article]));
   const visible = new Set();
   let cursor = el.peopleList.firstElementChild;
-  el.peopleCount.textContent = String(participants.length);
-  el.peopleEmpty.hidden = participants.length > 0;
-  for (const participant of participants) {
-    visible.add(participant.node);
-    let article = existing.get(participant.node);
+  el.peopleCount.textContent = String(mouths.length);
+  el.peopleEmpty.hidden = mouths.length > 0;
+  el.peopleEmpty.querySelector("strong").textContent = state.room ? "No people observed" : "No room open";
+  el.peopleEmpty.querySelector("p").textContent = state.room ? "Agent mouths appear after they participate in this room." : "Choose a room to see people and their roles.";
+  for (const mouth of mouths) {
+    const key = `${mouth.node}:${mouth.agent}`;
+    visible.add(key);
+    let article = existing.get(key);
     if (!article) article = document.getElementById("person-template").content.firstElementChild.cloneNode(true);
-    article.dataset.node = participant.node;
-    article.classList.toggle("recent", participant.recent);
-    const agents = participant.agents || [];
-    const display = agents.length ? agents.join(", ") : `Node ${short(participant.node)}`;
-    article.querySelector(".person-avatar span").textContent = initials(agents[0] || participant.node);
-    article.querySelector(".person-main > strong").textContent = display;
-    article.querySelector(".agent-empty").hidden = agents.length > 0;
-    article.querySelector("code").textContent = participant.node;
+    article.dataset.person = key;
+    article.dataset.node = mouth.node;
+    article.classList.toggle("recent", mouth.recent);
+    article.querySelector(".person-avatar span").textContent = initials(mouth.agent);
+    article.querySelector(".person-main > strong").textContent = mouth.agent;
+    article.querySelector(".agent-empty").hidden = true;
+    article.querySelector("code").textContent = mouth.node;
     const badges = article.querySelector(".badges");
     badges.replaceChildren();
-    badges.append(badge(participant.role, participant.role));
-    if (participant.local) badges.append(badge("local", "this node"));
-    if (participant.leader) badges.append(badge("leader", "leader"));
-    if (participant.floor_holder) badges.append(badge("floor", "holds floor"));
-    if (participant.moderator) badges.append(badge("moderator", "moderator"));
+    badges.append(badge(mouth.role, mouth.role));
+    if (mouth.local) badges.append(badge("local", "this node"));
+    if (mouth.leader) badges.append(badge("leader", "leader node"));
+    if (mouth.floor_holder) badges.append(badge("floor", "holds floor"));
+    if (mouth.moderator) badges.append(badge("moderator", "moderator"));
     if (article !== cursor) el.peopleList.insertBefore(article, cursor);
     cursor = article.nextElementSibling;
   }
-  for (const [node, article] of existing) if (!visible.has(node)) article.remove();
+  for (const [key, article] of existing) if (!visible.has(key)) article.remove();
 }
 
 function badge(kind, label) {
@@ -492,11 +504,15 @@ function rejectPending(message) {
 function updateFloor() {
   const holder = state.detail?.floor?.holder || state.liveGrant?.to || null;
   const mine = holder?.agent === OPERATOR_AGENT && holder?.node === state.node;
+  const queued = state.queuedIntent;
   if (!state.room) el.floorStatus.textContent = "Open a room to see who holds Conch.";
+  else if (!holder && queued) el.floorStatus.textContent = `Your hand is raised${queued.position ? ` at #${queued.position}` : ""}. Waiting for the grant to commit.`;
   else if (!holder) el.floorStatus.textContent = "The floor is vacant. Raise your hand to speak.";
   else if (mine) el.floorStatus.textContent = "You hold Conch. Your next take can be wrapped.";
-  else el.floorStatus.textContent = `${holder.agent} holds Conch on ${short(holder.node)}.`;
-  el.takeButton.disabled = state.composerBusy || state.readOnly || state.roomStatus !== "ok" || !state.room || Boolean(holder);
+  else if (queued) el.floorStatus.textContent = `${holder.agent} holds Conch. Your hand is raised${queued.position ? ` at #${queued.position}` : ""}.`;
+  else el.floorStatus.textContent = `${holder.agent} holds Conch on ${short(holder.node)}. You can queue now.`;
+  el.takeButton.textContent = queued ? `Hand raised${queued.position ? ` · #${queued.position}` : ""}` : "Raise hand";
+  el.takeButton.disabled = state.composerBusy || state.readOnly || state.roomStatus !== "ok" || !state.room || mine || Boolean(queued);
   el.speech.disabled = state.composerBusy || !mine;
   el.wrapButton.disabled = state.composerBusy || !mine || !el.speech.value.trim();
   el.yieldButton.disabled = state.composerBusy || !mine;
@@ -508,7 +524,9 @@ function updateFloor() {
 async function takeFloor() {
   el.takeButton.disabled = true;
   try {
-    await rpc({ typ: "raise_hand", room: state.room });
+    const queued = await rpc({ typ: "raise_hand", room: state.room });
+    state.queuedIntent = { intent_id: queued.intent_id, agent: OPERATOR_AGENT, node: state.node };
+    updateFloor();
     await pollRoom(true);
   } catch (error) {
     showToast(error.message);

@@ -52,6 +52,11 @@ async fn conch_mcp_serves_newline_delimited_json_rpc() {
         .unwrap()
         .iter()
         .any(|tool| tool["name"] == "wait_for_floor"));
+    assert!(replies[1]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "wait_for_history"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -142,6 +147,29 @@ async fn ping_stays_responsive_while_waiting_then_mcp_completes_the_turn() {
         "participant completes a real MCP turn\n"
     );
     assert_eq!(page["complete"], true);
+
+    participant
+        .send(tool_call(
+            15,
+            "wait_for_history",
+            json!({ "after": 4, "timeout": 3 }),
+        ))
+        .await;
+    participant
+        .send(json!({ "jsonrpc": "2.0", "id": 16, "method": "ping" }))
+        .await;
+    let pong = participant.receive().await;
+    assert_eq!(pong["id"], 16, "history wait returned before ping: {pong}");
+    assert_eq!(pong["result"], json!({}));
+    let raised = holder.call(tool_call(17, "raise_hand", json!({}))).await;
+    assert_eq!(raised["result"]["isError"], false);
+    let committed = participant.receive().await;
+    assert_eq!(committed["id"], 15);
+    assert_eq!(committed["result"]["isError"], false);
+    let page: Value =
+        serde_json::from_str(committed["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(page["timed_out"], false);
+    assert_eq!(page["scenes"][0]["scene"]["n"], 5);
 
     holder.shutdown().await;
     participant.shutdown().await;

@@ -1,6 +1,6 @@
 # Conch local operator UI
 
-Status: accepted implementation contract for the post-v1.0.1 operator-console update.
+Status: accepted implementation contract for the post-v1.0.1 operator-console update, amended for the v1.2 participation follow-up.
 The consensus, floor, ticket, and product decisions in the v1.6 design remain unchanged.
 
 ## 1. Problem
@@ -46,8 +46,9 @@ Desktop uses three regions:
   health/sync/head/role, and unread badges.
 - **Conversation:** room header, floor state, committed transcript, live draft,
   and composer.
-- **People rail:** participants grouped by node role, attached/historical agent
-  mouths, and leader/floor/moderator badges.
+- **People rail:** one visible row per attached or historically observed agent
+  mouth, with its inherited node role and leader/floor/moderator badges. Several
+  mouths on one node remain several people.
 
 With no selected room, the conversation region is a useful dashboard: create a
 room, join from a ticket/magnet/URL, or select a local room. On narrow screens,
@@ -85,11 +86,20 @@ The authoritative staker set is the committed roster. Observer presence is a
 recent, verified room declaration known to this node. Agent is a mouth, not a
 node role.
 
-Each participant contains node id, `stake|observe`, known agents, last-seen
-time, and booleans for local node, connected/recent, consensus leader,
-floor-holder node, and moderator node. Historical grant recipients supplement
-agent names when a live declaration is unavailable. Absence of an agent list is
-rendered as “No attached agents observed,” not as a protocol role.
+Room detail keeps node summaries in `participants` for compatibility and adds a
+canonical `mouths` array. Each mouth contains exactly one agent id, node id,
+inherited `stake|observe` node role, last-seen time, and booleans for local node,
+connected/recent, consensus-leader node, exact floor-holder mouth, and exact
+moderator mouth. Historical grant recipients supplement agent names when a live
+declaration is unavailable. The People count is the number of mouths, not nodes.
+
+Room detail also exposes the active durable intent queue under `floor.queue`,
+ordered by `(ts, intent_id)`. Each entry contains position, intent id, agent,
+node, kind, timestamp, and expiry. It contains no private authorization data.
+The operator may raise a hand while another mouth holds the floor. Once queued,
+the button is idempotently disabled and shows its position; refresh reconstructs
+that state from the daemon. A committed grant consumes the intent and clears the
+queued state.
 
 The UI always labels committed history separately from live/unverified drafts.
 
@@ -168,5 +178,24 @@ daemon's current room, matching the existing CLI create/join behavior.
 - Polling unchanged history preserves scroll exactly.
 - New history while scrolled up shows the pill; clicking reaches latest.
 - Stakers, observers, agents, leader, moderator, and holder render distinctly.
+- Multiple agent mouths on one node render as separate People rows.
+- Raising while another mouth holds the floor persists one intent and the same
+  queued state/position survives refresh.
 - Existing room-scoped browser, CLI, MCP, HTTP, and swarm security tests remain
   green.
+
+## 11. Persistent agent participation
+
+MCP adds a bounded `wait_for_history` call with `{room?, after, timeout?}`.
+`after` is exclusive; a successful response returns any committed scenes after
+that height. The timeout is capped at 300 seconds and returns a successful empty
+history page with `timed_out: true`, rather than an error. The daemon registers
+its commit notification before checking history so a commit cannot be lost in
+the read/wait race. MCP continues serving ping and other tool calls concurrently.
+
+The canonical join-room skill treats a join as persistent unless the operator
+supplies a terminal condition. After a committed turn, an idle participant
+repeats bounded history waits, acts only on relevant committed context, and does
+not silently end participation after one contribution. Explicit dismissal,
+satisfied terminal condition, host cancellation, or a non-retryable error ends
+the lifecycle.

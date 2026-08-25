@@ -61,6 +61,7 @@ const MAX_CONNECTIONS_PER_SOURCE: usize = 64;
 const AUTH_FAILURE_BURST: u32 = 20;
 const AUTH_FAILURE_DECAY_INTERVAL: Duration = Duration::from_secs(6);
 const REMOVE_AFTER_SECONDS: u64 = 300;
+const MAX_HISTORY_WAIT_SECS: u64 = 300;
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
@@ -122,7 +123,7 @@ struct Inner {
     replays: RwLock<BTreeMap<RoomId, Arc<Mutex<Replay>>>>,
     floors: RwLock<BTreeMap<RoomId, Arc<RoomFloor>>>,
     joins: RwLock<BTreeMap<RoomId, LocalJoin>>,
-    agents: RwLock<BTreeSet<AgentId>>,
+    room_agents: RwLock<BTreeMap<RoomId, BTreeSet<AgentId>>>,
     addrs: RwLock<Vec<String>>,
     trackers: RwLock<Vec<String>>,
     peers: RwLock<BTreeMap<RoomId, BTreeMap<NodeId, Vec<String>>>>,
@@ -409,7 +410,7 @@ impl Daemon {
                 replays: RwLock::new(replays),
                 floors: RwLock::new(floors),
                 joins: RwLock::new(joins),
-                agents: RwLock::new(BTreeSet::new()),
+                room_agents: RwLock::new(BTreeMap::new()),
                 addrs: RwLock::new(Vec::new()),
                 trackers: RwLock::new(Vec::new()),
                 peers: RwLock::new(peers),
@@ -1248,11 +1249,13 @@ impl Daemon {
             .ok_or(DaemonError::UnknownRoom(room))?;
         let agents = self
             .inner
-            .agents
+            .room_agents
             .read()
-            .expect("agent registry lock is not poisoned")
-            .iter()
+            .expect("room-agent registry lock is not poisoned")
+            .get(&room)
             .cloned()
+            .unwrap_or_default()
+            .into_iter()
             .collect();
         Ok(Declaration::signed(
             room,
@@ -2823,11 +2826,9 @@ impl Daemon {
                 "attach must be the first client frame",
             ));
         };
-        self.inner
-            .agents
-            .write()
-            .expect("agent registry lock is not poisoned")
-            .insert(agent.clone());
+        if let Some(room) = allowed_room {
+            self.remember_room_agent(room, agent.clone());
+        }
         write_frame(
             &mut stream,
             &ClientReply::success(json!({ "agent": agent, "node": self.node_id() })),
@@ -2855,6 +2856,9 @@ impl Daemon {
                 )
                 .await?;
                 return Ok(());
+            }
+            if let Some(room) = request_room(&request) {
+                self.remember_room_agent(room, agent.clone());
             }
             if let ClientRequest::History {
                 room,
@@ -2987,6 +2991,7 @@ impl Daemon {
                 .await
                 {
                     Ok(result) => result.map(|ticket| {
+                        self.remember_room_agent(ticket.id, agent.clone());
                         json!({
                             "id": ticket.id,
                             "magnet": ticket.to_magnet(),
@@ -2997,10 +3002,11 @@ impl Daemon {
                 }
             }
             ClientRequest::Join { ticket, role } => match ticket.resolve() {
-                Ok(ticket) => self
-                    .join_ticket(ticket, role)
-                    .await
-                    .map(|chain| json!({ "id": chain.room, "role": role })),
+                Ok(ticket) => self.join_ticket(ticket, role).await.map(|chain| {
+                    let room = chain.room.expect("joined chain has a room id");
+                    self.remember_room_agent(room, agent.clone());
+                    json!({ "id": room, "role": role })
+                }),
                 Err(error) => Err(error.into()),
             },
             ClientRequest::WaitForFloor { room, timeout_secs } => {
@@ -3032,6 +3038,14 @@ impl Daemon {
                 from_n,
                 follow: false,
             } => self.history_page_from(room, from_n),
+            ClientRequest::WaitForHistory {
+                room,
+                after_n,
+                timeout_secs,
+            } => {
+                self.client_wait_for_history(room, after_n, timeout_secs)
+                    .await
+            }
             ClientRequest::Status { room } => self.client_status(room),
             ClientRequest::Attach { .. } => Err(DaemonError::Protocol("duplicate attach")),
             ClientRequest::History { follow: true, .. } => {
@@ -3072,6 +3086,41 @@ impl Daemon {
                 &ClientReply::success(self.history_page(room, records)?),
             )
             .await?;
+        }
+    }
+
+    async fn client_wait_for_history(
+        &self,
+        room: RoomId,
+        after_n: u64,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, DaemonError> {
+        let floor = self.floor(room)?;
+        let wait = Duration::from_secs(timeout_secs.unwrap_or(60).min(MAX_HISTORY_WAIT_SECS));
+        let deadline = Instant::now() + wait;
+        loop {
+            // Register before reading so a commit between the read and await
+            // cannot be missed.
+            let changed = floor.changed.notified();
+            let records = match after_n.checked_add(1) {
+                Some(from_n) => self.history_from(room, from_n)?,
+                None => Vec::new(),
+            };
+            if !records.is_empty() {
+                let mut page = self.history_page(room, records)?;
+                page["timed_out"] = json!(false);
+                return Ok(page);
+            }
+            if Instant::now() >= deadline {
+                let mut page = self.history_page(room, Vec::new())?;
+                page["timed_out"] = json!(true);
+                return Ok(page);
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                let mut page = self.history_page(room, Vec::new())?;
+                page["timed_out"] = json!(true);
+                return Ok(page);
+            }
         }
     }
 
@@ -5151,6 +5200,16 @@ impl Daemon {
             .insert(node, declaration.clone());
     }
 
+    fn remember_room_agent(&self, room: RoomId, agent: AgentId) {
+        self.inner
+            .room_agents
+            .write()
+            .expect("room-agent registry lock is not poisoned")
+            .entry(room)
+            .or_default()
+            .insert(agent);
+    }
+
     async fn maybe_remove_unavailable(&self, room: RoomId) -> Result<(), DaemonError> {
         let replay = self.replay(room)?;
         let node = self.node_id();
@@ -5657,10 +5716,12 @@ impl Daemon {
             .unwrap_or_default();
         let local_agents = self
             .inner
-            .agents
+            .room_agents
             .read()
-            .expect("agent registry lock is not poisoned")
-            .clone();
+            .expect("room-agent registry lock is not poisoned")
+            .get(&room)
+            .cloned()
+            .unwrap_or_default();
 
         let mut nodes = BTreeMap::<NodeId, (JoinRole, BTreeSet<AgentId>)>::new();
         for node in &replay.chain.roster {
@@ -5720,6 +5781,27 @@ impl Daemon {
                 .1
                 .insert(moderator.agent.clone());
         }
+        let mut mouths = Vec::new();
+        for (node, (role, agents)) in &nodes {
+            let seen = if *node == local {
+                Some(now)
+            } else {
+                last_seen.get(node).copied()
+            };
+            for agent in agents {
+                mouths.push(json!({
+                    "agent": agent,
+                    "node": node,
+                    "role": role,
+                    "local": *node == local,
+                    "recent": seen.is_some_and(|seen| now.saturating_sub(seen) <= 10),
+                    "last_seen": seen,
+                    "leader": replay.consensus.leader_id == Some(*node),
+                    "floor_holder": replay.chain.live_grant.as_ref().is_some_and(|grant| grant.to.node == *node && grant.to.agent == *agent),
+                    "moderator": replay.chain.moderator.as_ref().is_some_and(|moderator| moderator.node == *node && moderator.agent == *agent),
+                }));
+            }
+        }
         let participants = nodes
             .into_iter()
             .map(|(node, (role, agents))| {
@@ -5741,15 +5823,46 @@ impl Daemon {
                 })
             })
             .collect::<Vec<_>>();
+        let mut queue = self
+            .floor(room)?
+            .engine
+            .lock()
+            .expect("floor lock is not poisoned")
+            .intents()
+            .filter(|intent| {
+                replay.chain.roster.contains(&intent.node)
+                    && !replay.chain.consumed_intents.contains(&intent.id)
+                    && now < intent.exp
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        queue.sort_by_key(|intent| (intent.ts, intent.id));
+        let queue = queue
+            .into_iter()
+            .enumerate()
+            .map(|(index, intent)| {
+                json!({
+                    "position": index + 1,
+                    "intent_id": intent.id,
+                    "agent": intent.agent,
+                    "node": intent.node,
+                    "kind": intent.kind,
+                    "ts": intent.ts,
+                    "exp": intent.exp,
+                })
+            })
+            .collect::<Vec<_>>();
         Ok(json!({
             "room": summary,
             "node": local,
             "participants": participants,
+            "mouths": mouths,
             "floor": {
                 "mode": replay.chain.floor_mode,
                 "timeout_secs": replay.chain.timeout_secs,
                 "holder": replay.chain.live_grant.as_ref().map(|grant| &grant.to),
                 "leader": replay.consensus.leader_id,
+                "queue": queue,
             }
         }))
     }
@@ -6070,7 +6183,8 @@ fn request_room(request: &ClientRequest) -> Option<RoomId> {
         | ClientRequest::Membership { room, .. }
         | ClientRequest::PutBlob { room, .. }
         | ClientRequest::Leave { room, .. }
-        | ClientRequest::History { room, .. } => Some(*room),
+        | ClientRequest::History { room, .. }
+        | ClientRequest::WaitForHistory { room, .. } => Some(*room),
         ClientRequest::Status { room } => *room,
         ClientRequest::Attach { .. }
         | ClientRequest::Create { .. }
@@ -6899,6 +7013,75 @@ mod tests {
             .any(|participant| participant["node"] == json!(peer.node_id())));
     }
 
+    #[tokio::test]
+    async fn operator_detail_lists_mouths_and_the_durable_floor_queue() {
+        let data = TempDir::new().unwrap();
+        let daemon = Daemon::open(data.path()).unwrap();
+        let room = daemon.create_genesis("mouths and queue").unwrap();
+        let holder = AgentId::new("agent:holder").unwrap();
+        let operator = AgentId::new("human:operator").unwrap();
+        daemon.remember_room_agent(room, holder.clone());
+        daemon.remember_room_agent(room, operator.clone());
+        let other_room = daemon.create_genesis("other room").unwrap();
+        let outsider = AgentId::new("agent:other-room-only").unwrap();
+        daemon.remember_room_agent(other_room, outsider.clone());
+
+        daemon
+            .client_raise_hand(holder.clone(), room)
+            .await
+            .unwrap();
+        let queued = daemon
+            .client_raise_hand(operator.clone(), room)
+            .await
+            .unwrap();
+        let detail = daemon.operator_room_detail(room).unwrap();
+
+        assert_eq!(detail["participants"].as_array().unwrap().len(), 1);
+        let mouths = detail["mouths"].as_array().unwrap();
+        assert_eq!(mouths.len(), 2);
+        assert!(mouths.iter().any(|mouth| {
+            mouth["agent"] == json!(holder) && mouth["floor_holder"] == json!(true)
+        }));
+        assert!(mouths.iter().any(|mouth| mouth["agent"] == json!(operator)));
+        assert!(!mouths.iter().any(|mouth| mouth["agent"] == json!(outsider)));
+        let queue = detail["floor"]["queue"].as_array().unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0]["position"], json!(1));
+        assert_eq!(queue[0]["agent"], json!(operator));
+        assert_eq!(queue[0]["intent_id"], queued["intent_id"]);
+    }
+
+    #[tokio::test]
+    async fn bounded_history_wait_wakes_on_commit_and_times_out_successfully() {
+        let data = TempDir::new().unwrap();
+        let daemon = Daemon::open(data.path()).unwrap();
+        let room = daemon.create_genesis("history wait").unwrap();
+        let waiting_daemon = daemon.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_daemon
+                .client_wait_for_history(room, 0, Some(2))
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+
+        daemon
+            .client_raise_hand(AgentId::new("agent:wakes-wait").unwrap(), room)
+            .await
+            .unwrap();
+        let page = waiting.await.unwrap();
+        assert_eq!(page["timed_out"], json!(false));
+        assert_eq!(page["scenes"].as_array().unwrap().len(), 1);
+        assert_eq!(page["scenes"][0]["scene"]["n"], json!(1));
+
+        let timed_out = daemon
+            .client_wait_for_history(room, 1, Some(0))
+            .await
+            .unwrap();
+        assert_eq!(timed_out["timed_out"], json!(true));
+        assert!(timed_out["scenes"].as_array().unwrap().is_empty());
+    }
+
     #[test]
     fn restart_commits_exact_pending_hash_before_a_fresh_body() {
         let data = TempDir::new().unwrap();
@@ -7566,12 +7749,7 @@ mod tests {
                 Some(token),
             )
             .unwrap();
-        target
-            .inner
-            .agents
-            .write()
-            .unwrap()
-            .insert(AgentId::new("agent:preauth-sentinel").unwrap());
+        target.remember_room_agent(ticket.id, AgentId::new("agent:preauth-sentinel").unwrap());
 
         let (mut outbound, inbound) = tokio::io::duplex(1024 * 1024);
         let responder = target.clone();
