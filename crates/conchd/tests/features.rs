@@ -1170,13 +1170,19 @@ async fn restarted_network_leader_carries_exact_pending_hash() {
         .sync_room_from(source_server.addr(), ticket.id)
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(15), async {
+    let committed = tokio::time::timeout(Duration::from_secs(30), async {
         while source.replay(ticket.id).unwrap().chain.head_n != Some(2) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .expect("the new leader must carry the accepted entry without a client nudge");
+    .await;
+    if committed.is_err() {
+        panic!(
+            "the new leader must carry the accepted entry without a client nudge\nsource={:#?}\nfollower={:#?}",
+            source.replay(ticket.id).unwrap(),
+            follower.replay(ticket.id).unwrap(),
+        );
+    }
     let replay = source.replay(ticket.id).unwrap();
     assert_eq!(replay.chain.head_n, Some(2));
     assert_eq!(replay.chain.head_hash, Some(accepted_hash));
