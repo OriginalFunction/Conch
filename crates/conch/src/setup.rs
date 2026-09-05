@@ -71,6 +71,42 @@ fn args_for(agent: &str) -> Vec<String> {
     vec!["--agent".into(), agent.into(), "mcp".into()]
 }
 
+/// The path to record in a host config for the running binary.
+///
+/// `current_exe` resolves symlinks, which turns `/opt/homebrew/bin/conch` into a
+/// versioned `/opt/homebrew/Cellar/conch/1.2.2/bin/conch` that the next upgrade
+/// deletes. When the name the process was invoked under resolves to the same file,
+/// that unresolved path is the stable one and is preferred.
+pub fn stable_binary_path_from(
+    argv0: Option<&std::ffi::OsStr>,
+    current_exe: Option<&Path>,
+    path: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let exe = current_exe?;
+    let canonical = fs::canonicalize(exe).ok();
+    if let (Some(argv0), Some(canonical)) = (argv0, canonical.as_deref()) {
+        let argv0 = Path::new(argv0);
+        let candidates: Vec<PathBuf> = if argv0.components().count() > 1 {
+            vec![argv0.to_path_buf()]
+        } else {
+            path.map(|path| {
+                std::env::split_paths(path)
+                    .map(|dir| dir.join(argv0))
+                    .collect()
+            })
+            .unwrap_or_default()
+        };
+        for candidate in candidates {
+            if candidate.is_file()
+                && fs::canonicalize(&candidate).ok().as_deref() == Some(canonical)
+            {
+                return Some(candidate);
+            }
+        }
+    }
+    Some(exe.to_path_buf())
+}
+
 pub fn run(options: &SetupOptions) -> Result<SetupReport, SetupError> {
     let host = options.host;
     let command = options.conch_binary.display().to_string();
@@ -270,6 +306,34 @@ fn write_atomic(path: &Path, text: &str, mode: Option<u32>) -> std::io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_entry_that_points_at_this_binary_beats_the_resolved_one() {
+        let exe = std::env::current_exe().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        // Stands in for /opt/homebrew/bin/conch -> ../Cellar/conch/X.Y.Z/bin/conch.
+        let link = dir.path().join("conch");
+        std::os::unix::fs::symlink(&exe, &link).unwrap();
+        let path = std::env::join_paths([dir.path()]).unwrap();
+
+        assert_eq!(
+            stable_binary_path_from(Some(std::ffi::OsStr::new("conch")), Some(&exe), Some(&path)),
+            Some(link)
+        );
+        // Nothing on PATH resolves to it: keep the resolved path.
+        let empty = tempfile::TempDir::new().unwrap();
+        let empty_path = std::env::join_paths([empty.path()]).unwrap();
+        assert_eq!(
+            stable_binary_path_from(
+                Some(std::ffi::OsStr::new("conch")),
+                Some(&exe),
+                Some(&empty_path)
+            ),
+            Some(exe.clone())
+        );
+        assert_eq!(stable_binary_path_from(None, None, None), None);
+    }
 
     #[test]
     fn version_header_sits_after_frontmatter() {

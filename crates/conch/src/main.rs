@@ -145,7 +145,8 @@ async fn run_local(command: LocalCommand) -> Result<(), Box<dyn std::error::Erro
                 dry_run,
                 home,
                 cwd: env::current_dir()?,
-                conch_binary: env::current_exe()?,
+                conch_binary: stable_binary_path()
+                    .ok_or("cannot determine the path of the running conch binary")?,
                 version: env!("CARGO_PKG_VERSION").into(),
             })?;
             if dry_run {
@@ -292,6 +293,15 @@ async fn run_local(command: LocalCommand) -> Result<(), Box<dyn std::error::Erro
             Ok(())
         }
     }
+}
+
+/// The path to record for this binary, preferring the un-resolved name it was invoked
+/// under so a Homebrew upgrade does not orphan every host config.
+fn stable_binary_path() -> Option<PathBuf> {
+    let argv0 = env::args_os().next();
+    let exe = env::current_exe().ok();
+    let path = env::var_os("PATH");
+    conch::setup::stable_binary_path_from(argv0.as_deref(), exe.as_deref(), path.as_deref())
 }
 
 fn print_running(pid: u32, data_dir: &std::path::Path, http: SocketAddr) {

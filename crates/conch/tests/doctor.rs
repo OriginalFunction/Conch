@@ -125,6 +125,31 @@ fn doctor_passes_with_daemon_and_reports_hosts() {
 }
 
 #[test]
+fn doctor_flags_a_recorded_command_that_no_longer_exists() {
+    let (home, data) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    setup(&home, "cursor");
+    // What a Homebrew upgrade leaves behind: an entry pointing at a versioned path
+    // that has since been deleted.
+    let config = home.path().join(".cursor/mcp.json");
+    let rewritten = fs::read_to_string(&config).unwrap().replace(
+        env!("CARGO_BIN_EXE_conch"),
+        "/nonexistent/Cellar/conch/bin/conch",
+    );
+    fs::write(&config, rewritten).unwrap();
+
+    let (dead, _http, reserved) = reserve_ports();
+    drop(reserved);
+    let out = String::from_utf8_lossy(&doctor(&home, &data, dead).stdout).into_owned();
+    assert!(
+        out.contains(
+            "warn  cursor        agent:cursor, command /nonexistent/Cellar/conch/bin/conch missing"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("run `conch setup cursor`"), "{out}");
+}
+
+#[test]
 fn doctor_flags_a_stale_skill() {
     let (home, data) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     setup(&home, "claude");

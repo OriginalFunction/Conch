@@ -198,17 +198,20 @@ fn host_check(host: Host, home: &Path, cli_version: &str) -> Check {
     let Ok(text) = fs::read_to_string(&path) else {
         return check(Level::Skip, host.name(), "not configured", None);
     };
-    let agent = match host.format() {
+    let entry = match host.format() {
         Format::Toml => text.parse::<toml_edit::DocumentMut>().ok().and_then(|doc| {
-            let args = doc
-                .get("mcp_servers")?
-                .get("conch")?
+            let server = doc.get("mcp_servers")?.get("conch")?;
+            let args = server
                 .get("args")?
                 .as_array()?
                 .iter()
                 .map(|v| v.as_str().unwrap_or("").to_string())
                 .collect::<Vec<_>>();
-            agent_from_args(&args)
+            let command = server
+                .get("command")
+                .and_then(|c| c.as_str())
+                .map(Into::into);
+            Some((agent_from_args(&args)?, command))
         }),
         Format::Json | Format::Jsonc => {
             serde_json::from_str::<serde_json::Value>(&edit::json::strip_comments(&text))
@@ -225,11 +228,17 @@ fn host_check(host: Host, home: &Path, cli_version: &str) -> Check {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    agent_from_args(&args)
+                    // OpenCode's `command` is the whole argv; everyone else's is a string.
+                    let command = entry.get("command").and_then(|c| {
+                        c.as_str()
+                            .map(String::from)
+                            .or_else(|| c.as_array()?.first()?.as_str().map(String::from))
+                    });
+                    Some((agent_from_args(&args)?, command))
                 })
         }
     };
-    let Some(agent) = agent else {
+    let Some((agent, command)) = entry else {
         let legacy = host == Host::Codex && text.contains("plugins.\"conch@");
         return if legacy {
             check(
@@ -242,6 +251,16 @@ fn host_check(host: Host, home: &Path, cli_version: &str) -> Check {
             check(Level::Skip, host.name(), "not configured", None)
         };
     };
+    // An entry that names a binary which is no longer there is worse than no entry:
+    // the host reports a broken MCP server instead of an unconfigured one.
+    if let Some(command) = command.filter(|command| !Path::new(command).exists()) {
+        return check(
+            Level::Warn,
+            host.name(),
+            format!("{agent}, command {command} missing"),
+            Some(format!("run `conch setup {}`", host.name())),
+        );
+    }
     let skill = fs::read_to_string(host.skill_dir(home).join("SKILL.md")).ok();
     match skill.as_deref().and_then(setup::skill_version) {
         Some(v) if v == cli_version => check(Level::Ok, host.name(), agent, None),
