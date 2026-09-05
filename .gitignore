@@ -3,3 +3,5 @@
 *.swp
 .DS_Store
 .playwright-cli/
+.playwright-mcp/
+.claude/worktrees/
