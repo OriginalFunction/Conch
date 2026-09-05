@@ -3,8 +3,38 @@ use std::{fs, net::TcpListener, path::PathBuf, time::Duration};
 use conch_launch::{locate_conchd, wait_for_port, PidFile};
 use tempfile::TempDir;
 
+struct EnvGuard {
+    path: Option<std::ffi::OsString>,
+    conch_conchd: Option<std::ffi::OsString>,
+}
+
+impl EnvGuard {
+    fn new() -> Self {
+        Self {
+            path: std::env::var_os("PATH"),
+            conch_conchd: std::env::var_os("CONCH_CONCHD"),
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        if let Some(conch_conchd) = &self.conch_conchd {
+            std::env::set_var("CONCH_CONCHD", conch_conchd);
+        } else {
+            std::env::remove_var("CONCH_CONCHD");
+        }
+    }
+}
+
 #[test]
 fn locate_prefers_env_override_and_reports_search_locations() {
+    let _guard = EnvGuard::new();
     let dir = TempDir::new().unwrap();
     let fake = dir.path().join("conchd");
     fs::write(&fake, "#!/bin/sh\n").unwrap();
@@ -14,19 +44,10 @@ fn locate_prefers_env_override_and_reports_search_locations() {
     assert_eq!(locate_conchd().unwrap(), fake);
 
     // Test 2: missing case - temporarily clear PATH to force NotFound error
-    let old_path = std::env::var_os("PATH");
     std::env::remove_var("PATH");
     std::env::set_var("CONCH_CONCHD", "/definitely/not/here/conchd");
     let error = locate_conchd().unwrap_err().to_string();
     assert!(error.contains("/definitely/not/here/conchd"), "{error}");
-
-    // Cleanup
-    if let Some(path) = old_path {
-        std::env::set_var("PATH", path);
-    } else {
-        std::env::remove_var("PATH");
-    }
-    std::env::remove_var("CONCH_CONCHD");
 }
 
 #[test]
