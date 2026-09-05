@@ -1,4 +1,10 @@
-use std::{ffi::OsString, fs, net::TcpListener, path::PathBuf, time::Duration};
+use std::{
+    ffi::OsString,
+    fs,
+    net::TcpListener,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use conch_launch::{locate_conchd_in, wait_for_port, PidFile};
 use tempfile::TempDir;
@@ -66,6 +72,19 @@ fn pid_file_round_trips_and_detects_dead_process() {
     assert_eq!(read.pid, 4_000_000_000);
     assert!(!read.is_alive());
     assert!(PidFile::read(&PathBuf::from("/nonexistent")).is_none());
+}
+
+#[test]
+fn the_auto_spawn_line_and_the_connect_remedy_have_one_wording() {
+    assert_eq!(
+        conch_launch::started_line(42, Path::new("/data")),
+        "conch: started conchd (pid 42) — log: /data/conchd.log"
+    );
+    assert_eq!(
+        conch_launch::connect_error("127.0.0.1:7421"),
+        "conchd is not running on 127.0.0.1:7421. Start it with `conch up` \
+         (or `brew services start conch`)."
+    );
 }
 
 #[test]

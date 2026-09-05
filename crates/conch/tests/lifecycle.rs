@@ -265,6 +265,70 @@ fn status_auto_spawns_on_default_node_and_says_so() {
         .unwrap();
 }
 
+/// `conch mcp` auto-spawns through the same helper the CLI uses, on the same default
+/// addresses, and prints the same one stderr line.
+#[test]
+fn mcp_auto_spawns_on_default_node() {
+    use std::io::Write;
+
+    let data = TempDir::new().unwrap();
+    let _guard = DaemonGuard::new(data.path());
+    let (tcp, http, reserved) = reserve_ports();
+    drop(reserved);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_conch"))
+        .args(["--agent", "agent:mcp", "mcp"])
+        .env("CONCH_DATA_DIR", data.path())
+        .env("CONCH_CONCHD", conchd_binary())
+        .env("CONCH_DEFAULT_TCP", tcp.to_string())
+        .env("CONCH_DEFAULT_HTTP", http.to_string())
+        .env_remove("CONCH_NODE")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"status","arguments":{}}}
+"#,
+        )
+        .unwrap();
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{err}");
+
+    let pid = PidFile::read(data.path()).expect("the MCP server started a daemon");
+    assert!(pid.is_alive());
+    assert!(
+        err.contains(&format!("conch: started conchd (pid {}) — log: ", pid.pid)),
+        "{err}"
+    );
+    assert!(
+        err.contains(&data.path().join("conchd.log").display().to_string()),
+        "{err}"
+    );
+
+    let replies: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(replies.len(), 2, "{replies:?}");
+    assert_eq!(replies[1]["result"]["isError"], false, "{}", replies[1]);
+    assert!(
+        replies[1]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"rooms\""),
+        "{}",
+        replies[1]
+    );
+}
+
 #[test]
 fn default_node_spawn_failure_prints_remedy() {
     let data = TempDir::new().unwrap();

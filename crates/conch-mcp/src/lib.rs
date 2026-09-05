@@ -376,33 +376,59 @@ impl Server {
         raw: Option<Vec<u8>>,
     ) -> Result<ClientReply, String> {
         let addr = parse_node_addr(&self.node)?;
-        let mut stream = match TcpStream::connect(addr).await {
+        let stream = match TcpStream::connect(addr).await {
             Ok(stream) => stream,
+            // Same auto-spawn the CLI performs, through the same helper, so the two
+            // never drift apart on ports, wording, or failure handling.
             Err(error)
                 if error.kind() == std::io::ErrorKind::ConnectionRefused
                     && self.auto_spawn
                     && !self.spawned.swap(true, std::sync::atomic::Ordering::SeqCst) =>
             {
                 let data_dir = conch_launch::default_data_dir();
-                let options = conch_launch::SpawnOptions {
-                    conchd: conch_launch::locate_conchd().map_err(|e| e.to_string())?,
-                    data_dir: data_dir.clone(),
-                    tcp: addr,
-                    http: conch_launch::DEFAULT_HTTP.parse().expect("literal"),
+                let http = conch_launch::default_http()
+                    .parse()
+                    .map_err(|error| format!("CONCH_DEFAULT_HTTP is not an address: {error}"))?;
+                let spawned = {
+                    let data_dir = data_dir.clone();
+                    tokio::task::spawn_blocking(move || {
+                        conch_launch::ensure_daemon(addr, http, &data_dir)
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?
                 };
-                let pid =
-                    tokio::task::spawn_blocking(move || conch_launch::spawn_detached(&options))
-                        .await
-                        .map_err(|e| e.to_string())?
-                        .map_err(|e| e.to_string())?;
-                eprintln!(
-                    "conch: started conchd (pid {pid}) — log: {}",
-                    conch_launch::log_path(&data_dir).display()
-                );
-                TcpStream::connect(addr).await.map_err(|e| e.to_string())?
+                let failure = match spawned {
+                    Ok(pid) => {
+                        if let Some(pid) = pid {
+                            // stderr is not part of the MCP stream.
+                            eprintln!("{}", conch_launch::started_line(pid, &data_dir));
+                        }
+                        match TcpStream::connect(addr).await {
+                            Ok(stream) => return self.exchange(stream, request, raw).await,
+                            Err(error) => error.to_string(),
+                        }
+                    }
+                    Err(error) => error.to_string(),
+                };
+                return Err(format!(
+                    "{}\ncause: {failure}",
+                    conch_launch::connect_error(&addr.to_string())
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                return Err(conch_launch::connect_error(&addr.to_string()))
             }
             Err(error) => return Err(error.to_string()),
         };
+        self.exchange(stream, request, raw).await
+    }
+
+    async fn exchange(
+        &self,
+        mut stream: TcpStream,
+        request: ClientRequest,
+        raw: Option<Vec<u8>>,
+    ) -> Result<ClientReply, String> {
         write_frame(
             &mut stream,
             &ClientRequest::Attach {

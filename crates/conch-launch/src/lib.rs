@@ -55,6 +55,60 @@ pub fn log_path(data_dir: &Path) -> PathBuf {
     data_dir.join(LOG_FILE)
 }
 
+/// The default swarm/client address, overridable for tests and side-by-side installs.
+pub fn default_tcp() -> String {
+    env::var("CONCH_DEFAULT_TCP").unwrap_or_else(|_| DEFAULT_TCP.into())
+}
+
+/// The default HTTP/WebSocket address, overridable the same way.
+pub fn default_http() -> String {
+    env::var("CONCH_DEFAULT_HTTP").unwrap_or_else(|_| DEFAULT_HTTP.into())
+}
+
+/// The one wording for "nothing is listening"; the CLI and the MCP server both use it.
+pub fn connect_error(node_addr: &str) -> String {
+    format!("conchd is not running on {node_addr}. Start it with `conch up` (or `brew services start conch`).")
+}
+
+/// The one stderr line an auto-spawn prints.
+pub fn started_line(pid: u32, data_dir: &Path) -> String {
+    format!(
+        "conch: started conchd (pid {pid}) — log: {}",
+        log_path(data_dir).display()
+    )
+}
+
+/// Start conchd unless something is already listening on `tcp`. `Ok(None)` means a
+/// daemon was already there — or came up while this one was starting — and nothing was
+/// spawned; `Ok(Some(pid))` names the daemon this call started.
+pub fn ensure_daemon(
+    tcp: SocketAddr,
+    http: SocketAddr,
+    data_dir: &Path,
+) -> Result<Option<u32>, LaunchError> {
+    if wait_for_port(tcp, Duration::from_millis(200)) {
+        return Ok(None);
+    }
+    let options = SpawnOptions {
+        conchd: locate_conchd()?,
+        data_dir: data_dir.to_path_buf(),
+        tcp,
+        http,
+    };
+    match spawn_detached(&options) {
+        Ok(pid) => Ok(Some(pid)),
+        // Another process got there first; wait for its daemon rather than failing.
+        Err(LaunchError::AlreadyRunning { pid }) => {
+            if wait_for_port(tcp, Duration::from_secs(5)) {
+                Ok(None)
+            } else {
+                Err(LaunchError::AlreadyRunning { pid })
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// `$CONCH_CONCHD`, then `conchd` beside the running binary, then `$PATH`.
 pub fn locate_conchd() -> Result<PathBuf, LaunchError> {
     let explicit = env::var_os("CONCH_CONCHD");

@@ -379,11 +379,11 @@ async fn connect_with_spawn(
 }
 
 fn default_tcp() -> String {
-    env::var("CONCH_DEFAULT_TCP").unwrap_or_else(|_| conch_launch::DEFAULT_TCP.into())
+    conch_launch::default_tcp()
 }
 
 fn default_http() -> String {
-    env::var("CONCH_DEFAULT_HTTP").unwrap_or_else(|_| conch_launch::DEFAULT_HTTP.into())
+    conch_launch::default_http()
 }
 
 fn spawn_options() -> Result<conch_launch::SpawnOptions, Box<dyn std::error::Error>> {
@@ -397,15 +397,17 @@ fn spawn_options() -> Result<conch_launch::SpawnOptions, Box<dyn std::error::Err
 
 /// Start conchd if nothing is listening on the default node. Prints one stderr line when it does.
 async fn ensure_daemon() -> Result<(), Box<dyn std::error::Error>> {
-    let options = spawn_options()?;
-    if conch_launch::wait_for_port(options.tcp, std::time::Duration::from_millis(200)) {
-        return Ok(());
+    let tcp: SocketAddr = default_tcp().parse()?;
+    let http: SocketAddr = default_http().parse()?;
+    let data_dir = conch_launch::default_data_dir();
+    let spawned = {
+        let data_dir = data_dir.clone();
+        tokio::task::spawn_blocking(move || conch_launch::ensure_daemon(tcp, http, &data_dir))
+            .await??
+    };
+    if let Some(pid) = spawned {
+        eprintln!("{}", conch_launch::started_line(pid, &data_dir));
     }
-    let pid = tokio::task::spawn_blocking(move || conch_launch::spawn_detached(&options)).await??;
-    eprintln!(
-        "conch: started conchd (pid {pid}) — log: {}",
-        conch_launch::log_path(&conch_launch::default_data_dir()).display()
-    );
     Ok(())
 }
 

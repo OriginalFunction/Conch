@@ -1,7 +1,7 @@
 //! Human remedies for the errors a new user hits first.
 
 pub fn connect_error(node_addr: &str) -> String {
-    format!("conchd is not running on {node_addr}. Start it with `conch up` (or `brew services start conch`).")
+    conch_launch::connect_error(node_addr)
 }
 
 /// A second line for a wire error, keyed by error code and the CLI command that produced it.
