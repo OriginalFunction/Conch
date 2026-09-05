@@ -114,7 +114,10 @@ pub fn run_checks(input: &DoctorInput) -> Vec<Check> {
                     Some("restart it after upgrading: `conch down && conch up`".into()),
                 )),
             }
-            let conchd = conch_launch::PidFile::read(&input.data_dir);
+            // A pid file whose pid is dead, or has been recycled by some other
+            // program, tells us nothing about how this daemon was started.
+            let conchd = conch_launch::PidFile::read(&input.data_dir)
+                .filter(|pid| pid.is_alive() && pid.is_conchd());
             let how = if service::unit_installed() {
                 "service unit installed"
             } else if conchd.is_some()

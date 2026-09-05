@@ -208,16 +208,30 @@ async fn run_local(command: LocalCommand) -> Result<(), Box<dyn std::error::Erro
         LocalCommand::Down { service } => {
             let data_dir = conch_launch::default_data_dir();
             match conch_launch::PidFile::read(&data_dir) {
-                Some(pid) if pid.is_alive() => {
-                    pid.stop(std::time::Duration::from_secs(5))?;
-                    // `stop` only waits for `kill -0` to fail, which can (rarely, under
-                    // load) report a false negative before conchd has actually removed
-                    // its own pid file on the way out. Wait for the file itself so
-                    // `down` never reports success while a stale pid file remains.
-                    wait_for_pid_file_gone(&data_dir, std::time::Duration::from_secs(5)).await?;
-                    println!("conchd stopped (pid {})", pid.pid);
+                Some(pid) if pid.is_alive() => match pid.stop(std::time::Duration::from_secs(5)) {
+                    Ok(()) => {
+                        // `stop` only waits for `kill -0` to fail, which can (rarely, under
+                        // load) report a false negative before conchd has actually removed
+                        // its own pid file on the way out. Wait for the file itself so
+                        // `down` never reports success while a stale pid file remains.
+                        wait_for_pid_file_gone(&data_dir, std::time::Duration::from_secs(5))
+                            .await?;
+                        println!("conchd stopped (pid {})", pid.pid);
+                    }
+                    // The pid was recycled by some other program: the file is stale,
+                    // and nothing was signalled.
+                    Err(conch_launch::LaunchError::PidMismatch { .. }) => {
+                        conch_launch::PidFile::remove(&data_dir);
+                        println!("conchd is not running (removed a stale pid file)");
+                    }
+                    Err(error) => return Err(error.into()),
+                },
+                // The process is already gone; clear what it left behind.
+                Some(_) => {
+                    conch_launch::PidFile::remove(&data_dir);
+                    println!("conchd is not running (removed a stale pid file)");
                 }
-                _ => println!("conchd is not running"),
+                None => println!("conchd is not running"),
             }
             if service {
                 conch::service::uninstall(&data_dir)?;

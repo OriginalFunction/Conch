@@ -33,6 +33,8 @@ pub enum LaunchError {
     AlreadyRunning { pid: u32 },
     #[error("conchd (pid {pid}) did not stop within {secs}s")]
     StopTimeout { pid: u32, secs: u64 },
+    #[error("pid {pid} is not a conchd; refusing to signal it (stale pid file)")]
+    PidMismatch { pid: u32 },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -128,7 +130,9 @@ pub struct SpawnOptions {
 /// Returns the pid once the TCP port accepts connections.
 pub fn spawn_detached(options: &SpawnOptions) -> Result<u32, LaunchError> {
     if let Some(existing) = PidFile::read(&options.data_dir) {
-        if existing.is_alive() {
+        // A live pid that belongs to some other program means the pid was recycled:
+        // the file is stale and gets overwritten, exactly as for a dead pid.
+        if existing.is_alive() && existing.is_conchd() {
             return Err(LaunchError::AlreadyRunning { pid: existing.pid });
         }
     }
@@ -157,20 +161,24 @@ pub fn spawn_detached(options: &SpawnOptions) -> Result<u32, LaunchError> {
     }
     let mut child = command.spawn()?;
     let pid = child.id();
-    // The child outlives us; reap it in the background so it never lingers
-    // as a zombie under our pid (kill -0 would otherwise still see it as
-    // alive after it exits, since nothing else waits on it).
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
     const SECS: u64 = 5;
     if !wait_for_port(options.tcp, Duration::from_secs(SECS)) {
+        // Never leave a half-started daemon behind: it would hold the data dir and,
+        // under a service unit, be restarted into the same failure forever.
+        let _ = child.kill();
+        let _ = child.wait();
         return Err(LaunchError::NotListening {
             addr: options.tcp,
             secs: SECS,
             log: tail_log(&options.data_dir, 20),
         });
     }
+    // The child outlives us; reap it in the background so it never lingers
+    // as a zombie under our pid (kill -0 would otherwise still see it as
+    // alive after it exits, since nothing else waits on it).
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(pid)
 }
 
@@ -207,18 +215,53 @@ impl PidFile {
         let _ = fs::remove_file(Self::path(data_dir));
     }
 
-    pub fn is_alive(&self) -> bool {
+    /// `false` when the process is gone. A `kill` that could not be run at all is an
+    /// error rather than "dead"; [`PidFile::is_alive`] flattens it for callers that
+    /// only want the happy path.
+    pub fn alive(&self) -> Result<bool, LaunchError> {
         #[cfg(unix)]
         {
             // kill -0 semantics via /bin/kill keeps us libc-free.
-            Command::new("kill")
+            Ok(Command::new("kill")
                 .arg("-0")
                 .arg(self.pid.to_string())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
+                .status()?
+                .success())
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(false)
+        }
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.alive().unwrap_or(false)
+    }
+
+    /// Does this pid actually belong to a conchd? Pids are recycled, so a pid file
+    /// left behind by a crash can name someone else's process entirely.
+    pub fn is_conchd(&self) -> bool {
+        #[cfg(unix)]
+        {
+            let Ok(output) = Command::new("ps")
+                .arg("-o")
+                .arg("comm=")
+                .arg("-p")
+                .arg(self.pid.to_string())
+                .stderr(Stdio::null())
+                .output()
+            else {
+                return false;
+            };
+            if !output.status.success() {
+                return false;
+            }
+            // macOS prints the full executable path, Linux the (truncated) command name.
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .ends_with("conchd")
         }
         #[cfg(not(unix))]
         {
@@ -226,7 +269,16 @@ impl PidFile {
         }
     }
 
+    /// SIGTERM the process and wait for it to go. A pid that is alive but is not a
+    /// conchd is never signalled: the caller gets [`LaunchError::PidMismatch`] and
+    /// should treat the pid file as stale.
     pub fn stop(&self, timeout: Duration) -> Result<(), LaunchError> {
+        if !self.alive()? {
+            return Ok(());
+        }
+        if !self.is_conchd() {
+            return Err(LaunchError::PidMismatch { pid: self.pid });
+        }
         #[cfg(unix)]
         {
             Command::new("kill")
@@ -237,7 +289,7 @@ impl PidFile {
                 .status()?;
         }
         let deadline = Instant::now() + timeout;
-        while self.is_alive() {
+        while self.alive()? {
             if Instant::now() >= deadline {
                 return Err(LaunchError::StopTimeout {
                     pid: self.pid,

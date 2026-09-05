@@ -67,3 +67,21 @@ fn pid_file_round_trips_and_detects_dead_process() {
     assert!(!read.is_alive());
     assert!(PidFile::read(&PathBuf::from("/nonexistent")).is_none());
 }
+
+#[test]
+fn stop_refuses_a_pid_that_is_not_a_conchd() {
+    // A stale pid file whose pid has been recycled by an unrelated process: the
+    // process is alive, but it is this test binary, not a conchd. `stop` must
+    // never signal it.
+    let file = PidFile {
+        pid: std::process::id(),
+        tcp: "127.0.0.1:7421".parse().unwrap(),
+        http: "127.0.0.1:7420".parse().unwrap(),
+    };
+    assert!(file.is_alive());
+    let error = file.stop(Duration::from_secs(1)).unwrap_err();
+    assert!(
+        matches!(error, conch_launch::LaunchError::PidMismatch { pid } if pid == file.pid),
+        "{error}"
+    );
+}

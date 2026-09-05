@@ -90,6 +90,41 @@ fn up_spawns_and_down_stops() {
 }
 
 #[test]
+fn down_never_signals_a_recycled_pid_and_clears_the_stale_file() {
+    let data = TempDir::new().unwrap();
+    let (tcp, http, reserved) = reserve_ports();
+    drop(reserved);
+    // A pid file left by a crashed daemon whose pid has since been recycled by an
+    // unrelated process — here, the test harness itself.
+    PidFile {
+        pid: std::process::id(),
+        tcp,
+        http,
+    }
+    .write(data.path())
+    .unwrap();
+    let down = conch(&data, tcp, http, &["down"]);
+    assert!(
+        down.status.success(),
+        "{}",
+        String::from_utf8_lossy(&down.stderr)
+    );
+    let out = String::from_utf8_lossy(&down.stdout);
+    assert!(out.contains("conchd is not running"), "{out}");
+    assert!(
+        PidFile::read(data.path()).is_none(),
+        "stale pid file removed"
+    );
+    // The unrelated process is untouched.
+    assert!(PidFile {
+        pid: std::process::id(),
+        tcp,
+        http
+    }
+    .is_alive());
+}
+
+#[test]
 fn status_auto_spawns_on_default_node_and_says_so() {
     let data = TempDir::new().unwrap();
     let _guard = DaemonGuard::new(data.path());
