@@ -197,7 +197,8 @@ pub struct SpawnOptions {
 }
 
 /// Spawn `conchd --localhost` in its own session with stdout/stderr appended to the log.
-/// Returns the pid once the TCP port accepts connections.
+/// Returns the pid once the TCP port accepts connections and the daemon has published
+/// its pid file.
 pub fn spawn_detached(options: &SpawnOptions) -> Result<u32, LaunchError> {
     if let Some(existing) = PidFile::read(&options.data_dir) {
         // A live pid that belongs to some other program means the pid was recycled:

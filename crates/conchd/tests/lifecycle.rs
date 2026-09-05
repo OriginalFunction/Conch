@@ -60,6 +60,27 @@ fn reserve_ports() -> (SocketAddr, SocketAddr, (TcpListener, TcpListener)) {
     (addrs.0, addrs.1, (tcp, http))
 }
 
+/// Reserve a fresh pair of ports and hand them to `start`, retrying when the daemon
+/// could not bind one of them.
+///
+/// The reservation has to be released before conchd can take the port, and in that
+/// window anything on the machine may claim it — the daemon then exits with "address
+/// already in use". That is a property of the harness, not of the code under test, so
+/// the test picks another pair rather than failing.
+fn with_daemon_ports(
+    mut start: impl FnMut(SocketAddr, SocketAddr) -> bool,
+) -> (SocketAddr, SocketAddr) {
+    for attempt in 1..=4 {
+        let (tcp, http, reserved) = reserve_ports();
+        drop(reserved);
+        if start(tcp, http) {
+            return (tcp, http);
+        }
+        assert!(attempt < 4, "conchd could not bind any reserved port pair");
+    }
+    unreachable!("the loop either returns or asserts")
+}
+
 /// Stops whatever the pid file names when the test ends, so a failing assertion
 /// never leaks a daemon.
 struct DaemonGuard(PathBuf);
@@ -121,15 +142,22 @@ async fn version_request_reports_daemon_version() {
 async fn a_daemon_that_cannot_bind_leaves_the_running_daemon_alone() {
     let data = TempDir::new().unwrap();
     let _guard = DaemonGuard::new(data.path());
-    let (tcp, http, reserved) = reserve_ports();
-    let options = SpawnOptions {
-        conchd: PathBuf::from(env!("CARGO_BIN_EXE_conchd")),
-        data_dir: data.path().to_path_buf(),
-        tcp,
-        http,
-    };
-    drop(reserved);
-    let first = spawn_detached(&options).unwrap();
+    let mut first = 0;
+    let (tcp, http) = with_daemon_ports(|tcp, http| {
+        let options = SpawnOptions {
+            conchd: PathBuf::from(env!("CARGO_BIN_EXE_conchd")),
+            data_dir: data.path().to_path_buf(),
+            tcp,
+            http,
+        };
+        match spawn_detached(&options) {
+            Ok(pid) => {
+                first = pid;
+                true
+            }
+            Err(_) => false,
+        }
+    });
 
     // A second daemon aimed at the same data dir and ports cannot bind.
     let second = Command::new(env!("CARGO_BIN_EXE_conchd"))
@@ -164,15 +192,21 @@ fn a_daemon_rebinds_its_port_straight_after_a_restart() {
     // cannot bind unless the listener asks for SO_REUSEADDR.
     let data = TempDir::new().unwrap();
     let _guard = DaemonGuard::new(data.path());
-    let (tcp, http, reserved) = reserve_ports();
+    let (tcp, http) = with_daemon_ports(|tcp, http| {
+        spawn_detached(&SpawnOptions {
+            conchd: PathBuf::from(env!("CARGO_BIN_EXE_conchd")),
+            data_dir: data.path().to_path_buf(),
+            tcp,
+            http,
+        })
+        .is_ok()
+    });
     let options = SpawnOptions {
         conchd: PathBuf::from(env!("CARGO_BIN_EXE_conchd")),
         data_dir: data.path().to_path_buf(),
         tcp,
         http,
     };
-    drop(reserved);
-    spawn_detached(&options).unwrap();
     // Still connected when the daemon goes: the daemon closes first, which is what
     // leaves its own listening port in TIME_WAIT.
     let held = std::net::TcpStream::connect(tcp).unwrap();
@@ -189,15 +223,27 @@ fn a_daemon_rebinds_its_port_straight_after_a_restart() {
 fn daemon_binary_writes_pid_file_and_removes_it_on_sigterm() {
     let data = TempDir::new().unwrap();
     let _guard = DaemonGuard::new(data.path());
-    let (tcp, http, reserved) = reserve_ports();
+    let mut pid = 0;
+    let (tcp, http) = with_daemon_ports(|tcp, http| {
+        match spawn_detached(&SpawnOptions {
+            conchd: PathBuf::from(env!("CARGO_BIN_EXE_conchd")),
+            data_dir: data.path().to_path_buf(),
+            tcp,
+            http,
+        }) {
+            Ok(started) => {
+                pid = started;
+                true
+            }
+            Err(_) => false,
+        }
+    });
     let options = SpawnOptions {
         conchd: PathBuf::from(env!("CARGO_BIN_EXE_conchd")),
         data_dir: data.path().to_path_buf(),
         tcp,
         http,
     };
-    drop(reserved);
-    let pid = spawn_detached(&options).unwrap();
     let file = PidFile::read(data.path()).expect("pid file written once listeners are bound");
     assert_eq!(file.pid, pid);
     assert_eq!(file.tcp, options.tcp);

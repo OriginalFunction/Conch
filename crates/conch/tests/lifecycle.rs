@@ -71,6 +71,27 @@ fn refused_addr() -> SocketAddr {
     "127.0.0.1:1".parse().expect("literal address")
 }
 
+/// Reserve a fresh pair of ports and hand them to `start`, retrying when the daemon
+/// could not bind one of them.
+///
+/// The reservation has to be released before conchd can take the port, and in that
+/// window anything on the machine may claim it — the daemon then exits with "address
+/// already in use". That is a property of the harness, not of the code under test, so
+/// the test picks another pair rather than failing.
+fn with_daemon_ports(
+    mut start: impl FnMut(SocketAddr, SocketAddr) -> bool,
+) -> (SocketAddr, SocketAddr) {
+    for attempt in 1..=4 {
+        let (tcp, http, reserved) = reserve_ports();
+        drop(reserved);
+        if start(tcp, http) {
+            return (tcp, http);
+        }
+        assert!(attempt < 4, "conchd could not bind any reserved port pair");
+    }
+    unreachable!("the loop either returns or asserts")
+}
+
 /// Stops whatever the pid file names when the test ends, so a failing assertion
 /// never leaks a daemon.
 struct DaemonGuard(PathBuf);
@@ -105,14 +126,14 @@ fn conch(data: &TempDir, tcp: SocketAddr, http: SocketAddr, args: &[&str]) -> st
 fn up_spawns_and_down_stops() {
     let data = TempDir::new().unwrap();
     let _guard = DaemonGuard::new(data.path());
-    let (tcp, http, reserved) = reserve_ports();
-    drop(reserved);
-    let up = conch(&data, tcp, http, &["up"]);
-    assert!(
-        up.status.success(),
-        "{}",
-        String::from_utf8_lossy(&up.stderr)
-    );
+    let mut up = None;
+    let (tcp, http) = with_daemon_ports(|tcp, http| {
+        let output = conch(&data, tcp, http, &["up"]);
+        let started = output.status.success();
+        up = Some(output);
+        started
+    });
+    let up = up.expect("with_daemon_ports ran the closure");
     let out = String::from_utf8_lossy(&up.stdout);
     assert!(out.contains(&format!("http://{http}/")), "{out}");
     let pid = PidFile::read(data.path()).unwrap_or_else(|| {
@@ -196,33 +217,35 @@ fn up_service_installs_unit_without_hand_spawn() {
     let home = TempDir::new().unwrap();
     let data = TempDir::new().unwrap();
     let _guard = DaemonGuard::new(data.path());
-    let (tcp, http, reserved) = reserve_ports();
-    let (stub, record, started_pid) = service_manager_stub(&data, tcp, http);
-    drop(reserved);
-
-    let up = Command::new(env!("CARGO_BIN_EXE_conch"))
-        .args(["up", "--service"])
-        .env("HOME", home.path())
-        .env("CONCH_DATA_DIR", data.path())
-        .env("CONCH_CONCHD", conchd_binary())
-        .env("CONCH_DEFAULT_TCP", tcp.to_string())
-        .env("CONCH_DEFAULT_HTTP", http.to_string())
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                stub.path().display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
-        .env_remove("CONCH_NODE")
-        .output()
-        .unwrap();
-    assert!(
-        up.status.success(),
-        "{}",
-        String::from_utf8_lossy(&up.stderr)
-    );
+    let mut stub_files = None;
+    let mut up = None;
+    let (_tcp, http) = with_daemon_ports(|tcp, http| {
+        let (stub, record, started_pid) = service_manager_stub(&data, tcp, http);
+        let output = Command::new(env!("CARGO_BIN_EXE_conch"))
+            .args(["up", "--service"])
+            .env("HOME", home.path())
+            .env("CONCH_DATA_DIR", data.path())
+            .env("CONCH_CONCHD", conchd_binary())
+            .env("CONCH_DEFAULT_TCP", tcp.to_string())
+            .env("CONCH_DEFAULT_HTTP", http.to_string())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    stub.path().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CONCH_NODE")
+            .output()
+            .unwrap();
+        let started = output.status.success();
+        stub_files = Some((stub, record, started_pid));
+        up = Some(output);
+        started
+    });
+    let (_stub, record, started_pid) = stub_files.expect("with_daemon_ports ran the closure");
+    let up = up.expect("with_daemon_ports ran the closure");
 
     // The unit was written under the temp HOME and handed to the service manager.
     let unit = if cfg!(target_os = "macos") {
@@ -294,14 +317,14 @@ fn down_never_signals_a_recycled_pid_and_clears_the_stale_file() {
 fn status_auto_spawns_on_default_node_and_says_so() {
     let data = TempDir::new().unwrap();
     let _guard = DaemonGuard::new(data.path());
-    let (tcp, http, reserved) = reserve_ports();
-    drop(reserved);
-    let status = conch(&data, tcp, http, &["status"]);
-    assert!(
-        status.status.success(),
-        "{}",
-        String::from_utf8_lossy(&status.stderr)
-    );
+    let mut status = None;
+    with_daemon_ports(|tcp, http| {
+        let output = conch(&data, tcp, http, &["status"]);
+        let started = output.status.success();
+        status = Some(output);
+        started
+    });
+    let status = status.expect("with_daemon_ports ran the closure");
     assert!(String::from_utf8_lossy(&status.stderr).contains("conch: started conchd (pid "));
     assert!(String::from_utf8_lossy(&status.stdout).contains("\"rooms\""));
     PidFile::read(data.path())
@@ -318,31 +341,35 @@ fn mcp_auto_spawns_on_default_node() {
 
     let data = TempDir::new().unwrap();
     let _guard = DaemonGuard::new(data.path());
-    let (tcp, http, reserved) = reserve_ports();
-    drop(reserved);
-
-    let mut child = Command::new(env!("CARGO_BIN_EXE_conch"))
-        .args(["--agent", "agent:mcp", "mcp"])
-        .env("CONCH_DATA_DIR", data.path())
-        .env("CONCH_CONCHD", conchd_binary())
-        .env("CONCH_DEFAULT_TCP", tcp.to_string())
-        .env("CONCH_DEFAULT_HTTP", http.to_string())
-        .env_remove("CONCH_NODE")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    stdin
-        .write_all(
-            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}
+    let mut result = None;
+    with_daemon_ports(|tcp, http| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_conch"))
+            .args(["--agent", "agent:mcp", "mcp"])
+            .env("CONCH_DATA_DIR", data.path())
+            .env("CONCH_CONCHD", conchd_binary())
+            .env("CONCH_DEFAULT_TCP", tcp.to_string())
+            .env("CONCH_DEFAULT_HTTP", http.to_string())
+            .env_remove("CONCH_NODE")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"status","arguments":{}}}
 "#,
-        )
-        .unwrap();
-    drop(stdin);
-    let output = child.wait_with_output().unwrap();
+            )
+            .unwrap();
+        drop(stdin);
+        let output = child.wait_with_output().unwrap();
+        let started = PidFile::read(data.path()).is_some();
+        result = Some(output);
+        started
+    });
+    let output = result.expect("with_daemon_ports ran the closure");
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{err}");
 

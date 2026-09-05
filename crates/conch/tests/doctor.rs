@@ -70,6 +70,27 @@ fn refused_addr() -> SocketAddr {
     "127.0.0.1:1".parse().expect("literal address")
 }
 
+/// Reserve a fresh pair of ports and hand them to `start`, retrying when the daemon
+/// could not bind one of them.
+///
+/// The reservation has to be released before conchd can take the port, and in that
+/// window anything on the machine may claim it — the daemon then exits with "address
+/// already in use". That is a property of the harness, not of the code under test, so
+/// the test picks another pair rather than failing.
+fn with_daemon_ports(
+    mut start: impl FnMut(SocketAddr, SocketAddr) -> bool,
+) -> (SocketAddr, SocketAddr) {
+    for attempt in 1..=4 {
+        let (tcp, http, reserved) = reserve_ports();
+        drop(reserved);
+        if start(tcp, http) {
+            return (tcp, http);
+        }
+        assert!(attempt < 4, "conchd could not bind any reserved port pair");
+    }
+    unreachable!("the loop either returns or asserts")
+}
+
 /// Stops whatever the pid file names when the test ends, so a failing assertion
 /// never leaks a daemon.
 struct DaemonGuard(PathBuf);
@@ -198,31 +219,20 @@ fn doctor_fails_without_a_daemon_and_names_the_remedy() {
 fn doctor_passes_with_daemon_and_reports_hosts() {
     let (home, data) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     let _guard = DaemonGuard::new(data.path());
-    let (tcp, http, reserved) = reserve_ports();
     // configure one host and start a daemon
     setup(&home, "cursor");
-    drop(reserved);
-    let up = Command::new(env!("CARGO_BIN_EXE_conch"))
-        .arg("up")
-        .env("CONCH_DATA_DIR", data.path())
-        .env("CONCH_CONCHD", conchd_binary())
-        .env("CONCH_DEFAULT_TCP", tcp.to_string())
-        .env("CONCH_DEFAULT_HTTP", http.to_string())
-        .env_remove("CONCH_NODE")
-        .output()
-        .unwrap();
-    assert!(
-        up.status.success(),
-        "up on {tcp}/{http} failed: {}\nlisteners:\n{}",
-        String::from_utf8_lossy(&up.stderr),
-        String::from_utf8_lossy(
-            &Command::new("lsof")
-                .args(["-nP", "-iTCP", "-sTCP:LISTEN"])
-                .output()
-                .map(|o| o.stdout)
-                .unwrap_or_default()
-        )
-    );
+    let (tcp, _http) = with_daemon_ports(|tcp, http| {
+        Command::new(env!("CARGO_BIN_EXE_conch"))
+            .arg("up")
+            .env("CONCH_DATA_DIR", data.path())
+            .env("CONCH_CONCHD", conchd_binary())
+            .env("CONCH_DEFAULT_TCP", tcp.to_string())
+            .env("CONCH_DEFAULT_HTTP", http.to_string())
+            .env_remove("CONCH_NODE")
+            .status()
+            .unwrap()
+            .success()
+    });
     let output = doctor(&home, &data, tcp);
     let out = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(0), "{out}");
