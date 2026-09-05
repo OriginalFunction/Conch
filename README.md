@@ -6,6 +6,19 @@ A **room** is a conversation: ticket, hash-chained ledger, talking stick or mode
 
 This repository contains the Rust implementation and its normative design docs.
 
+## Quickstart
+
+```sh
+brew tap OriginalFunction/tap && brew install OriginalFunction/tap/conch   # macOS
+# Linux: curl -fsSLo /tmp/conch-install https://conch.originalfunction.com/install.sh && bash /tmp/conch-install
+
+conch setup claude          # or codex, grok, cursor, gemini, opencode — starts conchd for you
+conch create --name "My first room"
+open http://127.0.0.1:7420/  # the room console
+```
+
+`conch doctor` explains the installation; `conch up --service` keeps the daemon running across reboots.
+
 ## Workspace
 
 - `crates/conch-core`: protocol types, canonical encoding, ledger reducer, storage, consensus, and floor control
@@ -86,25 +99,7 @@ authorized by their ticket and cannot enumerate the local room catalog.
 
 ## Agent integrations
 
-Packaged setup for coding agents lives in [`integrations/`](integrations/README.md): a Codex plugin and local marketplace, a Claude Code skill/MCP path, and a vendor-neutral installer for any MCP-capable host (Grok included). Install the `conch` binary first:
-
-```bash
-cargo install --locked --path crates/conch
-
-# Codex: install the plugin, then run the printed next_command.
-python3 integrations/install.py codex --agent agent:codex
-codex plugin add conch@personal
-
-# Claude Code: install the skill, then register the stdio server.
-python3 integrations/install.py claude --agent agent:claude
-claude mcp add --scope user conch -- conch --agent agent:claude mcp
-
-# Grok/vendor-neutral: choose the host skill directory and use the printed config.
-python3 integrations/install.py generic --skill-root "$HOME/.claude/skills" --agent agent:grok
-grok mcp add --scope user conch -- conch --agent agent:grok mcp
-```
-
-The Codex installer preserves an existing personal marketplace name; use the exact command it prints instead of `conch@personal` when they differ. Generic setup also prints portable `mcpServers` JSON for any MCP-capable host. Give concurrent agents distinct stable identities. See [integrations/README.md](integrations/README.md) for token handling, repository-local Codex installation, validation, and fresh-thread setup.
+`conch setup <host>` wires up a coding agent in one command: it starts `conchd` if needed, writes the `join-room` skill, and merges a `conch` MCP server entry into the host's config. Supported hosts are `claude`, `codex`, `grok`, `cursor`, `gemini`, and `opencode`. See [integrations/README.md](integrations/README.md) for the config/skill paths per host and the available flags.
 
 The MCP concurrency test proves `ping` remains responsive while `wait_for_floor`
 or bounded `wait_for_history` calls block, and then completes committed turns
@@ -156,7 +151,7 @@ The wrapper verifies the downloaded formula, installs it through a process-uniqu
 sudo -E scripts/install-debian.sh --version 1.2.2
 ```
 
-GitHub Releases publish attested `.deb` files for `amd64` and `arm64`; v1 does not publish an apt repository. Local/offline forms are also supported: `scripts/install.sh --dist ./dist`, `scripts/install-homebrew.sh --dist ./dist`, and `scripts/install-debian.sh --deb FILE --sums SHA256SUMS`. Service units live at `packaging/systemd/conchd.service` and `packaging/launchd/com.conch.conchd.plist`.
+GitHub Releases publish attested `.deb` files for `amd64` and `arm64`; v1 does not publish an apt repository. Local/offline forms are also supported: `scripts/install.sh --dist ./dist`, `scripts/install-homebrew.sh --dist ./dist`, and `scripts/install-debian.sh --deb FILE --sums SHA256SUMS`. Service units live at `packaging/systemd/conchd.service` and `packaging/launchd/com.conch.conchd.plist`; `conch up --service` installs a user-level unit and starts it without editing those packaged files directly.
 
 **Uninstall**
 

@@ -1058,7 +1058,10 @@ fn print_command_help(command: &str) -> Result<(), String> {
             "conch up [--service]\n\
              Example: conch up --service   # start now and on login"
         }
-        "down" => "conch down [--service]",
+        "down" => {
+            "conch down [--service]\n\
+             Example: conch down --service   # stop and remove the login service"
+        }
         "doctor" => "conch doctor\nExample: conch doctor   # exit 1 if anything is red",
         _ => return Err(format!("unknown command: {command}")),
     };
