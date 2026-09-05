@@ -224,7 +224,54 @@ async fn run_local(command: LocalCommand) -> Result<(), Box<dyn std::error::Erro
             }
             Ok(())
         }
+        LocalCommand::Doctor => {
+            let addr: SocketAddr = default_tcp().parse()?;
+            let daemon = if conch_launch::wait_for_port(addr, std::time::Duration::from_millis(300))
+            {
+                let version = probe_version(addr).await;
+                conch::doctor::DaemonProbe::Reachable { addr, version }
+            } else {
+                conch::doctor::DaemonProbe::Unreachable { addr }
+            };
+            let checks = conch::doctor::run_checks(&conch::doctor::DoctorInput {
+                cli_version: env!("CARGO_PKG_VERSION").into(),
+                conch_binary: env::current_exe()?,
+                daemon,
+                data_dir: conch_launch::default_data_dir(),
+                home: env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .ok_or("HOME is not set")?,
+                current_room: read_current_room(),
+            });
+            print!("{}", conch::doctor::render(&checks));
+            if conch::doctor::failed(&checks) {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
     }
+}
+
+/// Ask a reachable daemon for its version; `None` when it predates the request.
+async fn probe_version(addr: SocketAddr) -> Option<String> {
+    let mut stream = TcpStream::connect(addr).await.ok()?;
+    write_frame(
+        &mut stream,
+        &ClientRequest::Attach {
+            agent: AgentId::new("agent:doctor").ok()?,
+        },
+    )
+    .await
+    .ok()?;
+    let attached: ClientReply = read_frame(&mut stream).await.ok()?;
+    if !attached.ok {
+        return None;
+    }
+    write_frame(&mut stream, &ClientRequest::Version)
+        .await
+        .ok()?;
+    let reply: ClientReply = read_frame(&mut stream).await.ok()?;
+    reply.data?.get("version")?.as_str().map(String::from)
 }
 
 async fn wait_for_pid_file_gone(
@@ -349,6 +396,7 @@ enum LocalCommand {
     Down {
         service: bool,
     },
+    Doctor,
 }
 
 impl ParsedRequest {
@@ -930,6 +978,12 @@ impl Arguments {
                     LocalCommand::Down { service }
                 })
             }
+            "doctor" => {
+                if arguments.next().is_some() {
+                    return Err("unknown doctor argument".into());
+                }
+                ParsedRequest::Local(LocalCommand::Doctor)
+            }
             _ => return Err(format!("unknown command: {command}")),
         };
         if arguments.next().is_some() {
@@ -965,7 +1019,7 @@ fn print_help() {
          Commands:\n\
            create, join, status, history, raise-hand, wait-for-floor\n\
            speak, yield, grant, yank, config, breakout, blob, leave, mcp, setup\n\
-           up, down\n\n\
+           up, down, doctor\n\n\
          Run `conch help <command>` for command-specific usage.",
         env!("CARGO_PKG_VERSION")
     );
@@ -1005,6 +1059,7 @@ fn print_command_help(command: &str) -> Result<(), String> {
              Example: conch up --service   # start now and on login"
         }
         "down" => "conch down [--service]",
+        "doctor" => "conch doctor\nExample: conch doctor   # exit 1 if anything is red",
         _ => return Err(format!("unknown command: {command}")),
     };
     println!("{usage}");
