@@ -89,6 +89,127 @@ fn up_spawns_and_down_stops() {
     assert!(PidFile::read(data.path()).is_none());
 }
 
+/// A fake `launchctl`/`systemctl` that records its argv and, for the "start it now"
+/// verb, launches conchd itself — standing in for the service manager without ever
+/// touching the real one. Returns (stub directory, argv log, pid the stub started).
+fn service_manager_stub(
+    data: &TempDir,
+    tcp: SocketAddr,
+    http: SocketAddr,
+) -> (TempDir, PathBuf, PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let record = dir.path().join("argv.log");
+    let started_pid = dir.path().join("started.pid");
+    let name = if cfg!(target_os = "macos") {
+        "launchctl"
+    } else {
+        "systemctl"
+    };
+    let script = format!(
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$*\" >> '{record}'\n\
+         case \"$*\" in\n\
+         \x20 *bootstrap*|*'enable --now'*)\n\
+         \x20   '{conchd}' --localhost --data-dir '{data}' --tcp {tcp} --http {http} \
+         </dev/null >> '{log}' 2>&1 &\n\
+         \x20   printf '%s\\n' \"$!\" > '{started_pid}'\n\
+         \x20   ;;\n\
+         esac\n\
+         exit 0\n",
+        record = record.display(),
+        conchd = conchd_binary().display(),
+        data = data.path().display(),
+        tcp = tcp,
+        http = http,
+        log = data.path().join("conchd.log").display(),
+        started_pid = started_pid.display(),
+    );
+    let path = dir.path().join(name);
+    fs::write(&path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    (dir, record, started_pid)
+}
+
+fn conchd_processes_for(data: &TempDir) -> usize {
+    let output = Command::new("pgrep")
+        .arg("-f")
+        .arg(data.path().display().to_string())
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+}
+
+#[test]
+fn up_service_installs_unit_without_hand_spawn() {
+    let home = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    let _guard = DaemonGuard::new(data.path());
+    let (tcp, http, reserved) = reserve_ports();
+    let (stub, record, started_pid) = service_manager_stub(&data, tcp, http);
+    drop(reserved);
+
+    let up = Command::new(env!("CARGO_BIN_EXE_conch"))
+        .args(["up", "--service"])
+        .env("HOME", home.path())
+        .env("CONCH_DATA_DIR", data.path())
+        .env("CONCH_CONCHD", conchd_binary())
+        .env("CONCH_DEFAULT_TCP", tcp.to_string())
+        .env("CONCH_DEFAULT_HTTP", http.to_string())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                stub.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env_remove("CONCH_NODE")
+        .output()
+        .unwrap();
+    assert!(
+        up.status.success(),
+        "{}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+
+    // The unit was written under the temp HOME and handed to the service manager.
+    let unit = if cfg!(target_os = "macos") {
+        home.path()
+            .join("Library/LaunchAgents/com.conch.conchd.plist")
+    } else {
+        home.path().join(".config/systemd/user/conchd.service")
+    };
+    assert!(unit.is_file(), "unit not written to {}", unit.display());
+    let calls = fs::read_to_string(&record).unwrap();
+    assert!(
+        calls.contains("bootstrap") || calls.contains("enable --now"),
+        "{calls}"
+    );
+
+    // Exactly one conchd is running, and it is the one the service manager started —
+    // `up --service` must not hand-spawn a daemon the unit would then fight with.
+    let by_service: u32 = fs::read_to_string(&started_pid)
+        .expect("stub started a daemon")
+        .trim()
+        .parse()
+        .unwrap();
+    let pid = PidFile::read(data.path()).expect("pid file from the service-started daemon");
+    assert_eq!(pid.pid, by_service, "the daemon was hand-spawned as well");
+    assert!(pid.is_alive());
+    assert_eq!(conchd_processes_for(&data), 1);
+
+    let out = String::from_utf8_lossy(&up.stdout);
+    assert!(out.contains(&format!("http://{http}/")), "{out}");
+    assert!(out.contains(&format!("pid {by_service}")), "{out}");
+}
+
 #[test]
 fn down_never_signals_a_recycled_pid_and_clears_the_stale_file() {
     let data = TempDir::new().unwrap();

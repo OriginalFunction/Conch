@@ -1,6 +1,7 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     path::{Path, PathBuf},
+    process::Command,
     time::Duration,
 };
 
@@ -81,6 +82,46 @@ async fn version_request_reports_daemon_version() {
     assert!(reply.ok);
     assert_eq!(reply.data.unwrap()["version"], env!("CARGO_PKG_VERSION"));
     server.abort();
+}
+
+#[tokio::test]
+async fn a_daemon_that_cannot_bind_leaves_the_running_daemon_alone() {
+    let data = TempDir::new().unwrap();
+    let _guard = DaemonGuard::new(data.path());
+    let (tcp, http, reserved) = reserve_ports();
+    let options = SpawnOptions {
+        conchd: PathBuf::from(env!("CARGO_BIN_EXE_conchd")),
+        data_dir: data.path().to_path_buf(),
+        tcp,
+        http,
+    };
+    drop(reserved);
+    let first = spawn_detached(&options).unwrap();
+
+    // A second daemon aimed at the same data dir and ports cannot bind.
+    let second = Command::new(env!("CARGO_BIN_EXE_conchd"))
+        .arg("--localhost")
+        .arg("--data-dir")
+        .arg(data.path())
+        .arg("--tcp")
+        .arg(tcp.to_string())
+        .arg("--http")
+        .arg(http.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        !second.status.success(),
+        "second daemon should refuse to start: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    // It must not have taken over, or deleted, the running daemon's pid file.
+    let file = PidFile::read(data.path()).expect("first daemon's pid file survives");
+    assert_eq!(file.pid, first);
+    assert!(file.is_alive());
+    let reply = request(tcp, &ClientRequest::Version).await;
+    assert!(reply.ok);
+    assert_eq!(reply.data.unwrap()["version"], env!("CARGO_PKG_VERSION"));
 }
 
 #[test]

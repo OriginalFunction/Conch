@@ -108,32 +108,49 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let daemon = Daemon::open(data_dir.clone())?;
     let client = load_client_tls(tls_ca.as_deref())?;
-    let pid_file = conch_launch::PidFile {
+
+    // Bind before claiming the pid file. A second daemon aimed at the same data
+    // dir must fail on the listener and exit without ever having touched the
+    // running daemon's file.
+    let tls = if mode == TransportMode::Public {
+        let cert = tls_cert.expect("validated TLS certificate");
+        let key = tls_key.expect("validated TLS key");
+        validate_private_key_mode(&key)?;
+        Some(load_server_tls(&cert, &key)?)
+    } else {
+        None
+    };
+    daemon.configure_transport(mode, Some(client))?;
+    for endpoint in advertised {
+        daemon.advertise(&endpoint)?;
+    }
+    let mut tcp_server = match &tls {
+        Some(server) => daemon.start_tls(tcp, Arc::clone(server)).await?,
+        None => daemon.start(tcp).await?,
+    };
+    let mut http_server = match &tls {
+        // axum_server binds inside `serve`; the TCP listener above is the one
+        // clients and `conch up` actually probe.
+        Some(_) => None,
+        None => Some(daemon.start_http(http).await?),
+    };
+
+    conch_launch::PidFile {
         pid: std::process::id(),
         tcp,
         http,
-    };
-    pid_file.write(&data_dir)?;
+    }
+    .write(&data_dir)?;
+
     let serve = async {
-        if mode == TransportMode::Public {
-            let cert = tls_cert.expect("validated TLS certificate");
-            let key = tls_key.expect("validated TLS key");
-            validate_private_key_mode(&key)?;
-            let server = load_server_tls(&cert, &key)?;
-            daemon.configure_transport(mode, Some(client))?;
-            for endpoint in advertised {
-                daemon.advertise(&endpoint)?;
+        match (&mut http_server, tls) {
+            (Some(http_server), _) => {
+                tokio::try_join!(tcp_server.wait(), http_server.wait())?;
             }
-            tokio::try_join!(
-                daemon.serve_tls(tcp, Arc::clone(&server)),
-                daemon.serve_http_tls(http, server)
-            )?;
-        } else {
-            daemon.configure_transport(mode, Some(client))?;
-            for endpoint in advertised {
-                daemon.advertise(&endpoint)?;
+            (None, Some(server)) => {
+                tokio::try_join!(tcp_server.wait(), daemon.serve_http_tls(http, server))?;
             }
-            tokio::try_join!(daemon.serve(tcp), daemon.serve_http(http))?;
+            (None, None) => unreachable!("plaintext mode always starts an HTTP listener"),
         }
         Ok::<(), Box<dyn std::error::Error>>(())
     };
@@ -141,7 +158,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         result = serve => result,
         () = shutdown_signal() => Ok(()),
     };
-    conch_launch::PidFile::remove(&data_dir);
+    // Only ever remove a pid file we still own: another daemon may have taken
+    // over the data dir while this one was running.
+    if conch_launch::PidFile::read(&data_dir).is_some_and(|file| file.pid == std::process::id()) {
+        conch_launch::PidFile::remove(&data_dir);
+    }
     result
 }
 

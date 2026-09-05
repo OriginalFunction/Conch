@@ -227,6 +227,12 @@ impl RunningHttpServer {
     pub fn abort(&self) {
         self.task.abort();
     }
+
+    /// Run the HTTP server to completion. Lets a caller bind first — so nothing
+    /// externally visible is claimed until the listener is up — and serve after.
+    pub async fn wait(&mut self) -> Result<(), DaemonError> {
+        Ok((&mut self.task).await??)
+    }
 }
 
 impl Drop for RunningHttpServer {

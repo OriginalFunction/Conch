@@ -189,19 +189,45 @@ async fn run_local(command: LocalCommand) -> Result<(), Box<dyn std::error::Erro
         LocalCommand::Up { service } => {
             let options = spawn_options()?;
             let data_dir = options.data_dir.clone();
-            let http = options.http;
-            let spawn_result =
-                tokio::task::spawn_blocking(move || conch_launch::spawn_detached(&options)).await?;
-            match spawn_result {
-                Ok(pid) => println!(
-                    "conchd running (pid {pid})\nlog: {}\nui:  http://{http}/",
-                    conch_launch::log_path(&data_dir).display()
-                ),
-                Err(conch_launch::LaunchError::AlreadyRunning { .. }) if service => {}
-                Err(error) => return Err(error.into()),
+            let (tcp, http) = (options.tcp, options.http);
+            if !service {
+                let pid =
+                    tokio::task::spawn_blocking(move || conch_launch::spawn_detached(&options))
+                        .await??;
+                print_running(pid, &data_dir, http);
+                return Ok(());
             }
-            if service {
-                conch::service::install(&conch_launch::locate_conchd()?, &data_dir)?;
+
+            // Homebrew owns its own unit; say so and change nothing.
+            if conch::service::is_homebrew(&options.conchd) {
+                conch::service::install(&options.conchd, &data_dir)?;
+                return Ok(());
+            }
+            // The unit starts conchd itself, with KeepAlive/Restart=always. Hand-spawning
+            // one as well would leave the unit's daemon unable to bind, exiting, and being
+            // restarted forever, so stop whatever is running and let the unit own it.
+            if conch_launch::wait_for_port(tcp, std::time::Duration::from_millis(300)) {
+                if let Some(existing) = conch_launch::PidFile::read(&data_dir) {
+                    match existing.stop(std::time::Duration::from_secs(5)) {
+                        Ok(()) | Err(conch_launch::LaunchError::PidMismatch { .. }) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                conch_launch::PidFile::remove(&data_dir);
+            }
+            conch::service::install(&options.conchd, &data_dir)?;
+            const SECS: u64 = 5;
+            if !conch_launch::wait_for_port(tcp, std::time::Duration::from_secs(SECS)) {
+                return Err(format!(
+                    "the service unit was installed but conchd did not start listening on \
+                     {tcp} within {SECS}s; last log lines:\n{}",
+                    conch_launch::tail_log(&data_dir, 20)
+                )
+                .into());
+            }
+            match conch_launch::PidFile::read(&data_dir) {
+                Some(pid) => print_running(pid.pid, &data_dir, http),
+                None => println!("conchd running\nui:  http://{http}/"),
             }
             Ok(())
         }
@@ -264,6 +290,13 @@ async fn run_local(command: LocalCommand) -> Result<(), Box<dyn std::error::Erro
             Ok(())
         }
     }
+}
+
+fn print_running(pid: u32, data_dir: &std::path::Path, http: SocketAddr) {
+    println!(
+        "conchd running (pid {pid})\nlog: {}\nui:  http://{http}/",
+        conch_launch::log_path(data_dir).display()
+    );
 }
 
 /// Ask a reachable daemon for its version; `None` when it predates the request.

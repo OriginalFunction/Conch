@@ -334,6 +334,12 @@ impl RunningServer {
     pub fn abort(&self) {
         self.task.abort();
     }
+
+    /// Run the accept loop to completion. Lets a caller bind first — so nothing
+    /// externally visible is claimed until the listener is up — and serve after.
+    pub async fn wait(&mut self) -> Result<(), DaemonError> {
+        (&mut self.task).await?
+    }
 }
 
 impl Drop for RunningServer {
