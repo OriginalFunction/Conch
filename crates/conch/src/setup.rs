@@ -2,6 +2,7 @@
 
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -125,6 +126,9 @@ pub fn run(options: &SetupOptions) -> Result<SetupReport, SetupError> {
         .and_then(|t| skill_version(&t))
         != Some(options.version.clone());
 
+    // Host configs hold credentials. Whatever mode the file already had is the mode
+    // it keeps, in the rewrite and in the backup beside it.
+    let config_mode = file_mode(&config_path);
     let mut backup_path = None;
     if !options.dry_run {
         if config_changed {
@@ -134,18 +138,19 @@ pub fn run(options: &SetupOptions) -> Result<SetupReport, SetupError> {
                     config_path.file_name().unwrap().to_string_lossy()
                 ));
                 if !backup.exists() {
-                    fs::write(&backup, original)?;
+                    write_atomic(&backup, original, config_mode)?;
                     backup_path = Some(backup);
                 }
             }
             if let Some(parent) = config_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            write_atomic(&config_path, &merged)?;
+            write_atomic(&config_path, &merged, config_mode)?;
         }
         if skill_changed {
             fs::create_dir_all(skill_path.parent().unwrap())?;
-            write_atomic(&skill_path, &wanted_skill)?;
+            let skill_mode = file_mode(&skill_path);
+            write_atomic(&skill_path, &wanted_skill, skill_mode)?;
         }
     }
     Ok(SetupReport {
@@ -159,9 +164,45 @@ pub fn run(options: &SetupOptions) -> Result<SetupReport, SetupError> {
     })
 }
 
-fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+/// The existing file's permission bits, or `None` when it does not exist yet (in which
+/// case the process umask decides, as for any newly created file).
+fn file_mode(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return fs::metadata(path)
+            .ok()
+            .map(|meta| meta.permissions().mode() & 0o7777);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Replace `path` in one step. The temporary is created with `mode` from the outset so
+/// its contents are never briefly readable by anyone the original excluded.
+fn write_atomic(path: &Path, text: &str, mode: Option<u32>) -> std::io::Result<()> {
     let tmp = path.with_extension("conch-tmp");
-    fs::write(&tmp, text)?;
+    let _ = fs::remove_file(&tmp);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    let mut file = options.open(&tmp)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    // `create_new(true)` applies the umask on top of `mode`; restore the exact bits.
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
+    }
     fs::rename(&tmp, path)
 }
 

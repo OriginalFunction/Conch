@@ -128,6 +128,32 @@ fn malformed_config_is_refused_and_fallback_printed() {
     );
 }
 
+#[cfg(unix)]
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_keeps_the_configs_own_mode_and_writes_the_backup_the_same_way() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = TempDir::new().unwrap();
+    let config = home.path().join(".claude.json");
+    // Host configs hold API credentials; people lock them down and setup must not
+    // hand them back to the rest of the machine.
+    fs::write(&config, "{\n  \"other\": 1\n}\n").unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+
+    ok(&conch(home.path(), home.path(), &["setup", "claude"]));
+
+    assert_eq!(mode_of(&config), 0o600, "config mode preserved");
+    let backup = home.path().join(".claude.json.conch-bak");
+    assert!(backup.is_file());
+    assert_eq!(mode_of(&backup), 0o600, "backup is not world-readable");
+    assert!(!home.path().join(".claude.conch-tmp").exists());
+}
+
 #[test]
 fn dry_run_writes_nothing_and_shows_a_diff() {
     let home = TempDir::new().unwrap();
