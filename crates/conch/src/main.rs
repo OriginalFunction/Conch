@@ -308,7 +308,13 @@ fn stable_binary_path() -> Option<PathBuf> {
     let argv0 = env::args_os().next();
     let exe = env::current_exe().ok();
     let path = env::var_os("PATH");
-    conch::setup::stable_binary_path_from(argv0.as_deref(), exe.as_deref(), path.as_deref())
+    let cwd = env::current_dir().ok();
+    conch::setup::stable_binary_path_from(
+        argv0.as_deref(),
+        exe.as_deref(),
+        path.as_deref(),
+        cwd.as_deref(),
+    )
 }
 
 fn print_running(pid: u32, data_dir: &std::path::Path, http: SocketAddr) {

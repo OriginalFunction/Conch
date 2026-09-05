@@ -76,18 +76,33 @@ fn args_for(agent: &str) -> Vec<String> {
 /// `current_exe` resolves symlinks, which turns `/opt/homebrew/bin/conch` into a
 /// versioned `/opt/homebrew/Cellar/conch/1.2.2/bin/conch` that the next upgrade
 /// deletes. When the name the process was invoked under resolves to the same file,
-/// that unresolved path is the stable one and is preferred.
+/// that unresolved path is the stable one and is preferred. A relative invocation
+/// (`./target/debug/conch`) is anchored to `cwd` so the recorded path is always
+/// absolute; without a `cwd` it falls back to the resolved executable.
 pub fn stable_binary_path_from(
     argv0: Option<&std::ffi::OsStr>,
     current_exe: Option<&Path>,
     path: Option<&std::ffi::OsStr>,
+    cwd: Option<&Path>,
 ) -> Option<PathBuf> {
     let exe = current_exe?;
     let canonical = fs::canonicalize(exe).ok();
     if let (Some(argv0), Some(canonical)) = (argv0, canonical.as_deref()) {
         let argv0 = Path::new(argv0);
-        let candidates: Vec<PathBuf> = if argv0.components().count() > 1 {
+        let candidates: Vec<PathBuf> = if argv0.is_absolute() {
             vec![argv0.to_path_buf()]
+        } else if argv0.components().count() > 1 {
+            // `./bin/conch` → `<cwd>/bin/conch`: anchor it, dropping the `.` segments.
+            cwd.map(|cwd| {
+                let mut anchored = cwd.to_path_buf();
+                anchored.extend(
+                    argv0
+                        .components()
+                        .filter(|component| !matches!(component, std::path::Component::CurDir)),
+                );
+                vec![anchored]
+            })
+            .unwrap_or_default()
         } else {
             path.map(|path| {
                 std::env::split_paths(path)
@@ -323,7 +338,12 @@ mod tests {
         let path = std::env::join_paths([dir.path()]).unwrap();
 
         assert_eq!(
-            stable_binary_path_from(Some(std::ffi::OsStr::new("conch")), Some(&exe), Some(&path)),
+            stable_binary_path_from(
+                Some(std::ffi::OsStr::new("conch")),
+                Some(&exe),
+                Some(&path),
+                None
+            ),
             Some(link)
         );
         // Nothing on PATH resolves to it: keep the resolved path.
@@ -333,11 +353,48 @@ mod tests {
             stable_binary_path_from(
                 Some(std::ffi::OsStr::new("conch")),
                 Some(&exe),
-                Some(&empty_path)
+                Some(&empty_path),
+                None
             ),
             Some(exe.clone())
         );
-        assert_eq!(stable_binary_path_from(None, None, None), None);
+        assert_eq!(stable_binary_path_from(None, None, None, None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_invocation_is_recorded_as_an_absolute_path() {
+        let exe = std::env::current_exe().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("bin")).unwrap();
+        let link = dir.path().join("bin/conch");
+        std::os::unix::fs::symlink(&exe, &link).unwrap();
+
+        // Invoked as `./bin/conch` from `dir`: keep the symlink, drop the relativity.
+        assert_eq!(
+            stable_binary_path_from(
+                Some(std::ffi::OsStr::new("./bin/conch")),
+                Some(&exe),
+                None,
+                Some(dir.path())
+            ),
+            Some(link.clone())
+        );
+        // Absolute invocations are kept verbatim.
+        assert_eq!(
+            stable_binary_path_from(Some(link.as_os_str()), Some(&exe), None, None),
+            Some(link)
+        );
+        // A relative name with no cwd to anchor it falls back to the resolved path.
+        assert_eq!(
+            stable_binary_path_from(
+                Some(std::ffi::OsStr::new("./bin/conch")),
+                Some(&exe),
+                None,
+                None
+            ),
+            Some(exe)
+        );
     }
 
     #[test]
