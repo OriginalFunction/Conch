@@ -135,10 +135,14 @@ pub fn spawn_detached(options: &SpawnOptions) -> Result<u32, LaunchError> {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let child = command.spawn()?;
+    let mut child = command.spawn()?;
     let pid = child.id();
-    // Do not wait on the child: it outlives us.
-    std::mem::forget(child);
+    // The child outlives us; reap it in the background so it never lingers
+    // as a zombie under our pid (kill -0 would otherwise still see it as
+    // alive after it exits, since nothing else waits on it).
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     const SECS: u64 = 5;
     if !wait_for_port(options.tcp, Duration::from_secs(SECS)) {
         return Err(LaunchError::NotListening {

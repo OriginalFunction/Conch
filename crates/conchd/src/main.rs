@@ -106,29 +106,59 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--tls-cert and --tls-key require --mode public".into());
     }
 
-    let daemon = Daemon::open(data_dir)?;
+    let daemon = Daemon::open(data_dir.clone())?;
     let client = load_client_tls(tls_ca.as_deref())?;
-    if mode == TransportMode::Public {
-        let cert = tls_cert.expect("validated TLS certificate");
-        let key = tls_key.expect("validated TLS key");
-        validate_private_key_mode(&key)?;
-        let server = load_server_tls(&cert, &key)?;
-        daemon.configure_transport(mode, Some(client))?;
-        for endpoint in advertised {
-            daemon.advertise(&endpoint)?;
+    let pid_file = conch_launch::PidFile {
+        pid: std::process::id(),
+        tcp,
+        http,
+    };
+    pid_file.write(&data_dir)?;
+    let serve = async {
+        if mode == TransportMode::Public {
+            let cert = tls_cert.expect("validated TLS certificate");
+            let key = tls_key.expect("validated TLS key");
+            validate_private_key_mode(&key)?;
+            let server = load_server_tls(&cert, &key)?;
+            daemon.configure_transport(mode, Some(client))?;
+            for endpoint in advertised {
+                daemon.advertise(&endpoint)?;
+            }
+            tokio::try_join!(
+                daemon.serve_tls(tcp, Arc::clone(&server)),
+                daemon.serve_http_tls(http, server)
+            )?;
+        } else {
+            daemon.configure_transport(mode, Some(client))?;
+            for endpoint in advertised {
+                daemon.advertise(&endpoint)?;
+            }
+            tokio::try_join!(daemon.serve(tcp), daemon.serve_http(http))?;
         }
-        tokio::try_join!(
-            daemon.serve_tls(tcp, Arc::clone(&server)),
-            daemon.serve_http_tls(http, server)
-        )?;
-    } else {
-        daemon.configure_transport(mode, Some(client))?;
-        for endpoint in advertised {
-            daemon.advertise(&endpoint)?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    };
+    let result = tokio::select! {
+        result = serve => result,
+        () = shutdown_signal() => Ok(()),
+    };
+    conch_launch::PidFile::remove(&data_dir);
+    result
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
         }
-        tokio::try_join!(daemon.serve(tcp), daemon.serve_http(http))?;
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn print_help() {

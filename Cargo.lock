@@ -317,6 +317,7 @@ dependencies = [
  "axum",
  "axum-server",
  "conch-core",
+ "conch-launch",
  "ed25519-dalek",
  "futures-util",
  "hex",

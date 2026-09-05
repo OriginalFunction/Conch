@@ -3069,6 +3069,7 @@ impl Daemon {
                     .await
             }
             ClientRequest::Status { room } => self.client_status(room),
+            ClientRequest::Version => Ok(json!({ "version": env!("CARGO_PKG_VERSION") })),
             ClientRequest::Attach { .. } => Err(DaemonError::Protocol("duplicate attach")),
             ClientRequest::History { follow: true, .. } => {
                 Err(DaemonError::Protocol("follow must use the streaming path"))
@@ -6308,6 +6309,7 @@ fn request_room(request: &ClientRequest) -> Option<RoomId> {
         | ClientRequest::History { room, .. }
         | ClientRequest::WaitForHistory { room, .. } => Some(*room),
         ClientRequest::Status { room } => *room,
+        ClientRequest::Version => None,
         ClientRequest::Attach { .. }
         | ClientRequest::Create { .. }
         | ClientRequest::Join { .. } => None,

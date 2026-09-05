@@ -85,6 +85,7 @@ pub enum ClientRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         room: Option<RoomId>,
     },
+    Version,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
