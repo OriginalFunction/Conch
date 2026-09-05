@@ -190,13 +190,19 @@ async fn run_local(command: LocalCommand) -> Result<(), Box<dyn std::error::Erro
             let options = spawn_options()?;
             let data_dir = options.data_dir.clone();
             let http = options.http;
-            let pid = tokio::task::spawn_blocking(move || conch_launch::spawn_detached(&options))
-                .await??;
-            println!(
-                "conchd running (pid {pid})\nlog: {}\nui:  http://{http}/",
-                conch_launch::log_path(&data_dir).display()
-            );
-            let _ = service; // wired in Task 7
+            let spawn_result =
+                tokio::task::spawn_blocking(move || conch_launch::spawn_detached(&options)).await?;
+            match spawn_result {
+                Ok(pid) => println!(
+                    "conchd running (pid {pid})\nlog: {}\nui:  http://{http}/",
+                    conch_launch::log_path(&data_dir).display()
+                ),
+                Err(conch_launch::LaunchError::AlreadyRunning { .. }) if service => {}
+                Err(error) => return Err(error.into()),
+            }
+            if service {
+                conch::service::install(&conch_launch::locate_conchd()?, &data_dir)?;
+            }
             Ok(())
         }
         LocalCommand::Down { service } => {
@@ -213,7 +219,9 @@ async fn run_local(command: LocalCommand) -> Result<(), Box<dyn std::error::Erro
                 }
                 _ => println!("conchd is not running"),
             }
-            let _ = service; // wired in Task 7
+            if service {
+                conch::service::uninstall(&data_dir)?;
+            }
             Ok(())
         }
     }

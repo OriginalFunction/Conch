@@ -10,9 +10,9 @@
     <string>--localhost</string>
   </array>
   <key>RunAtLoad</key>
-  <false/>
+  <true/>
   <key>KeepAlive</key>
-  <false/>
+  <true/>
   <key>StandardOutPath</key>
   <string>/usr/local/var/log/conchd.log</string>
   <key>StandardErrorPath</key>
