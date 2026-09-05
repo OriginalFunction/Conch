@@ -44,6 +44,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(Into::into);
     }
+    if let ParsedRequest::Local(command) = request {
+        return run_local(command).await;
+    }
     let follow = matches!(
         &request,
         ParsedRequest::Ready(request)
@@ -115,6 +118,67 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn run_local(command: LocalCommand) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        LocalCommand::Setup {
+            host,
+            agent,
+            scope,
+            env,
+            dry_run,
+        } => {
+            if env::var_os("CONCH_SETUP_SKIP_DAEMON").is_none() {
+                ensure_daemon().await?;
+            }
+            let home = env::var_os("HOME")
+                .map(PathBuf::from)
+                .ok_or("HOME is not set")?;
+            let report = conch::setup::run(&conch::setup::SetupOptions {
+                host,
+                agent: agent.unwrap_or_else(|| host.default_agent()),
+                scope,
+                env,
+                dry_run,
+                home,
+                cwd: env::current_dir()?,
+                conch_binary: env::current_exe()?,
+                version: env!("CARGO_PKG_VERSION").into(),
+            })?;
+            if dry_run {
+                print!("{}", report.diff);
+                println!("(dry run) skill → {}", report.skill_path.display());
+                return Ok(());
+            }
+            match (report.config_changed, report.skill_changed) {
+                (false, false) => println!(
+                    "{}: already configured ({})",
+                    host.name(),
+                    report.config_path.display()
+                ),
+                _ => {
+                    println!(
+                        "{}: wrote {}{}",
+                        host.name(),
+                        report.config_path.display(),
+                        report
+                            .backup_path
+                            .as_ref()
+                            .map(|b| format!(" (backup {})", b.display()))
+                            .unwrap_or_default()
+                    );
+                    println!("skill → {}", report.skill_path.display());
+                }
+            }
+            println!("{}", report.next_step);
+            Ok(())
+        }
+    }
+}
+
+async fn ensure_daemon() -> Result<(), Box<dyn std::error::Error>> {
+    Ok(())
+}
+
 async fn fetch_ticket(
     source: &str,
     token: Option<Hash32>,
@@ -154,6 +218,17 @@ enum ParsedRequest {
     },
     Mcp {
         room: Option<RoomId>,
+    },
+    Local(LocalCommand),
+}
+
+enum LocalCommand {
+    Setup {
+        host: conch::hosts::Host,
+        agent: Option<String>,
+        scope: conch::hosts::Scope,
+        env: conch::hosts::Env,
+        dry_run: bool,
     },
 }
 
@@ -218,6 +293,9 @@ impl ParsedRequest {
                 ))
             }
             Self::Mcp { .. } => unreachable!("MCP is handled before client request resolution"),
+            Self::Local(_) => {
+                unreachable!("local commands are handled before client request resolution")
+            }
         }
     }
 }
@@ -673,6 +751,49 @@ impl Arguments {
                     .transpose()
                     .map_err(|error| format!("invalid room id: {error}"))?,
             },
+            "setup" => {
+                let host_name = arguments.next().ok_or(
+                    "setup requires a host: claude, codex, grok, cursor, gemini, opencode",
+                )?;
+                let host = conch::hosts::Host::parse(&host_name).ok_or_else(|| {
+                    format!(
+                        "unknown host {host_name}; expected one of claude, codex, grok, cursor, gemini, opencode"
+                    )
+                })?;
+                let mut agent_override = None;
+                let mut scope = conch::hosts::Scope::User;
+                let mut env = conch::hosts::Env::default();
+                let mut dry_run = false;
+                while let Some(flag) = arguments.next() {
+                    match flag.as_str() {
+                        "--agent" => {
+                            agent_override =
+                                Some(arguments.next().ok_or("--agent requires a name")?)
+                        }
+                        "--scope" => {
+                            scope = match arguments.next().as_deref() {
+                                Some("user") => conch::hosts::Scope::User,
+                                Some("project") => conch::hosts::Scope::Project,
+                                _ => return Err("--scope must be user or project".into()),
+                            }
+                        }
+                        "--env" => {
+                            let pair = arguments.next().ok_or("--env requires KEY=VALUE")?;
+                            let (k, v) = pair.split_once('=').ok_or("--env requires KEY=VALUE")?;
+                            env.0.push((k.to_string(), v.to_string()));
+                        }
+                        "--dry-run" => dry_run = true,
+                        _ => return Err(format!("unknown setup argument: {flag}")),
+                    }
+                }
+                ParsedRequest::Local(LocalCommand::Setup {
+                    host,
+                    agent: agent_override,
+                    scope,
+                    env,
+                    dry_run,
+                })
+            }
             _ => return Err(format!("unknown command: {command}")),
         };
         if arguments.next().is_some() {
@@ -704,7 +825,7 @@ fn print_help() {
            -h, --help            Print help\n\n\
          Commands:\n\
            create, join, status, history, raise-hand, wait-for-floor\n\
-           speak, yield, grant, yank, config, breakout, blob, leave, mcp\n\n\
+           speak, yield, grant, yank, config, breakout, blob, leave, mcp, setup\n\n\
          Run `conch help <command>` for command-specific usage.",
         env!("CARGO_PKG_VERSION")
     );
@@ -735,6 +856,10 @@ fn print_command_help(command: &str) -> Result<(), String> {
         "blob" => "conch --room ID blob put FILE",
         "leave" => "conch --room ID leave [--vacate]",
         "mcp" => "conch [--room ID] --agent ID mcp",
+        "setup" => {
+            "conch setup <claude|codex|grok|cursor|gemini|opencode> [--agent ID] [--scope user|project] [--env K=V ...] [--dry-run]\n\
+             Example: conch setup claude"
+        }
         _ => return Err(format!("unknown command: {command}")),
     };
     println!("{usage}");
