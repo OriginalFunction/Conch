@@ -243,7 +243,7 @@ impl Drop for RunningHttpServer {
 
 impl Daemon {
     pub async fn start_http(&self, addr: SocketAddr) -> Result<RunningHttpServer, DaemonError> {
-        let listener = TcpListener::bind(addr).await?;
+        let listener = crate::tcp::bind_listener(addr).await?;
         let addr = listener.local_addr()?;
         self.remember_http_addr(addr)?;
         let operator = self.transport_mode() == TransportMode::Local && addr.ip().is_loopback();
@@ -263,7 +263,7 @@ impl Daemon {
     }
 
     pub async fn serve_http(&self, addr: SocketAddr) -> Result<(), DaemonError> {
-        let listener = TcpListener::bind(addr).await?;
+        let listener = crate::tcp::bind_listener(addr).await?;
         let addr = listener.local_addr()?;
         self.remember_http_addr(addr)?;
         let operator = self.transport_mode() == TransportMode::Local && addr.ip().is_loopback();

@@ -244,8 +244,18 @@ pub fn spawn_detached(options: &SpawnOptions) -> Result<u32, LaunchError> {
         });
     }
     // Bound listeners come before the pid file, so callers that read it next
-    // (`conch up`, `doctor`) would otherwise race the daemon's own startup.
-    let _ = wait_for_pid_file(&options.data_dir, Duration::from_secs(SECS));
+    // (`conch up`, `doctor`) would otherwise race the daemon's own startup. A daemon
+    // that never publishes one did not finish starting — typically because a second
+    // listener could not bind — and must not be reported as running.
+    if wait_for_pid_file(&options.data_dir, Duration::from_secs(SECS)).is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(LaunchError::NotListening {
+            addr: options.tcp,
+            secs: SECS,
+            log: tail_log(&options.data_dir, 20),
+        });
+    }
     // The child outlives us; reap it in the background so it never lingers
     // as a zombie under our pid (kill -0 would otherwise still see it as
     // alive after it exits, since nothing else waits on it).

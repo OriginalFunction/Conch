@@ -39,7 +39,7 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpSocket, TcpStream},
     sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore},
     task::{self, JoinError, JoinHandle, JoinSet},
     time::{interval, sleep, timeout, Duration, Instant, MissedTickBehavior},
@@ -324,6 +324,23 @@ pub(crate) enum ConnectionProtocol {
     Tcp { allow_client: bool },
     Swarm,
     Client { allowed_room: RoomId },
+}
+
+/// Bind a listener with `SO_REUSEADDR`.
+///
+/// Without it, connections accepted by a listener that has just closed sit in
+/// TIME_WAIT still holding the port, so a daemon restarted straight away — exactly what
+/// `conch down && conch up` does — fails to rebind. It does not permit two live
+/// listeners on the same port: a second daemon still gets "address already in use".
+pub(crate) async fn bind_listener(addr: SocketAddr) -> Result<TcpListener, DaemonError> {
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    Ok(socket.listen(1024)?)
 }
 
 impl RunningServer {
@@ -1011,7 +1028,7 @@ impl Daemon {
     }
 
     pub async fn start(&self, addr: SocketAddr) -> Result<RunningServer, DaemonError> {
-        let listener = TcpListener::bind(addr).await?;
+        let listener = bind_listener(addr).await?;
         let addr = listener.local_addr()?;
         self.remember_addr(addr)?;
         let daemon = self.clone();
@@ -1020,7 +1037,7 @@ impl Daemon {
     }
 
     pub async fn serve(&self, addr: SocketAddr) -> Result<(), DaemonError> {
-        let listener = TcpListener::bind(addr).await?;
+        let listener = bind_listener(addr).await?;
         self.remember_addr(listener.local_addr()?)?;
         self.clone().serve_listener(listener).await
     }
@@ -1030,7 +1047,7 @@ impl Daemon {
         addr: SocketAddr,
         config: Arc<ServerConfig>,
     ) -> Result<(), DaemonError> {
-        let listener = TcpListener::bind(addr).await?;
+        let listener = bind_listener(addr).await?;
         self.remember_secure_addr(listener.local_addr()?)?;
         self.clone()
             .serve_tls_listener(listener, TlsAcceptor::from(config))
@@ -1042,7 +1059,7 @@ impl Daemon {
         addr: SocketAddr,
         config: Arc<ServerConfig>,
     ) -> Result<RunningServer, DaemonError> {
-        let listener = TcpListener::bind(addr).await?;
+        let listener = bind_listener(addr).await?;
         let addr = listener.local_addr()?;
         self.remember_secure_addr(addr)?;
         let daemon = self.clone();

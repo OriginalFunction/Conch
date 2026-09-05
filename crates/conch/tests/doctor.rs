@@ -3,6 +3,7 @@ use std::{
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process::Command,
+    sync::Mutex,
     time::Duration,
 };
 
@@ -21,13 +22,52 @@ fn conchd_binary() -> PathBuf {
     sibling
 }
 
-/// Two loopback ports that stay reserved until the caller drops the listeners, closing
-/// the window in which another test (or anything else on the machine) could take them.
+/// Two loopback ports for a daemon this test is about to start.
+///
+/// They come from below the ephemeral range (macOS hands out 49152 and up), because an
+/// ephemeral port is offered to unrelated processes the instant the reservation is
+/// released — and it has to be released before conchd can bind it. The cursor only ever
+/// walks forward, so no port is issued twice in this binary; its starting band is
+/// derived from both the clock and the pid, so binaries running side by side do not
+/// overlap and a port is not offered again for minutes. The listeners stay bound until
+/// the caller drops them, immediately before the daemon runs.
 fn reserve_ports() -> (SocketAddr, SocketAddr, (TcpListener, TcpListener)) {
-    let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
-    let http = TcpListener::bind("127.0.0.1:0").unwrap();
+    static NEXT: Mutex<Option<u16>> = Mutex::new(None);
+    let mut next = NEXT.lock().expect("port cursor is not poisoned");
+    let cursor = next.get_or_insert_with(|| {
+        // The band advances with the clock as well as the pid, so a port is not offered
+        // again for several minutes. A daemon that has just been stopped can leave a
+        // connection endpoint on its listening port for tens of seconds, and that
+        // outlives a scheme that only cycles through a few bands.
+        let seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after the epoch")
+            .as_secs();
+        20_000 + ((seconds + std::process::id() as u64) % 600) as u16 * 30
+    });
+    let mut chosen = Vec::new();
+    while chosen.len() < 2 {
+        let candidate = *cursor;
+        *cursor = if candidate >= 38_999 {
+            20_000
+        } else {
+            candidate + 1
+        };
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", candidate)) {
+            chosen.push(listener);
+        }
+    }
+    let http = chosen.pop().expect("two ports");
+    let tcp = chosen.pop().expect("two ports");
     let addrs = (tcp.local_addr().unwrap(), http.local_addr().unwrap());
     (addrs.0, addrs.1, (tcp, http))
+}
+
+/// An address whose connection is always refused: nothing may bind a port below 1024
+/// without root, and nothing listens on port 1. Tests that need "no daemon here" use
+/// this rather than a released ephemeral port, which anything on the machine may take.
+fn refused_addr() -> SocketAddr {
+    "127.0.0.1:1".parse().expect("literal address")
 }
 
 /// Stops whatever the pid file names when the test ends, so a failing assertion
@@ -49,8 +89,8 @@ impl Drop for DaemonGuard {
 }
 
 fn doctor(home: &TempDir, data: &TempDir, tcp: SocketAddr) -> std::process::Output {
-    let (_unused, http, reserved) = reserve_ports();
-    drop(reserved);
+    // `doctor` never connects to the HTTP address; it only has to be set.
+    let http = refused_addr();
     Command::new(env!("CARGO_BIN_EXE_conch"))
         .arg("doctor")
         .env("HOME", home.path())
@@ -107,8 +147,7 @@ fn doctor_names_a_duplicate_install_once_when_path_repeats_a_directory() {
     let (home, data) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     let other = TempDir::new().unwrap();
     fs::write(other.path().join("conch"), "#!/bin/sh\n").unwrap();
-    let (dead, _http, reserved) = reserve_ports();
-    drop(reserved);
+    let dead = refused_addr();
     let repeated = format!("{0}:{0}", other.path().display());
     let output = Command::new(env!("CARGO_BIN_EXE_conch"))
         .arg("doctor")
@@ -136,8 +175,7 @@ fn doctor_distinguishes_an_unversioned_skill_from_a_missing_one() {
     let skill = home.path().join(".claude/skills/join-room/SKILL.md");
     // A copy written before skills carried a version marker.
     fs::write(&skill, "---\nname: join-room\n---\n\n# Join a room\n").unwrap();
-    let (dead, _http, reserved) = reserve_ports();
-    drop(reserved);
+    let dead = refused_addr();
     let out = String::from_utf8_lossy(&doctor(&home, &data, dead).stdout).into_owned();
     assert!(
         out.contains("warn  claude        agent:claude, skill unversioned (pre-1.3)"),
@@ -148,11 +186,10 @@ fn doctor_distinguishes_an_unversioned_skill_from_a_missing_one() {
 #[test]
 fn doctor_fails_without_a_daemon_and_names_the_remedy() {
     let (home, data) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-    let (dead, _http, reserved) = reserve_ports();
-    drop(reserved);
+    let dead = refused_addr();
     let output = doctor(&home, &data, dead);
-    assert_eq!(output.status.code(), Some(1));
     let out = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{dead}\n{out}");
     assert!(out.contains("fail  daemon"), "{out}");
     assert!(out.contains("conch up"), "{out}");
 }
@@ -165,16 +202,27 @@ fn doctor_passes_with_daemon_and_reports_hosts() {
     // configure one host and start a daemon
     setup(&home, "cursor");
     drop(reserved);
-    assert!(Command::new(env!("CARGO_BIN_EXE_conch"))
+    let up = Command::new(env!("CARGO_BIN_EXE_conch"))
         .arg("up")
         .env("CONCH_DATA_DIR", data.path())
         .env("CONCH_CONCHD", conchd_binary())
         .env("CONCH_DEFAULT_TCP", tcp.to_string())
         .env("CONCH_DEFAULT_HTTP", http.to_string())
         .env_remove("CONCH_NODE")
-        .status()
-        .unwrap()
-        .success());
+        .output()
+        .unwrap();
+    assert!(
+        up.status.success(),
+        "up on {tcp}/{http} failed: {}\nlisteners:\n{}",
+        String::from_utf8_lossy(&up.stderr),
+        String::from_utf8_lossy(
+            &Command::new("lsof")
+                .args(["-nP", "-iTCP", "-sTCP:LISTEN"])
+                .output()
+                .map(|o| o.stdout)
+                .unwrap_or_default()
+        )
+    );
     let output = doctor(&home, &data, tcp);
     let out = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(0), "{out}");
@@ -203,8 +251,7 @@ fn doctor_flags_a_recorded_command_that_no_longer_exists() {
     );
     fs::write(&config, rewritten).unwrap();
 
-    let (dead, _http, reserved) = reserve_ports();
-    drop(reserved);
+    let dead = refused_addr();
     let out = String::from_utf8_lossy(&doctor(&home, &data, dead).stdout).into_owned();
     assert!(
         out.contains(
@@ -227,8 +274,7 @@ fn doctor_flags_a_stale_skill() {
             .replace(env!("CARGO_PKG_VERSION"), "0.0.1"),
     )
     .unwrap();
-    let (dead, _http, reserved) = reserve_ports();
-    drop(reserved);
+    let dead = refused_addr();
     let out = String::from_utf8_lossy(&doctor(&home, &data, dead).stdout).into_owned();
     assert!(
         out.contains("warn  claude        agent:claude, skill 0.0.1 is stale"),

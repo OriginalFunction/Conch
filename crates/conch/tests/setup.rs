@@ -3,6 +3,7 @@ use std::{
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process::Command,
+    sync::Mutex,
     time::Duration,
 };
 
@@ -22,11 +23,43 @@ fn conchd_binary() -> PathBuf {
     sibling
 }
 
-/// Two loopback ports that stay reserved until the caller drops the listeners, closing
-/// the window in which another test (or anything else on the machine) could take them.
+/// Two loopback ports for a daemon this test is about to start.
+///
+/// They come from below the ephemeral range (macOS hands out 49152 and up), because an
+/// ephemeral port is offered to unrelated processes the instant the reservation is
+/// released — and it has to be released before conchd can bind it. The cursor only ever
+/// walks forward, so no port is issued twice in this binary; its starting band is
+/// derived from both the clock and the pid, so binaries running side by side do not
+/// overlap and a port is not offered again for minutes. The listeners stay bound until
+/// the caller drops them, immediately before the daemon runs.
 fn reserve_ports() -> (SocketAddr, SocketAddr, (TcpListener, TcpListener)) {
-    let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
-    let http = TcpListener::bind("127.0.0.1:0").unwrap();
+    static NEXT: Mutex<Option<u16>> = Mutex::new(None);
+    let mut next = NEXT.lock().expect("port cursor is not poisoned");
+    let cursor = next.get_or_insert_with(|| {
+        // The band advances with the clock as well as the pid, so a port is not offered
+        // again for several minutes. A daemon that has just been stopped can leave a
+        // connection endpoint on its listening port for tens of seconds, and that
+        // outlives a scheme that only cycles through a few bands.
+        let seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after the epoch")
+            .as_secs();
+        20_000 + ((seconds + std::process::id() as u64) % 600) as u16 * 30
+    });
+    let mut chosen = Vec::new();
+    while chosen.len() < 2 {
+        let candidate = *cursor;
+        *cursor = if candidate >= 38_999 {
+            20_000
+        } else {
+            candidate + 1
+        };
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", candidate)) {
+            chosen.push(listener);
+        }
+    }
+    let http = chosen.pop().expect("two ports");
+    let tcp = chosen.pop().expect("two ports");
     let addrs = (tcp.local_addr().unwrap(), http.local_addr().unwrap());
     (addrs.0, addrs.1, (tcp, http))
 }
