@@ -4475,8 +4475,16 @@ impl Daemon {
     fn client_status(&self, room: Option<RoomId>) -> Result<Value, DaemonError> {
         if let Some(room) = room {
             let replay = self.replay(room)?;
+            let name = replay
+                .history
+                .first()
+                .and_then(|first| match &first.scene.body {
+                    Body::Genesis { name, .. } => Some(name.clone()),
+                    _ => None,
+                });
             return Ok(json!({
                 "room": room,
+                "name": name,
                 "node": self.node_id(),
                 "head_n": replay.chain.head_n,
                 "head_hash": replay.chain.head_hash,

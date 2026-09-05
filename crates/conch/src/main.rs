@@ -286,10 +286,13 @@ async fn run_local(command: LocalCommand) -> Result<(), Box<dyn std::error::Erro
             // doctor exists to report a broken install; every input it cannot get is a
             // check that fails, never a reason to print nothing.
             let node = default_tcp();
+            let room_id = read_current_room();
+            let mut room_head = None;
             let daemon = match node.parse::<SocketAddr>() {
                 Ok(addr) => {
                     if conch_launch::wait_for_port(addr, std::time::Duration::from_millis(300)) {
-                        let version = probe_version(addr).await;
+                        let (version, head) = probe_daemon(addr, room_id.as_deref()).await;
+                        room_head = head;
                         conch::doctor::DaemonProbe::Reachable { addr, version }
                     } else {
                         conch::doctor::DaemonProbe::Unreachable { addr }
@@ -300,13 +303,17 @@ async fn run_local(command: LocalCommand) -> Result<(), Box<dyn std::error::Erro
                     error: error.to_string(),
                 },
             };
+            let current_room = room_id.map(|id| {
+                let (name, head) = room_head.unzip();
+                conch::doctor::CurrentRoom { id, name, head }
+            });
             let checks = conch::doctor::run_checks(&conch::doctor::DoctorInput {
                 cli_version: env!("CARGO_PKG_VERSION").into(),
                 conch_binary: stable_binary_path(),
                 daemon,
                 data_dir: conch_launch::default_data_dir(),
                 home: env::var_os("HOME").map(PathBuf::from),
-                current_room: read_current_room(),
+                current_room,
             });
             print!("{}", conch::doctor::render(&checks));
             if conch::doctor::failed(&checks) {
@@ -339,26 +346,52 @@ fn print_running(pid: u32, data_dir: &std::path::Path, http: SocketAddr) {
     );
 }
 
-/// Ask a reachable daemon for its version; `None` when it predates the request.
-async fn probe_version(addr: SocketAddr) -> Option<String> {
-    let mut stream = TcpStream::connect(addr).await.ok()?;
-    write_frame(
-        &mut stream,
-        &ClientRequest::Attach {
-            agent: AgentId::new("agent:doctor").ok()?,
-        },
-    )
-    .await
-    .ok()?;
-    let attached: ClientReply = read_frame(&mut stream).await.ok()?;
-    if !attached.ok {
-        return None;
-    }
-    write_frame(&mut stream, &ClientRequest::Version)
+/// Ask a reachable daemon for its version (`None` when it predates the request) and,
+/// given the current room, that room's name and head height.
+async fn probe_daemon(
+    addr: SocketAddr,
+    room: Option<&str>,
+) -> (Option<String>, Option<(String, u64)>) {
+    async fn probe(
+        addr: SocketAddr,
+        room: Option<&str>,
+    ) -> Option<(Option<String>, Option<(String, u64)>)> {
+        let mut stream = TcpStream::connect(addr).await.ok()?;
+        write_frame(
+            &mut stream,
+            &ClientRequest::Attach {
+                agent: AgentId::new("agent:doctor").ok()?,
+            },
+        )
         .await
         .ok()?;
-    let reply: ClientReply = read_frame(&mut stream).await.ok()?;
-    reply.data?.get("version")?.as_str().map(String::from)
+        let attached: ClientReply = read_frame(&mut stream).await.ok()?;
+        if !attached.ok {
+            return None;
+        }
+        write_frame(&mut stream, &ClientRequest::Version)
+            .await
+            .ok()?;
+        let reply: ClientReply = read_frame(&mut stream).await.ok()?;
+        let version = reply
+            .data
+            .as_ref()
+            .and_then(|data| data.get("version")?.as_str().map(String::from));
+        let Some(room) = room.and_then(|room| room.parse::<RoomId>().ok()) else {
+            return Some((version, None));
+        };
+        write_frame(&mut stream, &ClientRequest::Status { room: Some(room) })
+            .await
+            .ok()?;
+        let reply: ClientReply = read_frame(&mut stream).await.ok()?;
+        let head = reply.data.and_then(|data| {
+            let name = data.get("name")?.as_str()?.to_string();
+            let head_n = data.get("head_n")?.as_u64()?;
+            Some((name, head_n))
+        });
+        Some((version, head))
+    }
+    probe(addr, room).await.unwrap_or((None, None))
 }
 
 async fn wait_for_pid_file_gone(

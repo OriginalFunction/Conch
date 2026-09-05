@@ -35,7 +35,14 @@ pub struct DoctorInput {
     pub data_dir: PathBuf,
     /// `None` when `HOME` is not set.
     pub home: Option<PathBuf>,
-    pub current_room: Option<String>,
+    pub current_room: Option<CurrentRoom>,
+}
+
+pub struct CurrentRoom {
+    pub id: String,
+    /// Known only when the daemon answered a `status` request for the room.
+    pub name: Option<String>,
+    pub head: Option<u64>,
 }
 
 pub enum DaemonProbe {
@@ -138,8 +145,13 @@ pub fn run_checks(input: &DoctorInput) -> Vec<Check> {
             // program, tells us nothing about how this daemon was started.
             let conchd = conch_launch::PidFile::read(&input.data_dir)
                 .filter(|pid| pid.is_alive() && pid.is_conchd());
-            let how = if service::unit_installed() {
-                "service unit installed"
+            let how = match service::unit_state() {
+                service::UnitState::Loaded => "service unit loaded",
+                service::UnitState::Present => "service unit present but not loaded",
+                service::UnitState::Absent => "",
+            };
+            let how = if !how.is_empty() {
+                how
             } else if conchd.is_some()
                 && service::is_homebrew(&conch_launch::locate_conchd().ok().unwrap_or_default())
             {
@@ -149,7 +161,10 @@ pub fn run_checks(input: &DoctorInput) -> Vec<Check> {
             } else {
                 "unknown (no pid file)"
             };
-            let level = if how.starts_with("started by hand") || how.starts_with("unknown") {
+            let level = if how.starts_with("started by hand")
+                || how.starts_with("unknown")
+                || how.ends_with("not loaded")
+            {
                 Level::Warn
             } else {
                 Level::Ok
@@ -173,18 +188,30 @@ pub fn run_checks(input: &DoctorInput) -> Vec<Check> {
             };
             #[cfg(not(unix))]
             let mode = 0o700;
+            let free = free_space(&input.data_dir);
+            let free_text = free
+                .map(|bytes| format!(" ({} free)", human_bytes(bytes)))
+                .unwrap_or_default();
+            const LOW_WATER: u64 = 1024 * 1024 * 1024;
             if mode & 0o077 != 0 {
                 out.push(check(
                     Level::Warn,
                     "data dir",
-                    format!("{} mode {mode:o}", input.data_dir.display()),
+                    format!("{} mode {mode:o}{free_text}", input.data_dir.display()),
                     Some(format!("chmod 700 {}", input.data_dir.display())),
+                ));
+            } else if free.is_some_and(|bytes| bytes < LOW_WATER) {
+                out.push(check(
+                    Level::Warn,
+                    "data dir",
+                    format!("{}{free_text}", input.data_dir.display()),
+                    Some("free up disk space; every room's ledger and blobs live here".into()),
                 ));
             } else {
                 out.push(check(
                     Level::Ok,
                     "data dir",
-                    input.data_dir.display().to_string(),
+                    format!("{}{free_text}", input.data_dir.display()),
                     None,
                 ));
             }
@@ -198,7 +225,16 @@ pub fn run_checks(input: &DoctorInput) -> Vec<Check> {
     }
 
     match &input.current_room {
-        Some(room) => out.push(check(Level::Ok, "current room", room.clone(), None)),
+        Some(room) => {
+            let mut detail = room.id.clone();
+            if let Some(name) = &room.name {
+                detail.push_str(&format!(" \"{name}\""));
+            }
+            if let Some(head) = room.head {
+                detail.push_str(&format!(" head {head}"));
+            }
+            out.push(check(Level::Ok, "current room", detail, None));
+        }
         None => out.push(check(
             Level::Skip,
             "current room",
@@ -283,7 +319,8 @@ fn host_check(host: Host, home: &Path, cli_version: &str) -> Check {
     };
     // An entry that names a binary which is no longer there is worse than no entry:
     // the host reports a broken MCP server instead of an unconfigured one.
-    if let Some(command) = command.filter(|command| !Path::new(command).exists()) {
+    let path = env::var_os("PATH");
+    if let Some(command) = command.filter(|command| !command_exists(command, path.as_deref())) {
         return check(
             Level::Warn,
             host.name(),
@@ -307,6 +344,56 @@ fn host_check(host: Host, home: &Path, cli_version: &str) -> Check {
         detail,
         Some(format!("run `conch setup {}`", host.name())),
     )
+}
+
+/// A command with a path separator is checked where it points; a bare name (`conch`,
+/// `npx`) is looked up on PATH the way the host will look it up.
+fn command_exists(command: &str, path: Option<&std::ffi::OsStr>) -> bool {
+    if command.contains(std::path::MAIN_SEPARATOR) {
+        return Path::new(command).exists();
+    }
+    path.is_some_and(|path| env::split_paths(path).any(|dir| dir.join(command).is_file()))
+}
+
+/// Bytes available to this user on the filesystem holding `dir`, via `df -k`, which
+/// keeps the crate free of libc. `None` when `df` is unavailable or `dir` is missing.
+fn free_space(dir: &Path) -> Option<u64> {
+    let output = std::process::Command::new("df")
+        .arg("-k")
+        .arg(dir)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_df_available(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The "Available" column of `df -k` output (1K blocks), in bytes.
+fn parse_df_available(output: &str) -> Option<u64> {
+    let header = output.lines().next()?;
+    let column = header
+        .split_whitespace()
+        .position(|field| field.starts_with("Avail"))?;
+    let row = output.lines().nth(1)?;
+    let blocks: u64 = row.split_whitespace().nth(column)?.parse().ok()?;
+    Some(blocks * 1024)
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn agent_from_args(args: &[String]) -> Option<String> {
@@ -357,4 +444,44 @@ pub fn render(checks: &[Check]) -> String {
 
 pub fn failed(checks: &[Check]) -> bool {
     checks.iter().any(|c| c.level == Level::Fail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn df_output_yields_the_available_column_in_bytes() {
+        let macos = "Filesystem   1024-blocks       Used Available Capacity  iused      ifree %iused  Mounted on\n\
+                     /dev/disk3s5  1948455240 1764976088 137322744    93% 16685179 1373227440    1%   /System/Volumes/Data\n";
+        assert_eq!(parse_df_available(macos), Some(137_322_744 * 1024));
+        let linux = "Filesystem     1K-blocks      Used Available Use% Mounted on\n\
+                     /dev/nvme0n1p2 490691512 300000000 165000000  65% /\n";
+        assert_eq!(parse_df_available(linux), Some(165_000_000 * 1024));
+        assert_eq!(
+            parse_df_available("df: /nope: No such file or directory\n"),
+            None
+        );
+        assert_eq!(parse_df_available(""), None);
+    }
+
+    #[test]
+    fn free_space_is_rendered_in_human_units() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(140_618_489_856), "131.0 GB");
+        assert_eq!(human_bytes(1_500_000), "1.4 MB");
+    }
+
+    #[test]
+    fn a_bare_command_name_is_looked_up_on_path_and_a_path_is_checked_directly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tool = dir.path().join("tool");
+        fs::write(&tool, "").unwrap();
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        assert!(command_exists("tool", Some(&path)));
+        assert!(!command_exists("other", Some(&path)));
+        assert!(!command_exists("tool", None));
+        assert!(command_exists(&tool.display().to_string(), None));
+        assert!(!command_exists("/nonexistent/tool", Some(&path)));
+    }
 }

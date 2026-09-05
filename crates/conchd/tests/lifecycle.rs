@@ -254,3 +254,32 @@ fn daemon_binary_writes_pid_file_and_removes_it_on_sigterm() {
         "pid file removed on clean shutdown"
     );
 }
+
+#[tokio::test]
+async fn status_for_a_room_names_it() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let ticket = daemon
+        .create_ticket(
+            "Doctor Room",
+            conch_core::types::StakePolicy::default(),
+            conch_core::types::FloorConfig::stick(30),
+        )
+        .unwrap();
+    let server = daemon
+        .start(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .await
+        .unwrap();
+    let reply = request(
+        server.addr(),
+        &ClientRequest::Status {
+            room: Some(ticket.id),
+        },
+    )
+    .await;
+    assert!(reply.ok);
+    let data = reply.data.unwrap();
+    assert_eq!(data["name"], "Doctor Room");
+    assert_eq!(data["head_n"], 0);
+    server.abort();
+}

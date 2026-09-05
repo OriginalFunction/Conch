@@ -291,3 +291,196 @@ fn doctor_flags_a_stale_skill() {
         "{out}"
     );
 }
+
+/// Rewrite cursor's recorded command to the bare name `conch`, as a hand-written
+/// entry or a `claude mcp add conch` would leave it.
+fn record_bare_command(home: &TempDir) {
+    let config = home.path().join(".cursor/mcp.json");
+    let rewritten = fs::read_to_string(&config)
+        .unwrap()
+        .replace(env!("CARGO_BIN_EXE_conch"), "conch");
+    fs::write(&config, rewritten).unwrap();
+}
+
+#[test]
+fn doctor_resolves_a_bare_command_name_through_path() {
+    let (home, data) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    setup(&home, "cursor");
+    record_bare_command(&home);
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_conch")).parent().unwrap();
+    let dead = refused_addr();
+    let output = Command::new(env!("CARGO_BIN_EXE_conch"))
+        .arg("doctor")
+        .env("HOME", home.path())
+        .env("CONCH_DATA_DIR", data.path())
+        .env("CONCH_DEFAULT_TCP", dead.to_string())
+        .env("PATH", bin_dir)
+        .env_remove("CONCH_NODE")
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("ok    cursor        agent:cursor"), "{out}");
+}
+
+#[test]
+fn doctor_flags_a_bare_command_name_that_is_not_on_path() {
+    let (home, data) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    setup(&home, "cursor");
+    record_bare_command(&home);
+    let empty = TempDir::new().unwrap();
+    let dead = refused_addr();
+    let output = Command::new(env!("CARGO_BIN_EXE_conch"))
+        .arg("doctor")
+        .env("HOME", home.path())
+        .env("CONCH_DATA_DIR", data.path())
+        .env("CONCH_DEFAULT_TCP", dead.to_string())
+        .env("PATH", empty.path())
+        .env_remove("CONCH_NODE")
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        out.contains("warn  cursor        agent:cursor, command conch missing"),
+        "{out}"
+    );
+}
+
+/// A fake `launchctl`/`systemctl` whose only job is to answer "is the unit loaded?"
+/// with a fixed exit code. Returns the directory to put on PATH.
+fn service_manager_answering(loaded: bool) -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let name = if cfg!(target_os = "macos") {
+        "launchctl"
+    } else {
+        "systemctl"
+    };
+    let path = dir.path().join(name);
+    fs::write(&path, format!("#!/bin/sh\nexit {}\n", u8::from(!loaded))).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
+fn write_unit_file(home: &TempDir) {
+    let unit = if cfg!(target_os = "macos") {
+        home.path()
+            .join("Library/LaunchAgents/com.conch.conchd.plist")
+    } else {
+        home.path().join(".config/systemd/user/conchd.service")
+    };
+    fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    fs::write(&unit, "placeholder unit\n").unwrap();
+}
+
+fn doctor_with_service_manager(
+    home: &TempDir,
+    data: &TempDir,
+    tcp: SocketAddr,
+    manager: &TempDir,
+) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_conch"))
+        .arg("doctor")
+        .env("HOME", home.path())
+        .env("CONCH_DATA_DIR", data.path())
+        .env("CONCH_CONCHD", conchd_binary())
+        .env("CONCH_DEFAULT_TCP", tcp.to_string())
+        .env("CONCH_DEFAULT_HTTP", refused_addr().to_string())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                manager.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env_remove("CONCH_NODE")
+        .env_remove("CODEX_HOME")
+        .env_remove("GROK_HOME")
+        .env_remove("OPENCODE_CONFIG")
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn doctor_tells_a_loaded_unit_from_one_that_is_merely_present() {
+    let (home, data) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let _guard = DaemonGuard::new(data.path());
+    write_unit_file(&home);
+    let (tcp, _http) = with_daemon_ports(|tcp, http| {
+        Command::new(env!("CARGO_BIN_EXE_conch"))
+            .arg("up")
+            .env("CONCH_DATA_DIR", data.path())
+            .env("CONCH_CONCHD", conchd_binary())
+            .env("CONCH_DEFAULT_TCP", tcp.to_string())
+            .env("CONCH_DEFAULT_HTTP", http.to_string())
+            .env_remove("CONCH_NODE")
+            .status()
+            .unwrap()
+            .success()
+    });
+
+    let out = doctor_with_service_manager(&home, &data, tcp, &service_manager_answering(true));
+    assert!(
+        out.contains("ok    daemon        service unit loaded"),
+        "{out}"
+    );
+
+    // The file is there but the service manager does not know it: a reboot will
+    // not bring conchd back, which is the whole point of the unit.
+    let out = doctor_with_service_manager(&home, &data, tcp, &service_manager_answering(false));
+    assert!(
+        out.contains("warn  daemon        service unit present but not loaded"),
+        "{out}"
+    );
+    assert!(out.contains("run `conch up --service`"), "{out}");
+}
+
+#[test]
+fn doctor_reports_free_space_and_the_current_rooms_name_and_head() {
+    let (home, data) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let _guard = DaemonGuard::new(data.path());
+    let (tcp, _http) = with_daemon_ports(|tcp, http| {
+        Command::new(env!("CARGO_BIN_EXE_conch"))
+            .arg("up")
+            .env("CONCH_DATA_DIR", data.path())
+            .env("CONCH_CONCHD", conchd_binary())
+            .env("CONCH_DEFAULT_TCP", tcp.to_string())
+            .env("CONCH_DEFAULT_HTTP", http.to_string())
+            .env_remove("CONCH_NODE")
+            .status()
+            .unwrap()
+            .success()
+    });
+    // `create` records the new room as current.
+    let created = Command::new(env!("CARGO_BIN_EXE_conch"))
+        .args(["create", "--name", "Doctor Room"])
+        .current_dir(home.path())
+        .env("CONCH_DATA_DIR", data.path())
+        .env("CONCH_DEFAULT_TCP", tcp.to_string())
+        .env_remove("CONCH_NODE")
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let out = String::from_utf8_lossy(&doctor(&home, &data, tcp).stdout).into_owned();
+    let room_line = out
+        .lines()
+        .find(|line| line.contains("current room"))
+        .unwrap_or_else(|| panic!("no current room line in:\n{out}"));
+    assert!(room_line.starts_with("ok    current room"), "{room_line}");
+    assert!(room_line.contains("\"Doctor Room\""), "{room_line}");
+    assert!(room_line.contains("head 0"), "{room_line}");
+    let data_line = out
+        .lines()
+        .find(|line| line.contains("data dir"))
+        .unwrap_or_else(|| panic!("no data dir line in:\n{out}"));
+    assert!(data_line.contains(" free)"), "{data_line}");
+}

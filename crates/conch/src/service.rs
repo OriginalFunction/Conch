@@ -162,9 +162,51 @@ pub fn uninstall(_data_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// For `doctor`: is a unit file present for this user?
-pub fn unit_installed() -> bool {
-    home().map(|h| unit_path(&h).exists()).unwrap_or(false)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitState {
+    Absent,
+    /// The unit file exists but the service manager does not have it loaded, so it
+    /// will not start conchd at login.
+    Present,
+    Loaded,
+}
+
+/// For `doctor`: is a unit file present for this user, and does the service manager
+/// know about it?
+pub fn unit_state() -> UnitState {
+    let Ok(home) = home() else {
+        return UnitState::Absent;
+    };
+    if !unit_path(&home).exists() {
+        return UnitState::Absent;
+    }
+    let loaded = if cfg!(target_os = "macos") {
+        Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .and_then(|uid| {
+                Command::new("launchctl")
+                    .args(["print", &format!("gui/{uid}/com.conch.conchd")])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .ok()
+            })
+    } else {
+        Command::new("systemctl")
+            .args(["--user", "is-enabled", "--quiet", "conchd"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()
+    };
+    if loaded.is_some_and(|status| status.success()) {
+        UnitState::Loaded
+    } else {
+        UnitState::Present
+    }
 }
 
 #[cfg(test)]
