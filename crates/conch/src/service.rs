@@ -195,6 +195,10 @@ pub fn unit_state() -> UnitState {
                     .ok()
             })
     } else {
+        // The question doctor is asking is "will this come back after a reboot".
+        // launchd answers it with "is the agent bootstrapped" (a LaunchAgent under
+        // ~/Library/LaunchAgents loads at login); systemd's equivalent is
+        // enablement, not the transient loaded/active state of a hand-started unit.
         Command::new("systemctl")
             .args(["--user", "is-enabled", "--quiet", "conchd"])
             .stdout(std::process::Stdio::null())

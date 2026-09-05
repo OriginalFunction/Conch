@@ -213,23 +213,32 @@ async fn run_local(command: LocalCommand) -> Result<(), Box<dyn std::error::Erro
                 // Only a daemon the pid file names can be stopped. A listener with no
                 // pid file, or one whose pid was recycled, is not ours to signal — and
                 // a unit installed now would fail to bind and be restarted forever.
-                let stopped = match conch_launch::PidFile::read(&data_dir) {
+                let refuse = |why: String| -> Box<dyn std::error::Error> {
+                    format!(
+                        "something is already listening on {tcp} that `conch` did not start \
+                         ({why}); stop it first, then rerun `conch up --service`"
+                    )
+                    .into()
+                };
+                // `Ok` covers both a daemon that was just stopped and a pid that was
+                // already gone; either way the port should be free now.
+                let named = match conch_launch::PidFile::read(&data_dir) {
                     Some(existing) => match existing.stop(std::time::Duration::from_secs(5)) {
-                        Ok(()) => true,
-                        Err(conch_launch::LaunchError::PidMismatch { .. }) => false,
+                        Ok(()) => Some(existing.pid),
+                        Err(conch_launch::LaunchError::PidMismatch { pid }) => {
+                            return Err(refuse(format!(
+                                "pid {pid} is not a conchd, so it was not signalled"
+                            )))
+                        }
                         Err(error) => return Err(error.into()),
                     },
-                    None => false,
+                    None => None,
                 };
-                if !stopped
-                    || conch_launch::wait_for_port(tcp, std::time::Duration::from_millis(300))
-                {
-                    return Err(format!(
-                        "something is already listening on {tcp} that `conch` did not start \
-                         (no pid file in {} names it); stop it first, then rerun `conch up --service`",
-                        data_dir.display()
-                    )
-                    .into());
+                if conch_launch::wait_for_port(tcp, std::time::Duration::from_millis(300)) {
+                    return Err(refuse(match named {
+                        Some(pid) => format!("pid {pid} is gone but the port is still held"),
+                        None => format!("no pid file in {} names it", data_dir.display()),
+                    }));
                 }
                 conch_launch::PidFile::remove(&data_dir);
             }

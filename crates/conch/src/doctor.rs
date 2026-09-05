@@ -376,8 +376,15 @@ fn parse_df_available(output: &str) -> Option<u64> {
     let column = header
         .split_whitespace()
         .position(|field| field.starts_with("Avail"))?;
-    let row = output.lines().nth(1)?;
-    let blocks: u64 = row.split_whitespace().nth(column)?.parse().ok()?;
+    // One path was asked about, so everything after the header is that row — even
+    // when df wraps a long device name onto a line of its own.
+    let blocks: u64 = output
+        .lines()
+        .skip(1)
+        .flat_map(str::split_whitespace)
+        .nth(column)?
+        .parse()
+        .ok()?;
     Some(blocks * 1024)
 }
 
@@ -458,6 +465,12 @@ mod tests {
         let linux = "Filesystem     1K-blocks      Used Available Use% Mounted on\n\
                      /dev/nvme0n1p2 490691512 300000000 165000000  65% /\n";
         assert_eq!(parse_df_available(linux), Some(165_000_000 * 1024));
+        // A long device name makes df wrap the row: the filesystem sits on its own
+        // line and the numbers follow on the next.
+        let wrapped = "Filesystem                          1K-blocks      Used Available Use% Mounted on\n\
+                       fileserver.example.com:/export/home/very/long/path\n\
+                                                           990000000 500000000 480000000  52% /home/u\n";
+        assert_eq!(parse_df_available(wrapped), Some(480_000_000 * 1024));
         assert_eq!(
             parse_df_available("df: /nope: No such file or directory\n"),
             None

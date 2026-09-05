@@ -485,15 +485,18 @@ fn down_clears_a_pid_file_whose_process_is_gone() {
     assert!(PidFile::read(data.path()).is_none());
 }
 
-#[test]
-fn up_service_refuses_when_an_unknown_process_holds_the_port() {
+/// Run `up --service` against a port held by `_foreign`, a listener that is not a
+/// conchd of ours, with `pid_file` describing whatever the data dir says about it.
+/// Returns stderr after asserting the command failed without installing anything.
+fn up_service_against_foreign_listener(pid_file: Option<PidFile>) -> (String, SocketAddr) {
     let home = TempDir::new().unwrap();
     let data = TempDir::new().unwrap();
     let (tcp, http, (listener, http_listener)) = reserve_ports();
     drop(http_listener);
-    // Something that is not ours is listening on the daemon port and no pid file
-    // names it: a daemon started before pid files existed, or another program.
     let _foreign = listener;
+    if let Some(pid_file) = pid_file {
+        pid_file.write(data.path()).unwrap();
+    }
     let (stub, record, _started_pid) = service_manager_stub(&data, tcp, http);
     let output = Command::new(env!("CARGO_BIN_EXE_conch"))
         .args(["up", "--service"])
@@ -514,7 +517,7 @@ fn up_service_refuses_when_an_unknown_process_holds_the_port() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    let err = String::from_utf8_lossy(&output.stderr);
+    let err = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         err.contains(&format!("something is already listening on {tcp}")),
         "{err}"
@@ -530,4 +533,52 @@ fn up_service_refuses_when_an_unknown_process_holds_the_port() {
         home.path().join(".config/systemd/user/conchd.service")
     };
     assert!(!unit.exists(), "unit written despite the foreign listener");
+    (err, tcp)
+}
+
+#[test]
+fn up_service_refuses_when_an_unknown_process_holds_the_port() {
+    // No pid file at all: a daemon started before pid files existed, or another
+    // program entirely.
+    let (err, _) = up_service_against_foreign_listener(None);
+    assert!(err.contains("no pid file"), "{err}");
+}
+
+#[test]
+fn up_service_refuses_when_the_pid_file_names_some_other_live_process() {
+    let (tcp, http, reserved) = reserve_ports();
+    drop(reserved);
+    // The pid was recycled by an unrelated process — here, the test harness.
+    let (err, _) = up_service_against_foreign_listener(Some(PidFile {
+        pid: std::process::id(),
+        tcp,
+        http,
+    }));
+    assert!(
+        err.contains(&format!("pid {} is not a conchd", std::process::id())),
+        "{err}"
+    );
+    assert!(PidFile {
+        pid: std::process::id(),
+        tcp,
+        http
+    }
+    .is_alive());
+}
+
+#[test]
+fn up_service_refuses_when_the_named_daemon_is_gone_but_the_port_is_still_held() {
+    let (tcp, http, reserved) = reserve_ports();
+    drop(reserved);
+    // The daemon the pid file names has exited, yet the port stayed occupied: what
+    // is listening now is not the process we know how to stop.
+    let (err, _) = up_service_against_foreign_listener(Some(PidFile {
+        pid: 4_000_000_000,
+        tcp,
+        http,
+    }));
+    assert!(
+        err.contains("pid 4000000000 is gone but the port is still held"),
+        "{err}"
+    );
 }

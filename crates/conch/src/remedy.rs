@@ -49,7 +49,8 @@ mod tests {
         assert_eq!(for_code("internal", "speak"), None);
         assert_eq!(
             connect_error("127.0.0.1:7421"),
-            conch_launch::connect_error("127.0.0.1:7421")
+            "conchd is not running on 127.0.0.1:7421. Start it with `conch up` \
+             (or `brew services start conch`)."
         );
     }
 }
