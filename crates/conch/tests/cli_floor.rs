@@ -144,7 +144,12 @@ async fn cli_speak_retry_yield_and_next_waiter() {
     )
     .await;
     assert!(!late.status.success());
-    assert!(String::from_utf8_lossy(&late.stderr).contains("no_grant"));
+    let stderr = String::from_utf8_lossy(&late.stderr);
+    assert!(stderr.contains("no_grant"));
+    assert!(
+        stderr.contains("raise your hand and wait for the floor"),
+        "{stderr}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

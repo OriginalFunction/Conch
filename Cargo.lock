@@ -303,6 +303,7 @@ name = "conch-mcp"
 version = "1.2.2"
 dependencies = [
  "conch-core",
+ "conch-launch",
  "conchd",
  "rand 0.8.7",
  "rcgen",

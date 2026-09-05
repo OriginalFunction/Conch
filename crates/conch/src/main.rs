@@ -38,9 +38,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tls_ca,
         request,
         output,
+        command,
+        node_is_default,
     } = parsed;
     if let ParsedRequest::Mcp { room } = &request {
-        return conch_mcp::run(node, agent, *room, tls_ca)
+        return conch_mcp::run(node, agent, *room, tls_ca, node_is_default)
             .await
             .map_err(Into::into);
     }
@@ -53,11 +55,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             if matches!(request.as_ref(), ClientRequest::History { follow: true, .. })
     );
     let (request, raw) = request.resolve(tls_ca.as_deref()).await?;
-    let mut stream = TcpStream::connect(parse_node_addr(&node)?).await?;
+    let mut stream = connect_with_spawn(&node, node_is_default).await?;
     write_frame(&mut stream, &ClientRequest::Attach { agent }).await?;
     let attached: ClientReply = read_frame(&mut stream).await?;
     if !attached.ok {
-        return Err(format_reply_error(&attached).into());
+        return Err(format_reply_error(&attached, &command).into());
     }
     write_frame(&mut stream, &request).await?;
     if let Some(raw) = raw {
@@ -69,7 +71,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             let reply: ClientReply = read_frame(&mut stream).await?;
             if !reply.ok {
-                return Err(format_reply_error(&reply).into());
+                return Err(format_reply_error(&reply, &command).into());
             }
             println!(
                 "{}",
@@ -79,7 +81,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let reply: ClientReply = read_frame(&mut stream).await?;
     if !reply.ok {
-        return Err(format_reply_error(&reply).into());
+        return Err(format_reply_error(&reply, &command).into());
     }
     let data = reply.data.unwrap_or_default();
     let output = match output {
@@ -184,10 +186,99 @@ async fn run_local(command: LocalCommand) -> Result<(), Box<dyn std::error::Erro
             println!("{}", report.next_step);
             Ok(())
         }
+        LocalCommand::Up { service } => {
+            let options = spawn_options()?;
+            let data_dir = options.data_dir.clone();
+            let http = options.http;
+            let pid = tokio::task::spawn_blocking(move || conch_launch::spawn_detached(&options))
+                .await??;
+            println!(
+                "conchd running (pid {pid})\nlog: {}\nui:  http://{http}/",
+                conch_launch::log_path(&data_dir).display()
+            );
+            let _ = service; // wired in Task 7
+            Ok(())
+        }
+        LocalCommand::Down { service } => {
+            let data_dir = conch_launch::default_data_dir();
+            match conch_launch::PidFile::read(&data_dir) {
+                Some(pid) if pid.is_alive() => {
+                    pid.stop(std::time::Duration::from_secs(5))?;
+                    // `stop` only waits for `kill -0` to fail, which can (rarely, under
+                    // load) report a false negative before conchd has actually removed
+                    // its own pid file on the way out. Wait for the file itself so
+                    // `down` never reports success while a stale pid file remains.
+                    wait_for_pid_file_gone(&data_dir, std::time::Duration::from_secs(5)).await?;
+                    println!("conchd stopped (pid {})", pid.pid);
+                }
+                _ => println!("conchd is not running"),
+            }
+            let _ = service; // wired in Task 7
+            Ok(())
+        }
     }
 }
 
+async fn wait_for_pid_file_gone(
+    data_dir: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while conch_launch::PidFile::read(data_dir).is_some() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("conchd stopped but its pid file was not removed in time".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
+async fn connect_with_spawn(
+    node: &str,
+    node_is_default: bool,
+) -> Result<TcpStream, Box<dyn std::error::Error>> {
+    let addr = parse_node_addr(node)?;
+    match TcpStream::connect(addr).await {
+        Ok(stream) => Ok(stream),
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused && node_is_default => {
+            ensure_daemon().await?;
+            Ok(TcpStream::connect(addr).await?)
+        }
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+            Err(conch::remedy::connect_error(&addr.to_string()).into())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn default_tcp() -> String {
+    env::var("CONCH_DEFAULT_TCP").unwrap_or_else(|_| conch_launch::DEFAULT_TCP.into())
+}
+
+fn default_http() -> String {
+    env::var("CONCH_DEFAULT_HTTP").unwrap_or_else(|_| conch_launch::DEFAULT_HTTP.into())
+}
+
+fn spawn_options() -> Result<conch_launch::SpawnOptions, Box<dyn std::error::Error>> {
+    Ok(conch_launch::SpawnOptions {
+        conchd: conch_launch::locate_conchd()?,
+        data_dir: conch_launch::default_data_dir(),
+        tcp: default_tcp().parse()?,
+        http: default_http().parse()?,
+    })
+}
+
+/// Start conchd if nothing is listening on the default node. Prints one stderr line when it does.
 async fn ensure_daemon() -> Result<(), Box<dyn std::error::Error>> {
+    let options = spawn_options()?;
+    if conch_launch::wait_for_port(options.tcp, std::time::Duration::from_millis(200)) {
+        return Ok(());
+    }
+    let pid = tokio::task::spawn_blocking(move || conch_launch::spawn_detached(&options)).await??;
+    eprintln!(
+        "conch: started conchd (pid {pid}) — log: {}",
+        conch_launch::log_path(&conch_launch::default_data_dir()).display()
+    );
     Ok(())
 }
 
@@ -207,6 +298,8 @@ struct Arguments {
     tls_ca: Option<PathBuf>,
     request: ParsedRequest,
     output: Output,
+    command: String,
+    node_is_default: bool,
 }
 
 enum Output {
@@ -241,6 +334,12 @@ enum LocalCommand {
         scope: conch::hosts::Scope,
         env: conch::hosts::Env,
         dry_run: bool,
+    },
+    Up {
+        service: bool,
+    },
+    Down {
+        service: bool,
     },
 }
 
@@ -319,7 +418,9 @@ fn ready(request: ClientRequest) -> ParsedRequest {
 impl Arguments {
     fn parse(arguments: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut arguments = arguments.peekable();
-        let mut node = env::var("CONCH_NODE").unwrap_or_else(|_| "tcp://127.0.0.1:7421".into());
+        let mut node =
+            env::var("CONCH_NODE").unwrap_or_else(|_| format!("tcp://{}", default_tcp()));
+        let mut node_explicit = false;
         let mut agent = env::var("CONCH_AGENT").unwrap_or_else(|_| "local".into());
         let mut tls_ca = env::var_os("CONCH_TLS_CA").map(PathBuf::from);
         let mut room = env::var("CONCH_ROOM").ok().or_else(read_current_room);
@@ -334,6 +435,7 @@ impl Arguments {
                 "--node" => {
                     arguments.next();
                     node = arguments.next().ok_or("--node requires a URL")?;
+                    node_explicit = true;
                 }
                 "--agent" => {
                     arguments.next();
@@ -806,11 +908,26 @@ impl Arguments {
                     dry_run,
                 })
             }
+            "up" | "down" => {
+                let mut service = false;
+                for flag in arguments.by_ref() {
+                    match flag.as_str() {
+                        "--service" => service = true,
+                        _ => return Err(format!("unknown {command} argument: {flag}")),
+                    }
+                }
+                ParsedRequest::Local(if command == "up" {
+                    LocalCommand::Up { service }
+                } else {
+                    LocalCommand::Down { service }
+                })
+            }
             _ => return Err(format!("unknown command: {command}")),
         };
         if arguments.next().is_some() {
             return Err("unexpected trailing arguments".into());
         }
+        let node_is_default = env::var_os("CONCH_NODE").is_none() && !node_explicit;
 
         Ok(Self {
             node,
@@ -818,6 +935,8 @@ impl Arguments {
             tls_ca,
             request,
             output,
+            command,
+            node_is_default,
         })
     }
 }
@@ -837,7 +956,8 @@ fn print_help() {
            -h, --help            Print help\n\n\
          Commands:\n\
            create, join, status, history, raise-hand, wait-for-floor\n\
-           speak, yield, grant, yank, config, breakout, blob, leave, mcp, setup\n\n\
+           speak, yield, grant, yank, config, breakout, blob, leave, mcp, setup\n\
+           up, down\n\n\
          Run `conch help <command>` for command-specific usage.",
         env!("CARGO_PKG_VERSION")
     );
@@ -872,6 +992,11 @@ fn print_command_help(command: &str) -> Result<(), String> {
             "conch setup <claude|codex|grok|cursor|gemini|opencode> [--agent ID] [--scope user|project] [--env K=V ...] [--dry-run]\n\
              Example: conch setup claude"
         }
+        "up" => {
+            "conch up [--service]\n\
+             Example: conch up --service   # start now and on login"
+        }
+        "down" => "conch down [--service]",
         _ => return Err(format!("unknown command: {command}")),
     };
     println!("{usage}");
@@ -906,10 +1031,13 @@ fn parse_node_addr(node: &str) -> Result<SocketAddr, Box<dyn std::error::Error>>
     Ok(address.parse()?)
 }
 
-fn format_reply_error(reply: &ClientReply) -> String {
+fn format_reply_error(reply: &ClientReply, command: &str) -> String {
     reply.error.as_ref().map_or_else(
         || "daemon returned an unspecified error".into(),
-        |error| format!("{}: {}", error.code, error.message),
+        |error| match conch::remedy::for_code(&error.code, command) {
+            Some(remedy) => format!("{}: {}\n{remedy}", error.code, error.message),
+            None => format!("{}: {}", error.code, error.message),
+        },
     )
 }
 

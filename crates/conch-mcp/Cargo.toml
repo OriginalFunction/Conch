@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 conch-core = { path = "../conch-core" }
+conch-launch = { path = "../conch-launch" }
 rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true

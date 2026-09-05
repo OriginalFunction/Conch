@@ -35,6 +35,8 @@ pub struct Server {
     agent: AgentId,
     room: Option<RoomId>,
     tls_ca: Option<PathBuf>,
+    auto_spawn: bool,
+    spawned: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Server {
@@ -44,11 +46,18 @@ impl Server {
             agent,
             room,
             tls_ca: None,
+            auto_spawn: false,
+            spawned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
     pub fn with_tls_ca(mut self, tls_ca: Option<PathBuf>) -> Self {
         self.tls_ca = tls_ca;
+        self
+    }
+
+    pub fn with_auto_spawn(mut self, auto_spawn: bool) -> Self {
+        self.auto_spawn = auto_spawn;
         self
     }
 
@@ -366,9 +375,34 @@ impl Server {
         request: ClientRequest,
         raw: Option<Vec<u8>>,
     ) -> Result<ClientReply, String> {
-        let mut stream = TcpStream::connect(parse_node_addr(&self.node)?)
-            .await
-            .map_err(|error| error.to_string())?;
+        let addr = parse_node_addr(&self.node)?;
+        let mut stream = match TcpStream::connect(addr).await {
+            Ok(stream) => stream,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ConnectionRefused
+                    && self.auto_spawn
+                    && !self.spawned.swap(true, std::sync::atomic::Ordering::SeqCst) =>
+            {
+                let data_dir = conch_launch::default_data_dir();
+                let options = conch_launch::SpawnOptions {
+                    conchd: conch_launch::locate_conchd().map_err(|e| e.to_string())?,
+                    data_dir: data_dir.clone(),
+                    tcp: addr,
+                    http: conch_launch::DEFAULT_HTTP.parse().expect("literal"),
+                };
+                let pid =
+                    tokio::task::spawn_blocking(move || conch_launch::spawn_detached(&options))
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .map_err(|e| e.to_string())?;
+                eprintln!(
+                    "conch: started conchd (pid {pid}) — log: {}",
+                    conch_launch::log_path(&data_dir).display()
+                );
+                TcpStream::connect(addr).await.map_err(|e| e.to_string())?
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         write_frame(
             &mut stream,
             &ClientRequest::Attach {
@@ -401,8 +435,11 @@ pub async fn run(
     agent: AgentId,
     room: Option<RoomId>,
     tls_ca: Option<PathBuf>,
+    auto_spawn: bool,
 ) -> Result<(), String> {
-    let server = Server::new(node, agent, room).with_tls_ca(tls_ca);
+    let server = Server::new(node, agent, room)
+        .with_tls_ca(tls_ca)
+        .with_auto_spawn(auto_spawn);
     let input = BufReader::new(io::stdin());
     let mut lines = input.lines();
     let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
