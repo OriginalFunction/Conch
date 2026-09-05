@@ -1,4 +1,10 @@
-use std::{fs, net::TcpListener, path::PathBuf, process::Command, time::Duration};
+use std::{
+    fs,
+    net::{SocketAddr, TcpListener},
+    path::{Path, PathBuf},
+    process::Command,
+    time::Duration,
+};
 
 use conch_launch::PidFile;
 use tempfile::TempDir;
@@ -15,31 +21,70 @@ fn conchd_binary() -> PathBuf {
     sibling
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// Two loopback ports that stay reserved until the caller drops the listeners, closing
+/// the window in which another test (or anything else on the machine) could take them.
+fn reserve_ports() -> (SocketAddr, SocketAddr, (TcpListener, TcpListener)) {
+    let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    let http = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addrs = (tcp.local_addr().unwrap(), http.local_addr().unwrap());
+    (addrs.0, addrs.1, (tcp, http))
 }
 
-fn doctor(home: &TempDir, data: &TempDir, tcp: u16) -> std::process::Output {
+/// Stops whatever the pid file names when the test ends, so a failing assertion
+/// never leaks a daemon.
+struct DaemonGuard(PathBuf);
+
+impl DaemonGuard {
+    fn new(data_dir: &Path) -> Self {
+        Self(data_dir.to_path_buf())
+    }
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = PidFile::read(&self.0) {
+            let _ = pid.stop(Duration::from_secs(5));
+        }
+    }
+}
+
+fn doctor(home: &TempDir, data: &TempDir, tcp: SocketAddr) -> std::process::Output {
+    let (_unused, http, reserved) = reserve_ports();
+    drop(reserved);
     Command::new(env!("CARGO_BIN_EXE_conch"))
         .arg("doctor")
         .env("HOME", home.path())
         .env("CONCH_DATA_DIR", data.path())
         .env("CONCH_CONCHD", conchd_binary())
-        .env("CONCH_DEFAULT_TCP", format!("127.0.0.1:{tcp}"))
-        .env("CONCH_DEFAULT_HTTP", format!("127.0.0.1:{}", free_port()))
+        .env("CONCH_DEFAULT_TCP", tcp.to_string())
+        .env("CONCH_DEFAULT_HTTP", http.to_string())
         .env_remove("CONCH_NODE")
+        .env_remove("CODEX_HOME")
+        .env_remove("GROK_HOME")
+        .env_remove("OPENCODE_CONFIG")
         .output()
         .unwrap()
+}
+
+fn setup(home: &TempDir, host: &str) {
+    assert!(Command::new(env!("CARGO_BIN_EXE_conch"))
+        .args(["setup", host])
+        .env("HOME", home.path())
+        .env("CONCH_SETUP_SKIP_DAEMON", "1")
+        .env_remove("CODEX_HOME")
+        .env_remove("GROK_HOME")
+        .env_remove("OPENCODE_CONFIG")
+        .status()
+        .unwrap()
+        .success());
 }
 
 #[test]
 fn doctor_fails_without_a_daemon_and_names_the_remedy() {
     let (home, data) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-    let output = doctor(&home, &data, free_port());
+    let (dead, _http, reserved) = reserve_ports();
+    drop(reserved);
+    let output = doctor(&home, &data, dead);
     assert_eq!(output.status.code(), Some(1));
     let out = String::from_utf8_lossy(&output.stdout);
     assert!(out.contains("fail  daemon"), "{out}");
@@ -49,21 +94,17 @@ fn doctor_fails_without_a_daemon_and_names_the_remedy() {
 #[test]
 fn doctor_passes_with_daemon_and_reports_hosts() {
     let (home, data) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-    let tcp = free_port();
+    let _guard = DaemonGuard::new(data.path());
+    let (tcp, http, reserved) = reserve_ports();
     // configure one host and start a daemon
-    assert!(Command::new(env!("CARGO_BIN_EXE_conch"))
-        .args(["setup", "cursor"])
-        .env("HOME", home.path())
-        .env("CONCH_SETUP_SKIP_DAEMON", "1")
-        .status()
-        .unwrap()
-        .success());
+    setup(&home, "cursor");
+    drop(reserved);
     assert!(Command::new(env!("CARGO_BIN_EXE_conch"))
         .arg("up")
         .env("CONCH_DATA_DIR", data.path())
         .env("CONCH_CONCHD", conchd_binary())
-        .env("CONCH_DEFAULT_TCP", format!("127.0.0.1:{tcp}"))
-        .env("CONCH_DEFAULT_HTTP", format!("127.0.0.1:{}", free_port()))
+        .env("CONCH_DEFAULT_TCP", tcp.to_string())
+        .env("CONCH_DEFAULT_HTTP", http.to_string())
         .env_remove("CONCH_NODE")
         .status()
         .unwrap()
@@ -73,7 +114,7 @@ fn doctor_passes_with_daemon_and_reports_hosts() {
     assert_eq!(output.status.code(), Some(0), "{out}");
     assert!(
         out.contains(&format!(
-            "ok    daemon        reachable on 127.0.0.1:{tcp}, version {}",
+            "ok    daemon        reachable on {tcp}, version {}",
             env!("CARGO_PKG_VERSION")
         )),
         "{out}"
@@ -81,22 +122,12 @@ fn doctor_passes_with_daemon_and_reports_hosts() {
     assert!(out.contains("warn  daemon        started by hand"), "{out}");
     assert!(out.contains("ok    cursor        agent:cursor"), "{out}");
     assert!(out.contains("--    claude        not configured"), "{out}");
-    PidFile::read(data.path())
-        .unwrap()
-        .stop(Duration::from_secs(5))
-        .unwrap();
 }
 
 #[test]
 fn doctor_flags_a_stale_skill() {
     let (home, data) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-    assert!(Command::new(env!("CARGO_BIN_EXE_conch"))
-        .args(["setup", "claude"])
-        .env("HOME", home.path())
-        .env("CONCH_SETUP_SKIP_DAEMON", "1")
-        .status()
-        .unwrap()
-        .success());
+    setup(&home, "claude");
     let skill = home.path().join(".claude/skills/join-room/SKILL.md");
     fs::write(
         &skill,
@@ -105,7 +136,9 @@ fn doctor_flags_a_stale_skill() {
             .replace(env!("CARGO_PKG_VERSION"), "0.0.1"),
     )
     .unwrap();
-    let out = String::from_utf8_lossy(&doctor(&home, &data, free_port()).stdout).into_owned();
+    let (dead, _http, reserved) = reserve_ports();
+    drop(reserved);
+    let out = String::from_utf8_lossy(&doctor(&home, &data, dead).stdout).into_owned();
     assert!(
         out.contains("warn  claude        agent:claude, skill 0.0.1 is stale"),
         "{out}"

@@ -1,7 +1,9 @@
 //! Locate, spawn, and stop a local `conchd`. Shared by the CLI and the MCP server.
 
 use std::{
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     io::{BufRead, BufReader},
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
@@ -53,31 +55,49 @@ pub fn log_path(data_dir: &Path) -> PathBuf {
 
 /// `$CONCH_CONCHD`, then `conchd` beside the running binary, then `$PATH`.
 pub fn locate_conchd() -> Result<PathBuf, LaunchError> {
+    let explicit = env::var_os("CONCH_CONCHD");
+    let exe = env::current_exe().ok();
+    let path = env::var_os("PATH");
+    locate_conchd_in(
+        explicit.as_deref(),
+        exe.as_deref().and_then(Path::parent),
+        path.as_deref(),
+    )
+}
+
+/// The env-free core of [`locate_conchd`], so tests never mutate process-global state.
+/// `searched` names every location actually tried, PATH entry by PATH entry.
+pub fn locate_conchd_in(
+    explicit: Option<&OsStr>,
+    exe_dir: Option<&Path>,
+    path: Option<&OsStr>,
+) -> Result<PathBuf, LaunchError> {
     let mut searched = Vec::new();
-    if let Some(explicit) = env::var_os("CONCH_CONCHD") {
-        let path = PathBuf::from(explicit);
-        if path.is_file() {
-            return Ok(path);
+    if let Some(explicit) = explicit {
+        let candidate = PathBuf::from(explicit);
+        if candidate.is_file() {
+            return Ok(candidate);
         }
-        searched.push(path.display().to_string());
+        searched.push(candidate.display().to_string());
     }
-    if let Ok(exe) = env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let sibling = dir.join("conchd");
-            if sibling.is_file() {
-                return Ok(sibling);
-            }
-            searched.push(sibling.display().to_string());
+    if let Some(dir) = exe_dir {
+        let sibling = dir.join("conchd");
+        if sibling.is_file() {
+            return Ok(sibling);
         }
+        searched.push(sibling.display().to_string());
     }
-    if let Some(path) = env::var_os("PATH") {
-        for dir in env::split_paths(&path) {
-            let candidate = dir.join("conchd");
-            if candidate.is_file() {
-                return Ok(candidate);
+    match path {
+        Some(path) => {
+            for dir in env::split_paths(path) {
+                let candidate = dir.join("conchd");
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
+                searched.push(candidate.display().to_string());
             }
         }
-        searched.push("$PATH".into());
+        None => searched.push("PATH unset".into()),
     }
     Err(LaunchError::NotFound {
         searched: searched.join(", "),

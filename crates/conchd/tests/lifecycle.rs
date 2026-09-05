@@ -1,6 +1,6 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -17,11 +17,31 @@ use tokio::{
     net::TcpStream,
 };
 
-fn free_port() -> SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+/// Two loopback ports that stay reserved until the caller drops the listeners, closing
+/// the window in which another test (or anything else on the machine) could take them.
+fn reserve_ports() -> (SocketAddr, SocketAddr, (TcpListener, TcpListener)) {
+    let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    let http = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addrs = (tcp.local_addr().unwrap(), http.local_addr().unwrap());
+    (addrs.0, addrs.1, (tcp, http))
+}
+
+/// Stops whatever the pid file names when the test ends, so a failing assertion
+/// never leaks a daemon.
+struct DaemonGuard(PathBuf);
+
+impl DaemonGuard {
+    fn new(data_dir: &Path) -> Self {
+        Self(data_dir.to_path_buf())
+    }
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = PidFile::read(&self.0) {
+            let _ = pid.stop(Duration::from_secs(5));
+        }
+    }
 }
 
 async fn request(addr: SocketAddr, request: &ClientRequest) -> ClientReply {
@@ -66,14 +86,17 @@ async fn version_request_reports_daemon_version() {
 #[test]
 fn daemon_binary_writes_pid_file_and_removes_it_on_sigterm() {
     let data = TempDir::new().unwrap();
+    let _guard = DaemonGuard::new(data.path());
+    let (tcp, http, reserved) = reserve_ports();
     let options = SpawnOptions {
         conchd: PathBuf::from(env!("CARGO_BIN_EXE_conchd")),
         data_dir: data.path().to_path_buf(),
-        tcp: free_port(),
-        http: free_port(),
+        tcp,
+        http,
     };
+    drop(reserved);
     let pid = spawn_detached(&options).unwrap();
-    let file = PidFile::read(data.path()).expect("pid file written at startup");
+    let file = PidFile::read(data.path()).expect("pid file written once listeners are bound");
     assert_eq!(file.pid, pid);
     assert_eq!(file.tcp, options.tcp);
     assert!(file.is_alive());

@@ -1,53 +1,43 @@
-use std::{fs, net::TcpListener, path::PathBuf, time::Duration};
+use std::{ffi::OsString, fs, net::TcpListener, path::PathBuf, time::Duration};
 
-use conch_launch::{locate_conchd, wait_for_port, PidFile};
+use conch_launch::{locate_conchd_in, wait_for_port, PidFile};
 use tempfile::TempDir;
-
-struct EnvGuard {
-    path: Option<std::ffi::OsString>,
-    conch_conchd: Option<std::ffi::OsString>,
-}
-
-impl EnvGuard {
-    fn new() -> Self {
-        Self {
-            path: std::env::var_os("PATH"),
-            conch_conchd: std::env::var_os("CONCH_CONCHD"),
-        }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        if let Some(path) = &self.path {
-            std::env::set_var("PATH", path);
-        } else {
-            std::env::remove_var("PATH");
-        }
-        if let Some(conch_conchd) = &self.conch_conchd {
-            std::env::set_var("CONCH_CONCHD", conch_conchd);
-        } else {
-            std::env::remove_var("CONCH_CONCHD");
-        }
-    }
-}
 
 #[test]
 fn locate_prefers_env_override_and_reports_search_locations() {
-    let _guard = EnvGuard::new();
     let dir = TempDir::new().unwrap();
     let fake = dir.path().join("conchd");
     fs::write(&fake, "#!/bin/sh\n").unwrap();
+    let fake_os = OsString::from(&fake);
 
-    // Test 1: env override case
-    std::env::set_var("CONCH_CONCHD", &fake);
-    assert_eq!(locate_conchd().unwrap(), fake);
+    // The explicit override wins over everything else.
+    assert_eq!(locate_conchd_in(Some(&fake_os), None, None).unwrap(), fake);
 
-    // Test 2: missing case - temporarily clear PATH to force NotFound error
-    std::env::remove_var("PATH");
-    std::env::set_var("CONCH_CONCHD", "/definitely/not/here/conchd");
-    let error = locate_conchd().unwrap_err().to_string();
+    // A missing override falls through to the directory beside the running binary.
+    let missing = OsString::from("/definitely/not/here/conchd");
+    assert_eq!(
+        locate_conchd_in(Some(&missing), Some(dir.path()), None).unwrap(),
+        fake
+    );
+
+    // With nothing found, every location tried is named, including each PATH entry.
+    let empty = TempDir::new().unwrap();
+    let path = std::env::join_paths([empty.path()]).unwrap();
+    let error = locate_conchd_in(Some(&missing), Some(empty.path()), Some(&path))
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("/definitely/not/here/conchd"), "{error}");
+    assert!(
+        error.contains(&empty.path().join("conchd").display().to_string()),
+        "{error}"
+    );
+    assert!(!error.contains("$PATH"), "{error}");
+
+    // An absent PATH is reported as such rather than silently skipped.
+    let error = locate_conchd_in(Some(&missing), None, None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("PATH unset"), "{error}");
 }
 
 #[test]
