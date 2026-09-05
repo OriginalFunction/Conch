@@ -52,7 +52,10 @@ fn wait_for_port_sees_a_listener_and_times_out_without_one() {
     let addr = listener.local_addr().unwrap();
     assert!(wait_for_port(addr, Duration::from_secs(1)));
     drop(listener);
-    assert!(!wait_for_port(addr, Duration::from_millis(300)));
+    // A released ephemeral port can be re-taken by anything on the machine before the
+    // second probe; port 1 needs root to bind, so nothing answers there.
+    let refused = "127.0.0.1:1".parse().expect("literal address");
+    assert!(!wait_for_port(refused, Duration::from_millis(300)));
 }
 
 #[test]
