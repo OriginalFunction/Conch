@@ -52,7 +52,8 @@ pub mod json {
                         "{\n".to_string() + &member_indent + "}"
                     };
                     let new_member = format!("\"{key}\": {body}");
-                    if members.is_empty() {
+                    let interior_is_blank = text[object.0 + 1..object.1 - 1].trim().is_empty();
+                    if members.is_empty() && interior_is_blank {
                         // The object interior is empty (or whitespace-only, as with a freshly
                         // created placeholder's "\n{indent}"). Replace it outright rather than
                         // inserting after `{`, or the placeholder's own closing whitespace would
@@ -63,6 +64,16 @@ pub mod json {
                             object.0 + 1..object.1 - 1,
                             &format!("{prefix}{new_member}{suffix}"),
                         );
+                    } else if members.is_empty() {
+                        // The interior holds no real members but isn't blank either — typically a
+                        // comment (e.g. `{ // add servers here }`). Preserve it by appending the
+                        // new member right after its trailing content, reusing its own trailing
+                        // whitespace as the lead-in to the closing brace rather than replacing
+                        // anything.
+                        let trimmed_len = text[object.0 + 1..object.1 - 1].trim_end().len();
+                        let insert_at = object.0 + 1 + trimmed_len;
+                        let prefix = format!("\n{member_indent}");
+                        text.insert_str(insert_at, &format!("{prefix}{new_member}"));
                     } else {
                         let insert_at = insertion_point(&text, object, &members);
                         let prefix = if has_trailing_comma(&text, &members, object) {
@@ -415,11 +426,17 @@ pub mod toml {
         server: &Server,
     ) -> Result<String, EditError> {
         let mut doc: DocumentMut = text.parse()?;
+        let existed = doc.get(table).is_some();
         let parent = doc.entry(table).or_insert(Item::Table(Table::new()));
         let parent = parent
             .as_table_mut()
             .ok_or_else(|| EditError::Json(format!("{table} is not a table")))?;
-        parent.set_implicit(true);
+        if !existed {
+            // Only a table this call created should be implicit (header-less); an existing
+            // `[mcp_servers]` header — and any comment attached to it — must survive even when
+            // the table holds only sub-tables.
+            parent.set_implicit(true);
+        }
         let mut entry = Table::new();
         entry["command"] = value(server.command);
         entry["args"] = value(server.args.iter().map(|s| s.as_str()).collect::<Array>());
@@ -440,6 +457,12 @@ pub mod toml {
                     entry["env"] = value(env);
                 }
             }
+        }
+        if let Some(old) = parent.get(name).and_then(|i| i.as_table()) {
+            // Replacing an existing server table must not discard its decor — when the server is
+            // the first item in the file, that decor is the file's leading comment block, and
+            // re-running `set_server` (the idempotent update path) would otherwise erase it.
+            *entry.decor_mut() = old.decor().clone();
         }
         parent.insert(name, Item::Table(entry));
         Ok(doc.to_string())
@@ -527,5 +550,47 @@ mod tests {
         };
         let out = toml::set_server("", "mcp_servers", "conch", &inline).unwrap();
         assert!(out.contains("env = { K = \"V\" }"), "{out}");
+    }
+
+    #[test]
+    fn json_preserves_comment_in_otherwise_empty_target_object() {
+        let input = "{\n  \"mcp\": { // add servers here\n  }\n}\n";
+        let out = json::set_member(input, &["mcp", "conch"], r#"{"type":"local"}"#).unwrap();
+        assert!(out.contains("// add servers here"), "{out}");
+        let cleaned = json::strip_comments(&out);
+        let value: serde_json::Value = serde_json::from_str(&cleaned).unwrap();
+        assert_eq!(value["mcp"]["conch"]["type"], "local");
+    }
+
+    #[test]
+    fn toml_keeps_existing_parent_header_and_its_comment() {
+        let input = "# server registry\n[mcp_servers]\n\n[mcp_servers.pencil]\ncommand = \"p\"\n";
+        let env = Env::default();
+        let server = toml::Server {
+            command: "/b/conch",
+            args: &[],
+            env: &env,
+            env_style: toml::EnvStyle::SubTable,
+        };
+        let out = toml::set_server(input, "mcp_servers", "conch", &server).unwrap();
+        assert!(out.contains("# server registry"), "{out}");
+        assert!(out.contains("[mcp_servers]"), "{out}");
+    }
+
+    #[test]
+    fn toml_replacing_existing_server_keeps_its_leading_comment() {
+        let input = "# Codex config\n# do not lose me\n\n[mcp_servers.conch]\ncommand = \"old\"\n";
+        let env = Env::default();
+        let server = toml::Server {
+            command: "/b/conch",
+            args: &[],
+            env: &env,
+            env_style: toml::EnvStyle::SubTable,
+        };
+        let out = toml::set_server(input, "mcp_servers", "conch", &server).unwrap();
+        assert!(out.contains("# Codex config"), "{out}");
+        assert!(out.contains("# do not lose me"), "{out}");
+        assert!(out.contains("command = \"/b/conch\""), "{out}");
+        assert!(!out.contains("command = \"old\""), "{out}");
     }
 }
