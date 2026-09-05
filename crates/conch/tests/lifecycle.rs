@@ -457,3 +457,77 @@ fn explicit_node_never_spawns_and_prints_remedy() {
     assert!(PidFile::read(data.path()).is_none());
     assert!(!fs::exists(data.path().join("conchd.log")).unwrap_or(false));
 }
+
+#[test]
+fn down_clears_a_pid_file_whose_process_is_gone() {
+    let data = TempDir::new().unwrap();
+    let (tcp, http, reserved) = reserve_ports();
+    drop(reserved);
+    // A pid file left by a daemon that crashed: nothing has that pid any more.
+    PidFile {
+        pid: 4_000_000_000,
+        tcp,
+        http,
+    }
+    .write(data.path())
+    .unwrap();
+    let down = conch(&data, tcp, http, &["down"]);
+    assert!(
+        down.status.success(),
+        "{}",
+        String::from_utf8_lossy(&down.stderr)
+    );
+    let out = String::from_utf8_lossy(&down.stdout);
+    assert!(
+        out.contains("conchd is not running (removed a stale pid file)"),
+        "{out}"
+    );
+    assert!(PidFile::read(data.path()).is_none());
+}
+
+#[test]
+fn up_service_refuses_when_an_unknown_process_holds_the_port() {
+    let home = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    let (tcp, http, (listener, http_listener)) = reserve_ports();
+    drop(http_listener);
+    // Something that is not ours is listening on the daemon port and no pid file
+    // names it: a daemon started before pid files existed, or another program.
+    let _foreign = listener;
+    let (stub, record, _started_pid) = service_manager_stub(&data, tcp, http);
+    let output = Command::new(env!("CARGO_BIN_EXE_conch"))
+        .args(["up", "--service"])
+        .env("HOME", home.path())
+        .env("CONCH_DATA_DIR", data.path())
+        .env("CONCH_CONCHD", conchd_binary())
+        .env("CONCH_DEFAULT_TCP", tcp.to_string())
+        .env("CONCH_DEFAULT_HTTP", http.to_string())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                stub.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env_remove("CONCH_NODE")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains(&format!("something is already listening on {tcp}")),
+        "{err}"
+    );
+    assert!(err.contains("stop it first"), "{err}");
+    // Nothing was installed or handed to the service manager: a unit started now
+    // would fail to bind and be restarted forever.
+    assert!(!record.exists(), "service manager was called");
+    let unit = if cfg!(target_os = "macos") {
+        home.path()
+            .join("Library/LaunchAgents/com.conch.conchd.plist")
+    } else {
+        home.path().join(".config/systemd/user/conchd.service")
+    };
+    assert!(!unit.exists(), "unit written despite the foreign listener");
+}

@@ -107,3 +107,51 @@ fn stop_refuses_a_pid_that_is_not_a_conchd() {
         "{error}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn spawn_kills_a_daemon_that_never_listens() {
+    use conch_launch::{spawn_detached, LaunchError, SpawnOptions};
+    let dir = TempDir::new().unwrap();
+    let data = dir.path().join("data");
+    fs::create_dir(&data).unwrap();
+    // A "conchd" that starts, records its pid, and never binds anything.
+    let fake = dir.path().join("conchd");
+    let pid_note = dir.path().join("spawned.pid");
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec sleep 60\n",
+            pid_note.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let refused = "127.0.0.1:1".parse().expect("literal address");
+    let error = spawn_detached(&SpawnOptions {
+        conchd: fake,
+        data_dir: data,
+        tcp: refused,
+        http: refused,
+    })
+    .unwrap_err();
+    assert!(
+        matches!(error, LaunchError::NotListening { addr, .. } if addr == refused),
+        "{error}"
+    );
+    // The half-started process must not be left behind.
+    let pid: u32 = fs::read_to_string(&pid_note)
+        .expect("the fake daemon ran")
+        .trim()
+        .parse()
+        .unwrap();
+    let gone = PidFile {
+        pid,
+        tcp: refused,
+        http: refused,
+    };
+    assert!(!gone.is_alive(), "pid {pid} still alive after spawn failed");
+}

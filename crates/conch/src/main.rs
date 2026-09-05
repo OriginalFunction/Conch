@@ -210,11 +210,26 @@ async fn run_local(command: LocalCommand) -> Result<(), Box<dyn std::error::Erro
             // one as well would leave the unit's daemon unable to bind, exiting, and being
             // restarted forever, so stop whatever is running and let the unit own it.
             if conch_launch::wait_for_port(tcp, std::time::Duration::from_millis(300)) {
-                if let Some(existing) = conch_launch::PidFile::read(&data_dir) {
-                    match existing.stop(std::time::Duration::from_secs(5)) {
-                        Ok(()) | Err(conch_launch::LaunchError::PidMismatch { .. }) => {}
+                // Only a daemon the pid file names can be stopped. A listener with no
+                // pid file, or one whose pid was recycled, is not ours to signal — and
+                // a unit installed now would fail to bind and be restarted forever.
+                let stopped = match conch_launch::PidFile::read(&data_dir) {
+                    Some(existing) => match existing.stop(std::time::Duration::from_secs(5)) {
+                        Ok(()) => true,
+                        Err(conch_launch::LaunchError::PidMismatch { .. }) => false,
                         Err(error) => return Err(error.into()),
-                    }
+                    },
+                    None => false,
+                };
+                if !stopped
+                    || conch_launch::wait_for_port(tcp, std::time::Duration::from_millis(300))
+                {
+                    return Err(format!(
+                        "something is already listening on {tcp} that `conch` did not start \
+                         (no pid file in {} names it); stop it first, then rerun `conch up --service`",
+                        data_dir.display()
+                    )
+                    .into());
                 }
                 conch_launch::PidFile::remove(&data_dir);
             }
