@@ -22,6 +22,6 @@ conch setup opencode   # OpenCode
 | gemini | `~/.gemini/settings.json` → `mcpServers.conch` | `~/.agents/skills/join-room/` |
 | opencode | `~/.config/opencode/opencode.json[c]` → `mcp.conch` | `~/.config/opencode/skills/join-room/` |
 
-Options: `--agent ID` (default `agent:<host>`), `--scope project` for the project-level file in the current directory, `--env K=V` to add environment (for example `CONCH_NODE`), `--dry-run` to print the diff.
+Options: `--agent ID` (default `agent:<host>`), `--scope project` for the project-level file in the current directory, `--env K=V` to add environment (for example `CONCH_NODE`), `--dry-run` to print the diff. Set `CONCH_SETUP_SKIP_DAEMON=1` to write the config and skill without starting a local daemon, for a host that will point at a remote node.
 
 Run `conch doctor` to see which hosts are configured and whether their skill copy is current.

@@ -78,6 +78,15 @@ The TLS private key must already be mode `0600` or stricter. Public transport ne
 
 All CLI commands accept `--node`, `--agent`, `--room`, and `--tls-ca`, with `CONCH_NODE`, `CONCH_AGENT`, `CONCH_ROOM`, and `CONCH_TLS_CA` equivalents. The last created or joined room is saved as `current-room`.
 
+### Environment
+
+| Variable | Effect |
+|---|---|
+| `CONCH_DATA_DIR` | Data directory for `conchd` and for `conch up`, `down`, and `doctor` (default `~/.conch`). |
+| `CONCH_DEFAULT_TCP`, `CONCH_DEFAULT_HTTP` | Addresses `conch up`, auto-spawn, and `doctor` expect a local daemon on (defaults `127.0.0.1:7421` and `127.0.0.1:7420`). Set both for a side-by-side install. |
+| `CONCH_CONCHD` | Path of the `conchd` binary to start, instead of the one beside `conch` or on `PATH`. |
+| `CONCH_SETUP_SKIP_DAEMON` | When set, `conch setup` writes the config and skill without starting a daemon — for a host that will talk to a remote node via `--env CONCH_NODE=...`. |
+
 ### Local operator console
 
 Open `http://127.0.0.1:7420/` on the daemon machine. In local mode the browser
@@ -125,6 +134,8 @@ GitHub CI also tests deterministic release assembly and exercises the Linux pack
 Consensus conformance includes executable traces for Examples H, H2, and I, Win-abort, 2–2 freeze, crash carry-forward, live catch-up term advancement, and leader self-removal.
 
 ## Install
+
+The [Quickstart](#quickstart) is the normal path: the Homebrew tap on macOS, the hosted installer on Linux. The wrappers in this section run from a source checkout and exist for verified, offline, and packaged installs.
 
 Default ports: HTTP/WebSocket **7420**, TCP **7421**. Data dir `~/.conch`.
 

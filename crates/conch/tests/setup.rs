@@ -235,10 +235,11 @@ fn setup_keeps_the_configs_own_mode_and_writes_the_backup_the_same_way() {
 }
 
 #[test]
-fn a_config_that_would_not_parse_afterwards_is_never_written() {
+fn a_config_that_does_not_parse_is_refused_before_anything_is_touched() {
     let home = TempDir::new().unwrap();
     let config = home.path().join(".claude.json");
-    // Scans far enough for the member insert to succeed, but the result is not JSON.
+    // Structured enough for the member scanner to find its insertion point, but not
+    // JSON: it is refused up front, and no backup or scratch file appears.
     let original = "{\"projects\":{\"a\": ,},\"other\":1}";
     fs::write(&config, original).unwrap();
     let output = conch(home.path(), home.path(), &["setup", "claude"]);

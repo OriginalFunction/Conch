@@ -408,4 +408,35 @@ mod tests {
         );
         assert_eq!(skill_version(&text).as_deref(), Some("9.9.9"));
     }
+
+    // `validate` guards both ends of `run`: the file as found, and the merged text
+    // before it is written. The merge itself is byte-preserving, so the second gate
+    // can only be reached through these functions.
+    #[test]
+    fn validate_accepts_each_format_and_rejects_damage() {
+        assert!(validate(Format::Json, "{\"a\": 1}").is_ok());
+        assert!(validate(Format::Json, "{\"a\": 1,}").is_err());
+        assert!(validate(Format::Json, "{\"a\": ,}").is_err());
+        // JSONC: comments and trailing commas are not damage.
+        assert!(validate(
+            Format::Jsonc,
+            "{\n  // c\n  \"a\": [1, 2,],\n  \"b\": {\"c\": \"x,}\",},\n}\n"
+        )
+        .is_ok());
+        assert!(validate(Format::Jsonc, "{ \"a\": }").is_err());
+        assert!(validate(Format::Toml, "[a]\nb = 1\n").is_ok());
+        assert!(validate(Format::Toml, "[a\nb = 1\n").is_err());
+    }
+
+    #[test]
+    fn trailing_commas_are_dropped_only_outside_strings() {
+        assert_eq!(strip_trailing_commas("[1, 2,]"), "[1, 2]");
+        assert_eq!(strip_trailing_commas("{\"a\": 1, }"), "{\"a\": 1 }");
+        assert_eq!(strip_trailing_commas("{\"a\": \",}\",}"), "{\"a\": \",}\"}");
+        assert_eq!(
+            strip_trailing_commas("{\"a\": \"esc\\\",\",}"),
+            "{\"a\": \"esc\\\",\"}"
+        );
+        assert_eq!(strip_trailing_commas("[1,\n  2,\n]"), "[1,\n  2\n]");
+    }
 }
