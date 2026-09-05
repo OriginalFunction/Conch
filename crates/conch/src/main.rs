@@ -129,7 +129,9 @@ async fn run_local(command: LocalCommand) -> Result<(), Box<dyn std::error::Erro
             env,
             dry_run,
         } => {
-            if env::var_os("CONCH_SETUP_SKIP_DAEMON").is_none() {
+            // A dry run reports what it would change and changes nothing — including
+            // not starting a daemon.
+            if !dry_run && env::var_os("CONCH_SETUP_SKIP_DAEMON").is_none() {
                 ensure_daemon().await?;
             }
             let home = env::var_os("HOME")
@@ -225,7 +227,7 @@ async fn run_local(command: LocalCommand) -> Result<(), Box<dyn std::error::Erro
                 )
                 .into());
             }
-            match conch_launch::PidFile::read(&data_dir) {
+            match conch_launch::wait_for_pid_file(&data_dir, std::time::Duration::from_secs(SECS)) {
                 Some(pid) => print_running(pid.pid, &data_dir, http),
                 None => println!("conchd running\nui:  http://{http}/"),
             }
@@ -342,9 +344,22 @@ async fn connect_with_spawn(
     let addr = parse_node_addr(node)?;
     match TcpStream::connect(addr).await {
         Ok(stream) => Ok(stream),
+        // Auto-spawn is a convenience; when it does not work the user still needs the
+        // remedy for "nothing is listening", with the underlying cause beneath it.
         Err(error) if error.kind() == io::ErrorKind::ConnectionRefused && node_is_default => {
-            ensure_daemon().await?;
-            Ok(TcpStream::connect(addr).await?)
+            let spawned = ensure_daemon().await;
+            let failure = match spawned {
+                Ok(()) => match TcpStream::connect(addr).await {
+                    Ok(stream) => return Ok(stream),
+                    Err(error) => error.to_string(),
+                },
+                Err(error) => error.to_string(),
+            };
+            Err(format!(
+                "{}\ncause: {failure}",
+                conch::remedy::connect_error(&addr.to_string())
+            )
+            .into())
         }
         Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
             Err(conch::remedy::connect_error(&addr.to_string()).into())

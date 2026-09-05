@@ -82,6 +82,17 @@ pub fn run(options: &SetupOptions) -> Result<SetupReport, SetupError> {
         Err(e) => return Err(e.into()),
     };
     let before = existing.clone().unwrap_or_default();
+    let unparseable = |source: edit::EditError| SetupError::Unparseable {
+        path: config_path.clone(),
+        source: Box::new(source),
+        fallback: host.fallback_command(&command, &args),
+    };
+    // Refuse a file we cannot understand before touching anything, and refuse our own
+    // result if the merge produced something that would not parse: the spec is that a
+    // file which fails to parse is never written.
+    if !before.trim().is_empty() {
+        validate(host.format(), &before).map_err(&unparseable)?;
+    }
     let merged = match host.format() {
         Format::Json | Format::Jsonc => edit::json::set_member(
             &before,
@@ -104,11 +115,8 @@ pub fn run(options: &SetupOptions) -> Result<SetupReport, SetupError> {
             },
         ),
     }
-    .map_err(|source| SetupError::Unparseable {
-        path: config_path.clone(),
-        source: Box::new(source),
-        fallback: host.fallback_command(&command, &args),
-    })?;
+    .map_err(&unparseable)?;
+    validate(host.format(), &merged).map_err(&unparseable)?;
     let config_changed = merged != before;
     let diff = similar::TextDiff::from_lines(&before, &merged)
         .unified_diff()
@@ -164,21 +172,74 @@ pub fn run(options: &SetupOptions) -> Result<SetupReport, SetupError> {
     })
 }
 
+/// Does this text still parse as the host's format? JSONC is reduced to plain JSON
+/// first, so comments and trailing commas are not mistaken for damage.
+fn validate(format: Format, text: &str) -> Result<(), edit::EditError> {
+    match format {
+        Format::Json => serde_json::from_str::<serde_json::Value>(text)
+            .map(|_| ())
+            .map_err(|error| edit::EditError::Json(error.to_string())),
+        Format::Jsonc => {
+            let plain = strip_trailing_commas(&edit::json::strip_comments(text));
+            serde_json::from_str::<serde_json::Value>(&plain)
+                .map(|_| ())
+                .map_err(|error| edit::EditError::Json(error.to_string()))
+        }
+        Format::Toml => text
+            .parse::<toml_edit::DocumentMut>()
+            .map(|_| ())
+            .map_err(edit::EditError::Toml),
+    }
+}
+
+/// Drop each `,` that sits directly before a closing `}` or `]` so JSONC passes a
+/// strict JSON parse. Comments must already have been removed.
+fn strip_trailing_commas(text: &str) -> String {
+    let mut marked: Vec<(char, bool)> = Vec::new();
+    let (mut in_string, mut escaped) = (false, false);
+    for ch in text.chars() {
+        let was_in_string = in_string;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+        } else if ch == '"' {
+            in_string = true;
+        }
+        marked.push((ch, was_in_string));
+    }
+    let mut out = String::with_capacity(text.len());
+    for (index, &(ch, inside)) in marked.iter().enumerate() {
+        if !inside && ch == ',' {
+            let next = marked[index + 1..]
+                .iter()
+                .find(|(c, inside)| *inside || !c.is_whitespace());
+            if matches!(next, Some((c, false)) if *c == '}' || *c == ']') {
+                continue;
+            }
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// The existing file's permission bits, or `None` when it does not exist yet (in which
 /// case the process umask decides, as for any newly created file).
+#[cfg(unix)]
 fn file_mode(path: &Path) -> Option<u32> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        return fs::metadata(path)
-            .ok()
-            .map(|meta| meta.permissions().mode() & 0o7777);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        None
-    }
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .ok()
+        .map(|meta| meta.permissions().mode() & 0o7777)
+}
+
+#[cfg(not(unix))]
+fn file_mode(_path: &Path) -> Option<u32> {
+    None
 }
 
 /// Replace `path` in one step. The temporary is created with `mode` from the outset so

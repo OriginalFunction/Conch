@@ -266,6 +266,43 @@ fn status_auto_spawns_on_default_node_and_says_so() {
 }
 
 #[test]
+fn default_node_spawn_failure_prints_remedy() {
+    let data = TempDir::new().unwrap();
+    let (dead, http, reserved) = reserve_ports();
+    drop(reserved);
+    // Run a copy of the CLI from a directory with no conchd beside it, with no
+    // override and no PATH, so locating conchd cannot succeed.
+    let bin_dir = TempDir::new().unwrap();
+    let conch_copy = bin_dir.path().join("conch");
+    fs::copy(env!("CARGO_BIN_EXE_conch"), &conch_copy).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&conch_copy, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let output = Command::new(&conch_copy)
+        .arg("status")
+        .env("CONCH_DATA_DIR", data.path())
+        .env("CONCH_CONCHD", "/nonexistent/conchd")
+        .env("CONCH_DEFAULT_TCP", dead.to_string())
+        .env("CONCH_DEFAULT_HTTP", http.to_string())
+        .env_remove("CONCH_NODE")
+        .env_remove("PATH")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains(&format!("conchd is not running on {dead}")),
+        "{err}"
+    );
+    assert!(err.contains("`conch up`"), "{err}");
+    assert!(err.contains("conchd binary not found"), "{err}");
+    assert!(PidFile::read(data.path()).is_none());
+}
+
+#[test]
 fn explicit_node_never_spawns_and_prints_remedy() {
     let data = TempDir::new().unwrap();
     let (dead, _http, reserved) = reserve_ports();

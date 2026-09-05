@@ -119,6 +119,22 @@ pub fn wait_for_port(addr: SocketAddr, timeout: Duration) -> bool {
     }
 }
 
+/// Wait for the daemon that owns `data_dir` to publish its pid file. conchd binds its
+/// listeners first, so a port that accepts connections does not yet mean the pid file
+/// is on disk; anything that reads it straight after a successful probe waits here.
+pub fn wait_for_pid_file(data_dir: &Path, timeout: Duration) -> Option<PidFile> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(file) = PidFile::read(data_dir) {
+            return Some(file);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 pub struct SpawnOptions {
     pub conchd: PathBuf,
     pub data_dir: PathBuf,
@@ -173,6 +189,9 @@ pub fn spawn_detached(options: &SpawnOptions) -> Result<u32, LaunchError> {
             log: tail_log(&options.data_dir, 20),
         });
     }
+    // Bound listeners come before the pid file, so callers that read it next
+    // (`conch up`, `doctor`) would otherwise race the daemon's own startup.
+    let _ = wait_for_pid_file(&options.data_dir, Duration::from_secs(SECS));
     // The child outlives us; reap it in the background so it never lingers
     // as a zombie under our pid (kill -0 would otherwise still see it as
     // alive after it exits, since nothing else waits on it).
