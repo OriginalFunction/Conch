@@ -80,6 +80,72 @@ fn setup(home: &TempDir, host: &str) {
 }
 
 #[test]
+fn doctor_reports_a_broken_environment_instead_of_bailing_out() {
+    let data = TempDir::new().unwrap();
+    // doctor exists to diagnose a broken install; an unset HOME or a mistyped
+    // CONCH_DEFAULT_TCP must appear as checks, not abort the whole report.
+    let output = Command::new(env!("CARGO_BIN_EXE_conch"))
+        .arg("doctor")
+        .env_remove("HOME")
+        .env("CONCH_DATA_DIR", data.path())
+        .env("CONCH_DEFAULT_TCP", "not-an-address")
+        .env_remove("CONCH_NODE")
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{out}");
+    assert!(out.contains("fail  daemon"), "{out}");
+    assert!(out.contains("not-an-address"), "{out}");
+    assert!(out.contains("fail  hosts"), "{out}");
+    assert!(out.contains("HOME is not set"), "{out}");
+    // and it still printed the checks that do not depend on either
+    assert!(out.contains("data dir"), "{out}");
+}
+
+#[test]
+fn doctor_names_a_duplicate_install_once_when_path_repeats_a_directory() {
+    let (home, data) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let other = TempDir::new().unwrap();
+    fs::write(other.path().join("conch"), "#!/bin/sh\n").unwrap();
+    let (dead, _http, reserved) = reserve_ports();
+    drop(reserved);
+    let repeated = format!("{0}:{0}", other.path().display());
+    let output = Command::new(env!("CARGO_BIN_EXE_conch"))
+        .arg("doctor")
+        .env("HOME", home.path())
+        .env("CONCH_DATA_DIR", data.path())
+        .env("CONCH_DEFAULT_TCP", dead.to_string())
+        .env("PATH", repeated)
+        .env_remove("CONCH_NODE")
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&output.stdout);
+    let duplicate = other.path().join("conch").display().to_string();
+    assert!(out.contains(&duplicate), "{out}");
+    assert_eq!(
+        out.matches(&duplicate).count(),
+        1,
+        "duplicate listed once per install, not once per PATH entry: {out}"
+    );
+}
+
+#[test]
+fn doctor_distinguishes_an_unversioned_skill_from_a_missing_one() {
+    let (home, data) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    setup(&home, "claude");
+    let skill = home.path().join(".claude/skills/join-room/SKILL.md");
+    // A copy written before skills carried a version marker.
+    fs::write(&skill, "---\nname: join-room\n---\n\n# Join a room\n").unwrap();
+    let (dead, _http, reserved) = reserve_ports();
+    drop(reserved);
+    let out = String::from_utf8_lossy(&doctor(&home, &data, dead).stdout).into_owned();
+    assert!(
+        out.contains("warn  claude        agent:claude, skill unversioned (pre-1.3)"),
+        "{out}"
+    );
+}
+
+#[test]
 fn doctor_fails_without_a_daemon_and_names_the_remedy() {
     let (home, data) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     let (dead, _http, reserved) = reserve_ports();

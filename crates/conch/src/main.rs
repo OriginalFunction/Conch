@@ -268,22 +268,29 @@ async fn run_local(command: LocalCommand) -> Result<(), Box<dyn std::error::Erro
             Ok(())
         }
         LocalCommand::Doctor => {
-            let addr: SocketAddr = default_tcp().parse()?;
-            let daemon = if conch_launch::wait_for_port(addr, std::time::Duration::from_millis(300))
-            {
-                let version = probe_version(addr).await;
-                conch::doctor::DaemonProbe::Reachable { addr, version }
-            } else {
-                conch::doctor::DaemonProbe::Unreachable { addr }
+            // doctor exists to report a broken install; every input it cannot get is a
+            // check that fails, never a reason to print nothing.
+            let node = default_tcp();
+            let daemon = match node.parse::<SocketAddr>() {
+                Ok(addr) => {
+                    if conch_launch::wait_for_port(addr, std::time::Duration::from_millis(300)) {
+                        let version = probe_version(addr).await;
+                        conch::doctor::DaemonProbe::Reachable { addr, version }
+                    } else {
+                        conch::doctor::DaemonProbe::Unreachable { addr }
+                    }
+                }
+                Err(error) => conch::doctor::DaemonProbe::BadAddress {
+                    node,
+                    error: error.to_string(),
+                },
             };
             let checks = conch::doctor::run_checks(&conch::doctor::DoctorInput {
                 cli_version: env!("CARGO_PKG_VERSION").into(),
-                conch_binary: env::current_exe()?,
+                conch_binary: stable_binary_path(),
                 daemon,
                 data_dir: conch_launch::default_data_dir(),
-                home: env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .ok_or("HOME is not set")?,
+                home: env::var_os("HOME").map(PathBuf::from),
                 current_room: read_current_room(),
             });
             print!("{}", conch::doctor::render(&checks));

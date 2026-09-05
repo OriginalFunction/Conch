@@ -29,10 +29,12 @@ pub struct Check {
 
 pub struct DoctorInput {
     pub cli_version: String,
-    pub conch_binary: PathBuf,
+    /// `None` when the running binary's own path could not be determined.
+    pub conch_binary: Option<PathBuf>,
     pub daemon: DaemonProbe,
     pub data_dir: PathBuf,
-    pub home: PathBuf,
+    /// `None` when `HOME` is not set.
+    pub home: Option<PathBuf>,
     pub current_room: Option<String>,
 }
 
@@ -43,6 +45,11 @@ pub enum DaemonProbe {
     Reachable {
         addr: SocketAddr,
         version: Option<String>,
+    },
+    /// The configured default node is not an address at all.
+    BadAddress {
+        node: String,
+        error: String,
     },
 }
 
@@ -62,18 +69,25 @@ fn check(
 
 pub fn run_checks(input: &DoctorInput) -> Vec<Check> {
     let mut out = Vec::new();
-    out.push(check(
-        Level::Ok,
-        "conch",
-        format!(
-            "{} version {}",
-            input.conch_binary.display(),
-            input.cli_version
-        ),
-        None,
-    ));
+    match &input.conch_binary {
+        Some(binary) => out.push(check(
+            Level::Ok,
+            "conch",
+            format!("{} version {}", binary.display(), input.cli_version),
+            None,
+        )),
+        None => out.push(check(
+            Level::Fail,
+            "conch",
+            format!(
+                "version {} (cannot determine this binary's own path)",
+                input.cli_version
+            ),
+            Some("run conch by its full path, or reinstall it".into()),
+        )),
+    }
 
-    let duplicates = duplicates_on_path(&input.conch_binary);
+    let duplicates = duplicates_on_path(input.conch_binary.as_deref());
     if !duplicates.is_empty() {
         out.push(check(
             Level::Warn,
@@ -84,6 +98,12 @@ pub fn run_checks(input: &DoctorInput) -> Vec<Check> {
     }
 
     match &input.daemon {
+        DaemonProbe::BadAddress { node, error } => out.push(check(
+            Level::Fail,
+            "daemon",
+            format!("default node {node} is not an address ({error})"),
+            Some("unset CONCH_DEFAULT_TCP, or set it to host:port".into()),
+        )),
         DaemonProbe::Unreachable { addr } => out.push(check(
             Level::Fail,
             "daemon",
@@ -187,8 +207,18 @@ pub fn run_checks(input: &DoctorInput) -> Vec<Check> {
         )),
     }
 
-    for host in ALL_HOSTS {
-        out.push(host_check(host, &input.home, &input.cli_version));
+    match &input.home {
+        Some(home) => {
+            for host in ALL_HOSTS {
+                out.push(host_check(host, home, &input.cli_version));
+            }
+        }
+        None => out.push(check(
+            Level::Fail,
+            "hosts",
+            "HOME is not set, so no host config can be found",
+            Some("set HOME to your home directory and run `conch doctor` again".into()),
+        )),
     }
     out
 }
@@ -262,21 +292,21 @@ fn host_check(host: Host, home: &Path, cli_version: &str) -> Check {
         );
     }
     let skill = fs::read_to_string(host.skill_dir(home).join("SKILL.md")).ok();
-    match skill.as_deref().and_then(setup::skill_version) {
-        Some(v) if v == cli_version => check(Level::Ok, host.name(), agent, None),
-        Some(v) => check(
-            Level::Warn,
-            host.name(),
-            format!("{agent}, skill {v} is stale"),
-            Some(format!("run `conch setup {}`", host.name())),
-        ),
-        None => check(
-            Level::Warn,
-            host.name(),
-            format!("{agent}, skill missing"),
-            Some(format!("run `conch setup {}`", host.name())),
-        ),
-    }
+    let detail = match skill.as_deref() {
+        None => format!("{agent}, skill missing"),
+        Some(text) => match setup::skill_version(text) {
+            Some(v) if v == cli_version => return check(Level::Ok, host.name(), agent, None),
+            Some(v) => format!("{agent}, skill {v} is stale"),
+            // A copy is there, it just predates the version marker.
+            None => format!("{agent}, skill unversioned (pre-1.3)"),
+        },
+    };
+    check(
+        Level::Warn,
+        host.name(),
+        detail,
+        Some(format!("run `conch setup {}`", host.name())),
+    )
 }
 
 fn agent_from_args(args: &[String]) -> Option<String> {
@@ -284,19 +314,28 @@ fn agent_from_args(args: &[String]) -> Option<String> {
     args.get(index + 1).cloned()
 }
 
-fn duplicates_on_path(current: &Path) -> Vec<String> {
-    let canonical = fs::canonicalize(current).ok();
-    env::var_os("PATH")
-        .map(|path| {
-            env::split_paths(&path)
-                .map(|dir| dir.join("conch"))
-                .filter(|candidate| {
-                    candidate.is_file() && fs::canonicalize(candidate).ok() != canonical
-                })
-                .map(|p| p.display().to_string())
-                .collect()
-        })
-        .unwrap_or_default()
+/// Other `conch` binaries on PATH, each named once however many times PATH repeats
+/// the directory it sits in.
+fn duplicates_on_path(current: Option<&Path>) -> Vec<String> {
+    let canonical = current.and_then(|current| fs::canonicalize(current).ok());
+    let Some(path) = env::var_os("PATH") else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for candidate in env::split_paths(&path).map(|dir| dir.join("conch")) {
+        if !candidate.is_file() {
+            continue;
+        }
+        let resolved = fs::canonicalize(&candidate).ok();
+        if resolved.is_some() && resolved == canonical {
+            continue;
+        }
+        if seen.insert(resolved.unwrap_or_else(|| candidate.clone())) {
+            out.push(candidate.display().to_string());
+        }
+    }
+    out
 }
 
 pub fn render(checks: &[Check]) -> String {

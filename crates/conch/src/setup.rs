@@ -154,14 +154,19 @@ pub fn run(options: &SetupOptions) -> Result<SetupReport, SetupError> {
     .map_err(&unparseable)?;
     validate(host.format(), &merged).map_err(&unparseable)?;
     let config_changed = merged != before;
-    let diff = similar::TextDiff::from_lines(&before, &merged)
-        .unified_diff()
-        .context_radius(2)
-        .header(
-            &config_path.display().to_string(),
-            &config_path.display().to_string(),
-        )
-        .to_string();
+    // Only `--dry-run` ever prints the diff; computing it otherwise is pure cost.
+    let diff = if options.dry_run {
+        similar::TextDiff::from_lines(&before, &merged)
+            .unified_diff()
+            .context_radius(2)
+            .header(
+                &config_path.display().to_string(),
+                &config_path.display().to_string(),
+            )
+            .to_string()
+    } else {
+        String::new()
+    };
 
     let skill_path = host.skill_dir(&options.home).join("SKILL.md");
     let wanted_skill = skill_text(&options.version);
