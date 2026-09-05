@@ -154,6 +154,30 @@ fn project_scope_targets_cwd_files() {
 }
 
 #[test]
+fn skill_only_rerun_does_not_claim_config_was_written() {
+    let home = TempDir::new().unwrap();
+    ok(&conch(home.path(), home.path(), &["setup", "claude"]));
+    let skill_path = home.path().join(".claude/skills/join-room/SKILL.md");
+    let skill = fs::read_to_string(&skill_path).unwrap();
+    fs::write(
+        &skill_path,
+        skill.replace(env!("CARGO_PKG_VERSION"), "0.0.1"),
+    )
+    .unwrap();
+
+    let out = ok(&conch(home.path(), home.path(), &["setup", "claude"]));
+    assert!(!out.contains("wrote"), "{out}");
+    assert!(out.contains("config already correct"), "{out}");
+    assert!(out.contains("skill →"), "{out}");
+    let skill = fs::read_to_string(&skill_path).unwrap();
+    assert!(skill.contains(&format!(
+        "<!-- conch-skill-version: {} -->",
+        env!("CARGO_PKG_VERSION")
+    )));
+    assert!(!home.path().join(".claude.json.conch-bak").exists());
+}
+
+#[test]
 fn unknown_host_is_rejected() {
     let home = TempDir::new().unwrap();
     let output = conch(home.path(), home.path(), &["setup", "vim"]);

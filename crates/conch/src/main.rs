@@ -155,18 +155,30 @@ async fn run_local(command: LocalCommand) -> Result<(), Box<dyn std::error::Erro
                     host.name(),
                     report.config_path.display()
                 ),
-                _ => {
-                    println!(
-                        "{}: wrote {}{}",
-                        host.name(),
-                        report.config_path.display(),
-                        report
-                            .backup_path
-                            .as_ref()
-                            .map(|b| format!(" (backup {})", b.display()))
-                            .unwrap_or_default()
-                    );
-                    println!("skill → {}", report.skill_path.display());
+                (config_changed, skill_changed) => {
+                    if config_changed {
+                        println!(
+                            "{}: wrote {}{}",
+                            host.name(),
+                            report.config_path.display(),
+                            report
+                                .backup_path
+                                .as_ref()
+                                .map(|b| format!(" (backup {})", b.display()))
+                                .unwrap_or_default()
+                        );
+                    } else {
+                        println!(
+                            "{}: config already correct ({})",
+                            host.name(),
+                            report.config_path.display()
+                        );
+                    }
+                    if skill_changed {
+                        println!("skill → {}", report.skill_path.display());
+                    } else {
+                        println!("skill up to date ({})", report.skill_path.display());
+                    }
                 }
             }
             println!("{}", report.next_step);
