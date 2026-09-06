@@ -680,6 +680,39 @@ struct Globals {
     json: bool,
 }
 
+/// Parse one global flag into `globals`, reading its value (if it takes one) from
+/// `next`. Returns `Ok(true)` when `flag` was a global option (fully consumed,
+/// including any value), `Ok(false)` when it wasn't — the caller keeps `flag` for
+/// its own use (e.g. as the command word, or a command-owned argument).
+fn take_global(
+    flag: &str,
+    next: &mut impl FnMut() -> Option<String>,
+    globals: &mut Globals,
+) -> Result<bool, String> {
+    match flag {
+        "--json" => globals.json = true,
+        "--node" => {
+            globals.node = next().ok_or("--node requires a URL")?;
+            globals.node_explicit = true;
+        }
+        "--agent" => globals.agent = next().ok_or("--agent requires a name")?,
+        "--room" => globals.room = Some(next().ok_or("--room requires an id")?),
+        "--token" => {
+            globals.token = Some(
+                next()
+                    .ok_or("--token requires a 64-character hex capability")?
+                    .parse::<Hash32>()
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        "--tls-ca" => {
+            globals.tls_ca = Some(PathBuf::from(next().ok_or("--tls-ca requires a PEM file")?));
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
 /// Pull global options out of the arguments that follow the command word, leaving
 /// the command's own arguments in order.
 fn extract_globals(
@@ -698,29 +731,10 @@ fn extract_globals(
             }
             continue;
         }
-        match arg.as_str() {
-            "--json" => globals.json = true,
-            "--node" => {
-                globals.node = iter.next().ok_or("--node requires a URL")?;
-                globals.node_explicit = true;
-            }
-            "--agent" => globals.agent = iter.next().ok_or("--agent requires a name")?,
-            "--room" => globals.room = Some(iter.next().ok_or("--room requires an id")?),
-            "--token" => {
-                globals.token = Some(
-                    iter.next()
-                        .ok_or("--token requires a 64-character hex capability")?
-                        .parse::<Hash32>()
-                        .map_err(|error| error.to_string())?,
-                );
-            }
-            "--tls-ca" => {
-                globals.tls_ca = Some(PathBuf::from(
-                    iter.next().ok_or("--tls-ca requires a PEM file")?,
-                ))
-            }
-            _ => rest.push(arg),
+        if take_global(&arg, &mut || iter.next(), globals)? {
+            continue;
         }
+        rest.push(arg);
     }
     Ok(rest)
 }
@@ -728,54 +742,25 @@ fn extract_globals(
 impl Arguments {
     fn parse(arguments: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut arguments = arguments.peekable();
-        let mut node =
-            env::var("CONCH_NODE").unwrap_or_else(|_| format!("tcp://{}", default_tcp()));
-        let mut node_explicit = false;
-        let mut agent = env::var("CONCH_AGENT").unwrap_or_else(|_| default_agent());
-        let mut tls_ca = env::var_os("CONCH_TLS_CA").map(PathBuf::from);
-        let mut room = env::var("CONCH_ROOM").ok().or_else(read_current_room);
-        let mut token = env::var("CONCH_TOKEN")
-            .ok()
-            .map(|value| value.parse::<Hash32>())
-            .transpose()
-            .map_err(|error| format!("invalid CONCH_TOKEN: {error}"))?;
-        let mut json = false;
+        let mut globals = Globals {
+            node: env::var("CONCH_NODE").unwrap_or_else(|_| format!("tcp://{}", default_tcp())),
+            node_explicit: false,
+            agent: env::var("CONCH_AGENT").unwrap_or_else(|_| default_agent()),
+            room: env::var("CONCH_ROOM").ok().or_else(read_current_room),
+            token: env::var("CONCH_TOKEN")
+                .ok()
+                .map(|value| value.parse::<Hash32>())
+                .transpose()
+                .map_err(|error| format!("invalid CONCH_TOKEN: {error}"))?,
+            tls_ca: env::var_os("CONCH_TLS_CA").map(PathBuf::from),
+            json: false,
+        };
 
-        while let Some(argument) = arguments.peek().cloned() {
+        let command = loop {
+            let Some(argument) = arguments.next() else {
+                return Err("a command is required".into());
+            };
             match argument.as_str() {
-                "--node" => {
-                    arguments.next();
-                    node = arguments.next().ok_or("--node requires a URL")?;
-                    node_explicit = true;
-                }
-                "--agent" => {
-                    arguments.next();
-                    agent = arguments.next().ok_or("--agent requires a name")?;
-                }
-                "--room" => {
-                    arguments.next();
-                    room = Some(arguments.next().ok_or("--room requires an id")?);
-                }
-                "--token" => {
-                    arguments.next();
-                    token = Some(
-                        arguments
-                            .next()
-                            .ok_or("--token requires a 64-character hex capability")?
-                            .parse::<Hash32>()
-                            .map_err(|error| error.to_string())?,
-                    );
-                }
-                "--tls-ca" => {
-                    arguments.next();
-                    tls_ca = Some(PathBuf::from(
-                        arguments.next().ok_or("--tls-ca requires a PEM file")?,
-                    ));
-                }
-                "--json" => {
-                    arguments.next();
-                    json = true;
-                }
                 "--version" | "-V" => {
                     println!("conch {}", env!("CARGO_PKG_VERSION"));
                     std::process::exit(0);
@@ -784,11 +769,14 @@ impl Arguments {
                     print_help();
                     std::process::exit(0);
                 }
-                _ => break,
+                _ => {
+                    if take_global(&argument, &mut || arguments.next(), &mut globals)? {
+                        continue;
+                    }
+                    break argument;
+                }
             }
-        }
-
-        let command = arguments.next().ok_or("a command is required")?;
+        };
         if command == "help" {
             if let Some(command) = arguments.next() {
                 print_command_help(&command)?;
@@ -799,15 +787,6 @@ impl Arguments {
         }
 
         let rest: Vec<String> = arguments.collect();
-        let mut globals = Globals {
-            node,
-            node_explicit,
-            agent,
-            room,
-            token,
-            tls_ca,
-            json,
-        };
         let rest = extract_globals(&command, rest, &mut globals)?;
         let Globals {
             node,
