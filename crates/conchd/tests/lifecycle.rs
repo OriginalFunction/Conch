@@ -13,6 +13,7 @@ use conch_core::{
 };
 use conch_launch::{spawn_detached, PidFile, SpawnOptions};
 use conchd::tcp::Daemon;
+use serde_json::json;
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -281,5 +282,98 @@ async fn status_for_a_room_names_it() {
     let data = reply.data.unwrap();
     assert_eq!(data["name"], "Doctor Room");
     assert_eq!(data["head_n"], 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn history_records_name_the_author_of_each_take() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let ticket = daemon
+        .create_ticket(
+            "Authors",
+            conch_core::types::StakePolicy::default(),
+            conch_core::types::FloorConfig::stick(300),
+        )
+        .unwrap();
+    let server = daemon
+        .start(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .await
+        .unwrap();
+    let room = ticket.id;
+    // One connection per request: `request` attaches as agent:test each time.
+    let granted = request(
+        server.addr(),
+        &ClientRequest::WaitForFloor {
+            room,
+            timeout_secs: Some(5),
+        },
+    )
+    .await;
+    assert!(granted.ok, "{granted:?}");
+    let spoke = request(
+        server.addr(),
+        &ClientRequest::Speak {
+            room,
+            text: "first take".into(),
+            request_id: "00000000000000000000000000000001".into(),
+        },
+    )
+    .await;
+    assert!(spoke.ok, "{spoke:?}");
+    let yielded = request(server.addr(), &ClientRequest::Yield { room }).await;
+    assert!(yielded.ok, "{yielded:?}");
+    // A vacant configuration change has no author.
+    let configured = request(
+        server.addr(),
+        &ClientRequest::Membership {
+            room,
+            stake: None,
+            floor: Some(conch_core::types::FloorConfig::stick(120)),
+        },
+    )
+    .await;
+    assert!(configured.ok, "{configured:?}");
+
+    let page = request(
+        server.addr(),
+        &ClientRequest::History {
+            room,
+            from_n: 0,
+            follow: false,
+        },
+    )
+    .await;
+    assert!(page.ok, "{page:?}");
+    let scenes = page.data.unwrap()["scenes"].as_array().unwrap().clone();
+    assert_eq!(scenes.len(), 4, "{scenes:?}");
+    assert_eq!(scenes[0]["scene"]["body"]["type"], "genesis");
+    assert!(scenes[0].get("author").is_none());
+    assert_eq!(scenes[1]["scene"]["body"]["type"], "grant");
+    assert!(
+        scenes[1].get("author").is_none(),
+        "grants say `to`, not author"
+    );
+    assert_eq!(scenes[2]["scene"]["body"]["type"], "speech");
+    assert_eq!(scenes[2]["author"]["agent"], "agent:test");
+    assert_eq!(scenes[2]["author"]["node"], json!(daemon.node_id()));
+    assert_eq!(scenes[3]["scene"]["body"]["type"], "membership");
+    assert!(
+        scenes[3].get("author").is_none(),
+        "vacant membership has no author"
+    );
+
+    // A page that starts after the grant still resolves the author.
+    let tail = request(
+        server.addr(),
+        &ClientRequest::History {
+            room,
+            from_n: 2,
+            follow: false,
+        },
+    )
+    .await;
+    let scenes = tail.data.unwrap()["scenes"].as_array().unwrap().clone();
+    assert_eq!(scenes[0]["author"]["agent"], "agent:test");
     server.abort();
 }

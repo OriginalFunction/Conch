@@ -6021,6 +6021,10 @@ impl Daemon {
         }))
     }
 
+    /// Serve committed records with an `author` beside each take. The author is the
+    /// mouth named by the grant the take closes, resolved from the full history so a
+    /// page that starts after the grant still carries it. `author` sits beside
+    /// `scene`, never inside it: clients hash the scene envelope.
     fn history_page(
         &self,
         room: RoomId,
@@ -6032,6 +6036,26 @@ impl Daemon {
             .read()
             .expect("sync registry lock is not poisoned")
             .contains(&room);
+        let grantees: BTreeMap<Hash32, Mouth> = self
+            .replay(room)?
+            .history
+            .iter()
+            .filter_map(|record| match &record.scene.body {
+                Body::Grant { to, .. } => Some((hash_scene(&record.scene), to.clone())),
+                _ => None,
+            })
+            .collect();
+        let scenes = scenes
+            .into_iter()
+            .map(|record| {
+                let author = closes_grant(&record.scene.body).and_then(|hash| grantees.get(&hash));
+                let mut value = serde_json::to_value(&record)?;
+                if let (Some(author), Some(object)) = (author, value.as_object_mut()) {
+                    object.insert("author".into(), serde_json::to_value(author)?);
+                }
+                Ok(value)
+            })
+            .collect::<Result<Vec<Value>, serde_json::Error>>()?;
         Ok(json!({
             "scenes": scenes,
             "syncing": syncing,
@@ -6856,6 +6880,19 @@ fn hash_scene(scene: &Scene) -> Hash32 {
     Hash32::from_bytes(scene_hash(
         &serde_json::to_value(scene).expect("typed scene is serializable"),
     ))
+}
+
+/// The grant a scene closes, for every body kind that can be issued as a take.
+fn closes_grant(body: &Body) -> Option<Hash32> {
+    match body {
+        Body::Speech { closes_grant, .. } | Body::Breakout { closes_grant, .. } => {
+            Some(*closes_grant)
+        }
+        Body::Membership { closes_grant, .. } | Body::ViewChange { closes_grant, .. } => {
+            *closes_grant
+        }
+        Body::Genesis { .. } | Body::Grant { .. } => None,
+    }
 }
 
 fn scene_blobs(scene: &Scene) -> &[BlobRef] {

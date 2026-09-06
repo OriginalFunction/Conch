@@ -410,6 +410,29 @@ async fn get_history_matches_cli_protocol() {
     let tcp = daemon.start(loopback()).await.unwrap();
     let http = daemon.start_http(loopback()).await.unwrap();
 
+    // Drive one turn through the TCP client to create a speech record.
+    let granted = tcp_request(
+        tcp.addr(),
+        ClientRequest::WaitForFloor {
+            room,
+            timeout_secs: Some(5),
+        },
+    )
+    .await;
+    assert!(granted.ok, "{granted:?}");
+    let spoke = tcp_request(
+        tcp.addr(),
+        ClientRequest::Speak {
+            room,
+            text: "test message".into(),
+            request_id: "00000000000000000000000000000001".into(),
+        },
+    )
+    .await;
+    assert!(spoke.ok, "{spoke:?}");
+    let yielded = tcp_request(tcp.addr(), ClientRequest::Yield { room }).await;
+    assert!(yielded.ok, "{yielded:?}");
+
     let cli = tcp_request(
         tcp.addr(),
         ClientRequest::History {
@@ -423,7 +446,17 @@ async fn get_history_matches_cli_protocol() {
     let response = http_get(http.addr(), &format!("/history/{room}?from=0"), None).await;
     assert_eq!(response.0, 200);
     let http_history: Value = serde_json::from_slice(&response.1).unwrap();
-    assert_eq!(Some(http_history), cli.data);
+    assert_eq!(Some(http_history.clone()), cli.data);
+
+    // Verify that the speech record carries author on the HTTP side.
+    let body: Value = http_history;
+    let speech = body["scenes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["scene"]["body"]["type"] == "speech")
+        .expect("the turn committed a speech");
+    assert_eq!(speech["author"]["agent"], "local");
 }
 
 #[tokio::test]
