@@ -145,6 +145,7 @@ struct Inner {
     outbound_slots: Arc<Semaphore>,
     room_dials: Mutex<BTreeMap<RoomId, usize>>,
     floor_timeouts_started: AtomicBool,
+    floor_timeout_notices: Mutex<BTreeMap<RoomId, Hash32>>,
 }
 
 struct AuthFailureBucket {
@@ -321,6 +322,26 @@ struct AuthenticatedPeer {
 pub struct RunningServer {
     addr: SocketAddr,
     task: JoinHandle<Result<(), DaemonError>>,
+    floor_timeouts: Option<FloorTimeoutTicker>,
+}
+
+/// The leader's floor-timeout ticker, owned by the server that started it so
+/// that stopping the server stops the ticker and frees the daemon it pins.
+struct FloorTimeoutTicker {
+    daemon: Daemon,
+    task: JoinHandle<()>,
+}
+
+impl FloorTimeoutTicker {
+    /// Stop the ticker and release the once-per-daemon guard, so a server
+    /// started later in the same process gets a ticker of its own.
+    fn stop(&self) {
+        self.task.abort();
+        self.daemon
+            .inner
+            .floor_timeouts_started
+            .store(false, Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -354,6 +375,9 @@ impl RunningServer {
 
     pub fn abort(&self) {
         self.task.abort();
+        if let Some(ticker) = &self.floor_timeouts {
+            ticker.stop();
+        }
     }
 
     /// Run the accept loop to completion. Lets a caller bind first — so nothing
@@ -366,6 +390,9 @@ impl RunningServer {
 impl Drop for RunningServer {
     fn drop(&mut self) {
         self.task.abort();
+        if let Some(ticker) = &self.floor_timeouts {
+            ticker.stop();
+        }
     }
 }
 
@@ -467,6 +494,7 @@ impl Daemon {
                 outbound_slots: Arc::new(Semaphore::new(64)),
                 room_dials: Mutex::new(BTreeMap::new()),
                 floor_timeouts_started: AtomicBool::new(false),
+                floor_timeout_notices: Mutex::new(BTreeMap::new()),
             }),
         };
         daemon.recover_staged_breakouts()?;
@@ -1033,19 +1061,25 @@ impl Daemon {
     }
 
     pub async fn start(&self, addr: SocketAddr) -> Result<RunningServer, DaemonError> {
-        self.spawn_floor_timeouts();
         let listener = bind_listener(addr).await?;
         let addr = listener.local_addr()?;
         self.remember_addr(addr)?;
+        let floor_timeouts = self.spawn_floor_timeouts();
         let daemon = self.clone();
         let task = tokio::spawn(async move { daemon.serve_listener(listener).await });
-        Ok(RunningServer { addr, task })
+        Ok(RunningServer {
+            addr,
+            task,
+            floor_timeouts,
+        })
     }
 
     pub async fn serve(&self, addr: SocketAddr) -> Result<(), DaemonError> {
-        self.spawn_floor_timeouts();
         let listener = bind_listener(addr).await?;
         self.remember_addr(listener.local_addr()?)?;
+        // This call owns the process for its lifetime, so the ticker outlives
+        // the handle and stops only when the process does.
+        let _floor_timeouts = self.spawn_floor_timeouts();
         self.clone().serve_listener(listener).await
     }
 
@@ -1054,9 +1088,9 @@ impl Daemon {
         addr: SocketAddr,
         config: Arc<ServerConfig>,
     ) -> Result<(), DaemonError> {
-        self.spawn_floor_timeouts();
         let listener = bind_listener(addr).await?;
         self.remember_secure_addr(listener.local_addr()?)?;
+        let _floor_timeouts = self.spawn_floor_timeouts();
         self.clone()
             .serve_tls_listener(listener, TlsAcceptor::from(config))
             .await
@@ -1067,30 +1101,36 @@ impl Daemon {
         addr: SocketAddr,
         config: Arc<ServerConfig>,
     ) -> Result<RunningServer, DaemonError> {
-        self.spawn_floor_timeouts();
         let listener = bind_listener(addr).await?;
         let addr = listener.local_addr()?;
         self.remember_secure_addr(addr)?;
+        let floor_timeouts = self.spawn_floor_timeouts();
         let daemon = self.clone();
         let task = tokio::spawn(async move {
             daemon
                 .serve_tls_listener(listener, TlsAcceptor::from(config))
                 .await
         });
-        Ok(RunningServer { addr, task })
+        Ok(RunningServer {
+            addr,
+            task,
+            floor_timeouts,
+        })
     }
 
-    /// Start the leader's floor-timeout ticker once per process (spec §12.1).
-    pub fn spawn_floor_timeouts(&self) {
+    /// Start the leader's floor-timeout ticker (spec §12.1). Callers bind first,
+    /// so a daemon that failed to claim its port never leaves a ticker behind.
+    /// `None` means this daemon already has one running.
+    fn spawn_floor_timeouts(&self) -> Option<FloorTimeoutTicker> {
         if self
             .inner
             .floor_timeouts_started
             .swap(true, Ordering::SeqCst)
         {
-            return;
+            return None;
         }
         let daemon = self.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut tick = interval(Duration::from_secs(1));
             tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
@@ -1098,6 +1138,29 @@ impl Daemon {
                 daemon.enforce_floor_timeouts().await;
             }
         });
+        Some(FloorTimeoutTicker {
+            daemon: self.clone(),
+            task,
+        })
+    }
+
+    /// True the first time a tick reports trouble closing this grant, so a
+    /// permanent condition is logged once instead of every second.
+    fn first_floor_timeout_notice(&self, room: RoomId, grant: Hash32) -> bool {
+        self.inner
+            .floor_timeout_notices
+            .lock()
+            .expect("floor timeout notice lock is not poisoned")
+            .insert(room, grant)
+            != Some(grant)
+    }
+
+    fn forget_floor_timeout_notice(&self, room: RoomId) {
+        self.inner
+            .floor_timeout_notices
+            .lock()
+            .expect("floor timeout notice lock is not poisoned")
+            .remove(&room);
     }
 
     /// One pass over every loaded room: close the live grant of any room this node
@@ -1118,9 +1181,16 @@ impl Daemon {
             let Some(grant) = replay.chain.live_grant.clone() else {
                 continue;
             };
-            let leads = replay.chain.roster.len() <= 1
-                || (replay.consensus.role == ConsensusRole::Leader
-                    && replay.consensus.leader_id == Some(self.node_id()));
+            // A single-node roster leads itself — but only for the node that IS
+            // that roster. An observer of a single-staker room must never try to
+            // close its grant: it would stall a whole FREEZE_WAIT dialling the
+            // holder on every tick and starve its own rooms.
+            let leads = if replay.chain.roster.len() <= 1 {
+                replay.chain.roster.first() == Some(&self.node_id())
+            } else {
+                replay.consensus.role == ConsensusRole::Leader
+                    && replay.consensus.leader_id == Some(self.node_id())
+            };
             if !leads {
                 continue;
             }
@@ -1161,14 +1231,28 @@ impl Daemon {
                         .is_some_and(|record| {
                             matches!(&record.scene.body, Body::Speech { text, blobs, .. } if text.is_empty() && blobs.is_empty())
                         });
+                    self.forget_floor_timeout_notice(room);
                     eprintln!(
                         "conchd: room {room}: floor timeout after {age}s, holder {}@{}, empty={empty}",
                         grant.to.agent, grant.to.node
                     );
                 }
-                // The holder acknowledged the freeze and is still CLOSING; try again next tick.
-                Err(DaemonError::MutationUnavailable) => {}
-                Err(error) => eprintln!("conchd: room {room}: floor timeout close failed: {error}"),
+                // The holder acknowledged the freeze and is still CLOSING; try
+                // again next tick. Say so once per grant, so a condition that
+                // never clears is visible instead of retrying in silence.
+                Err(DaemonError::MutationUnavailable) => {
+                    if self.first_floor_timeout_notice(room, grant.hash) {
+                        eprintln!(
+                            "conchd: room {room}: floor timeout after {age}s, holder {}@{} has not closed its take yet; retrying",
+                            grant.to.agent, grant.to.node
+                        );
+                    }
+                }
+                Err(error) => {
+                    if self.first_floor_timeout_notice(room, grant.hash) {
+                        eprintln!("conchd: room {room}: floor timeout close failed: {error}");
+                    }
+                }
             }
         }
     }
@@ -8415,5 +8499,72 @@ mod tests {
         assert_eq!(replay.chain.roster.len(), 2);
         assert!(!replay.chain.roster.contains(&third.node_id()));
         assert!(replay.chain.roster.contains(&second.node_id()));
+    }
+
+    /// A one-node roster leads itself, but only for the node that is that
+    /// roster. An observer that reaches the close path instead dials the holder
+    /// and stalls a whole `FREEZE_WAIT` on every tick, starving its own rooms.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_observer_of_a_single_staker_room_never_enforces_its_floor_timeout() {
+        let source_data = TempDir::new().unwrap();
+        let observer_data = TempDir::new().unwrap();
+        let source = Daemon::open(source_data.path()).unwrap();
+        let ticket = source
+            .create_ticket("observed", StakePolicy::default(), FloorConfig::stick(1))
+            .unwrap();
+        source
+            .client_raise_hand(AgentId::new("agent:holder").unwrap(), ticket.id)
+            .await
+            .unwrap();
+        let room_dir = source.store(ticket.id).unwrap().root().to_path_buf();
+
+        // Replicate the room onto a node outside its one-node roster, without
+        // the holder's own ephemeral take, and read it back as an observer.
+        let observed = observer_data
+            .path()
+            .join("rooms")
+            .join(ticket.id.to_string());
+        fs::create_dir_all(&observed).unwrap();
+        copy_tree(&room_dir, &observed);
+        for ephemeral in ["take.json", "close_take.json", "join.json"] {
+            let _ = fs::remove_file(observed.join(ephemeral));
+        }
+        let observer = Daemon::open(observer_data.path()).unwrap();
+        let replay = observer.replay(ticket.id).unwrap();
+        assert_eq!(replay.chain.roster, vec![source.node_id()]);
+        assert_ne!(observer.node_id(), source.node_id());
+        let grant = replay.chain.live_grant.clone().expect("the take is live");
+        assert_ne!(grant.to.node, observer.node_id());
+        let committed = replay.history.len();
+
+        // Well past the room's one-second timeout, so only the leader predicate
+        // can keep this observer out of the close path.
+        sleep(Duration::from_millis(1200)).await;
+        let started = Instant::now();
+        observer.enforce_floor_timeouts().await;
+
+        // An observer that tried to close would spend FREEZE_WAIT (5 s) failing
+        // to reach the holder's node before giving up.
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the observer tried to close the grant instead of skipping the room: {:?}",
+            started.elapsed()
+        );
+        let replay = observer.replay(ticket.id).unwrap();
+        assert_eq!(replay.chain.live_grant, Some(grant));
+        assert_eq!(replay.history.len(), committed);
+    }
+
+    fn copy_tree(from: &Path, to: &Path) {
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                fs::create_dir_all(&target).unwrap();
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
     }
 }

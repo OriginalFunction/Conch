@@ -1453,7 +1453,7 @@ async fn leader_closes_an_overdue_local_take_with_its_appended_text() {
     let data = TempDir::new().unwrap();
     let daemon = Daemon::open(data.path()).unwrap();
     let ticket = daemon
-        .create_ticket("Timed", StakePolicy::default(), FloorConfig::stick(1))
+        .create_ticket("Timed", StakePolicy::default(), FloorConfig::stick(2))
         .unwrap();
     let server = daemon.start(loopback()).await.unwrap();
     let mut holder = attach(server.addr(), "agent:slow").await;
@@ -1561,4 +1561,63 @@ async fn leader_empty_closes_an_overdue_remote_holder_it_cannot_reach() {
     ));
     source_server.abort();
     second_server.abort();
+}
+
+#[tokio::test]
+async fn floor_timeouts_are_enforced_again_after_a_server_is_aborted_and_restarted() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let ticket = daemon
+        .create_ticket("Restarted", StakePolicy::default(), FloorConfig::stick(2))
+        .unwrap();
+    let first = daemon.start(loopback()).await.unwrap();
+    let mut holder = attach(first.addr(), "agent:first").await;
+    let granted = request(
+        &mut holder,
+        ClientRequest::WaitForFloor {
+            room: ticket.id,
+            timeout_secs: Some(5),
+        },
+    )
+    .await;
+    assert!(granted.ok, "{granted:?}");
+    let closed = tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            let replay = daemon.replay(ticket.id).unwrap();
+            if replay.chain.live_grant.is_none() {
+                return replay.history.len();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the first overdue grant was closed");
+
+    // Stopping the server stops its ticker; starting another must arm a new one.
+    first.abort();
+    drop(first);
+    drop(holder);
+    let second = daemon.start(loopback()).await.unwrap();
+    let mut next = attach(second.addr(), "agent:second").await;
+    let regranted = request(
+        &mut next,
+        ClientRequest::WaitForFloor {
+            room: ticket.id,
+            timeout_secs: Some(5),
+        },
+    )
+    .await;
+    assert!(regranted.ok, "{regranted:?}");
+    tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            let replay = daemon.replay(ticket.id).unwrap();
+            if replay.chain.live_grant.is_none() && replay.history.len() > closed {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the restarted server enforces the floor timeout again");
+    second.abort();
 }
