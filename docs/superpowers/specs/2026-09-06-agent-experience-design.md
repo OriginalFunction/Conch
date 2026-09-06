@@ -168,7 +168,8 @@ The consensus leader enforces it, per spec §12.1 and §12.4.
 ### 4.1 Configuration
 
 - `conch create` and the daemon's own genesis path default `timeout_secs` to 300.
-  A breakout child inherits its parent's floor config instead of today's fixed 30.
+  A breakout child inherits its parent's `timeout_secs` instead of today's fixed 30
+  (its mode stays stick, as today).
 - `conch create --timeout SECS` and `conch config --timeout SECS`; MCP `create`
   and `config` take `timeout`. Values below 1 are rejected as `invalid`.
 - Existing rooms keep their committed value and start being enforced;
