@@ -104,13 +104,17 @@ pub fn flatten(records: &[Value], you: &Mouth) -> Vec<Value> {
                     event["timeout_secs"] = body["floor"]["timeout_secs"].clone();
                     event
                 }
-                // breakout, or a membership/view-change issued as a take: the floor is vacant.
-                _ => {
+                // A breakout, or a membership/view-change issued as a take: the
+                // scene closed a grant, so the floor is vacant again.
+                "breakout" | "membership" | "view-change" => {
                     let mut event = base("floor");
                     event["holder"] = Value::Null;
                     event["author"] = author.clone().unwrap_or(Value::Null);
                     event
                 }
+                // A body type this build does not know: report nothing rather
+                // than inventing a floor change from it.
+                _ => return None,
             };
             if event["author"].is_null() {
                 event.as_object_mut().map(|object| object.remove("author"));
@@ -311,5 +315,26 @@ mod tests {
         }
         assert_eq!(last_height(&records), Some(16));
         assert_eq!(last_height(&[]), None);
+    }
+
+    #[test]
+    fn an_unrecognised_body_type_produces_no_event() {
+        let records = vec![
+            record(1, json!({ "type": "something-newer", "field": 1 }), None),
+            record(
+                2,
+                json!({ "type": "breakout", "closes_grant": "ee", "ticket": {}, "auto_join": [] }),
+                Some(("agent:codex", 2)),
+            ),
+        ];
+        let events = flatten(&records, &me());
+        let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            ["floor"],
+            "a body type this build does not know is not a floor change"
+        );
+        assert_eq!(events[0]["n"], 2);
+        assert_eq!(last_height(&records), Some(2));
     }
 }
