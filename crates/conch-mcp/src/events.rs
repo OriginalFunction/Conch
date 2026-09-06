@@ -239,6 +239,36 @@ mod tests {
                 json!({ "type": "membership", "closes_grant": "dd", "stake": {}, "floor": { "mode": "stick", "timeout_secs": 60 } }),
                 Some(("agent:codex", 2)),
             ),
+            record(
+                11,
+                json!({ "type": "grant", "to": { "agent": "agent:codex", "node": node_json(2) }, "reason": "queue", "intent_id": "04" }),
+                None,
+            ),
+            record(
+                12,
+                json!({ "type": "breakout", "closes_grant": "ee", "ticket": {}, "auto_join": [] }),
+                Some(("agent:codex", 2)),
+            ),
+            record(
+                13,
+                json!({ "type": "grant", "to": { "agent": "agent:codex", "node": node_json(2) }, "reason": "queue", "intent_id": "05" }),
+                None,
+            ),
+            record(
+                14,
+                json!({ "type": "view-change", "add": [], "remove": [], "next_roster": [], "closes_grant": "ff" }),
+                Some(("agent:codex", 2)),
+            ),
+            record(
+                15,
+                json!({ "type": "grant", "to": { "agent": "agent:codex", "node": node_json(2) }, "reason": "queue", "intent_id": "06" }),
+                None,
+            ),
+            record(
+                16,
+                json!({ "type": "speech", "closes_grant": "gg", "text": "", "blobs": [{ "name": "a.txt", "sha256": "00", "bytes": 1 }] }),
+                Some(("agent:codex", 2)),
+            ),
         ];
         let events = flatten(&records, &me());
         let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
@@ -246,7 +276,7 @@ mod tests {
             kinds,
             [
                 "floor", "mention", "granted", "speech", "floor", "speech", "roster", "config",
-                "floor", "floor"
+                "floor", "floor", "floor", "floor", "floor", "floor", "floor", "speech"
             ]
         );
         assert_eq!(events[0]["holder"]["agent"], "agent:codex");
@@ -265,11 +295,21 @@ mod tests {
         // A take closed by a non-speech scene vacates the floor and names its author.
         assert_eq!(events[9]["holder"], Value::Null);
         assert_eq!(events[9]["author"]["agent"], "agent:codex");
-        for (event, n) in events.iter().zip([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) {
+        // Breakout and view-change with closes_grant also vacate the floor.
+        assert_eq!(events[11]["holder"], Value::Null);
+        assert_eq!(events[11]["author"]["agent"], "agent:codex");
+        assert_eq!(events[13]["holder"], Value::Null);
+        assert_eq!(events[13]["author"]["agent"], "agent:codex");
+        // Speech with empty text and blobs is not empty.
+        assert_eq!(events[15]["empty"], false);
+        for (event, n) in events
+            .iter()
+            .zip([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+        {
             assert_eq!(event["n"], n);
             assert_eq!(event["ts"], 1_700_000_000 + n);
         }
-        assert_eq!(last_height(&records), Some(10));
+        assert_eq!(last_height(&records), Some(16));
         assert_eq!(last_height(&[]), None);
     }
 }
