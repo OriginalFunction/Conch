@@ -43,6 +43,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         output,
         command,
         node_is_default,
+        json: _,
+        room: _,
     } = parsed;
     if let ParsedRequest::Mcp { room } = &request {
         return conch_mcp::run(node, agent, *room, tls_ca, node_is_default)
@@ -502,6 +504,11 @@ struct Arguments {
     output: Output,
     command: String,
     node_is_default: bool,
+    // Read by later tasks in the human-CLI series (rendering and room resolution).
+    #[allow(dead_code)]
+    json: bool,
+    #[allow(dead_code)]
+    room: Option<String>,
 }
 
 enum Output {
@@ -618,13 +625,113 @@ fn ready(request: ClientRequest) -> ParsedRequest {
     ParsedRequest::Ready(Box::new(request))
 }
 
+/// The identity a person gets when they do not name one: `human:<username>`.
+fn default_agent() -> String {
+    default_agent_from(
+        env::var("USER").ok().as_deref(),
+        env::var("LOGNAME").ok().as_deref(),
+    )
+}
+
+fn default_agent_from(user: Option<&str>, logname: Option<&str>) -> String {
+    let name = user
+        .or(logname)
+        .map(sanitise_username)
+        .unwrap_or_else(|| "operator".into());
+    format!("human:{name}")
+}
+
+/// Lower-case, and only the characters an agent id allows besides `:` and `.`.
+fn sanitise_username(raw: &str) -> String {
+    let cleaned: String = raw
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "operator".into()
+    } else {
+        cleaned
+    }
+}
+
+/// Global options a command may claim for itself; the parser leaves these alone.
+fn owned_flags(command: &str) -> &'static [&'static str] {
+    match command {
+        "create" => &["--token"],
+        "setup" => &["--agent"],
+        _ => &[],
+    }
+}
+
+struct Globals {
+    node: String,
+    node_explicit: bool,
+    agent: String,
+    room: Option<String>,
+    token: Option<Hash32>,
+    tls_ca: Option<PathBuf>,
+    json: bool,
+}
+
+/// Pull global options out of the arguments that follow the command word, leaving
+/// the command's own arguments in order.
+fn extract_globals(
+    command: &str,
+    args: Vec<String>,
+    globals: &mut Globals,
+) -> Result<Vec<String>, String> {
+    let owned = owned_flags(command);
+    let mut rest = Vec::with_capacity(args.len());
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        if owned.contains(&arg.as_str()) {
+            rest.push(arg);
+            if let Some(value) = iter.next() {
+                rest.push(value);
+            }
+            continue;
+        }
+        match arg.as_str() {
+            "--json" => globals.json = true,
+            "--node" => {
+                globals.node = iter.next().ok_or("--node requires a URL")?;
+                globals.node_explicit = true;
+            }
+            "--agent" => globals.agent = iter.next().ok_or("--agent requires a name")?,
+            "--room" => globals.room = Some(iter.next().ok_or("--room requires an id")?),
+            "--token" => {
+                globals.token = Some(
+                    iter.next()
+                        .ok_or("--token requires a 64-character hex capability")?
+                        .parse::<Hash32>()
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            "--tls-ca" => {
+                globals.tls_ca = Some(PathBuf::from(
+                    iter.next().ok_or("--tls-ca requires a PEM file")?,
+                ))
+            }
+            _ => rest.push(arg),
+        }
+    }
+    Ok(rest)
+}
+
 impl Arguments {
     fn parse(arguments: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut arguments = arguments.peekable();
         let mut node =
             env::var("CONCH_NODE").unwrap_or_else(|_| format!("tcp://{}", default_tcp()));
         let mut node_explicit = false;
-        let mut agent = env::var("CONCH_AGENT").unwrap_or_else(|_| "local".into());
+        let mut agent = env::var("CONCH_AGENT").unwrap_or_else(|_| default_agent());
         let mut tls_ca = env::var_os("CONCH_TLS_CA").map(PathBuf::from);
         let mut room = env::var("CONCH_ROOM").ok().or_else(read_current_room);
         let mut token = env::var("CONCH_TOKEN")
@@ -632,6 +739,7 @@ impl Arguments {
             .map(|value| value.parse::<Hash32>())
             .transpose()
             .map_err(|error| format!("invalid CONCH_TOKEN: {error}"))?;
+        let mut json = false;
 
         while let Some(argument) = arguments.peek().cloned() {
             match argument.as_str() {
@@ -664,6 +772,10 @@ impl Arguments {
                         arguments.next().ok_or("--tls-ca requires a PEM file")?,
                     ));
                 }
+                "--json" => {
+                    arguments.next();
+                    json = true;
+                }
                 "--version" | "-V" => {
                     println!("conch {}", env!("CARGO_PKG_VERSION"));
                     std::process::exit(0);
@@ -685,6 +797,30 @@ impl Arguments {
             }
             std::process::exit(0);
         }
+
+        let rest: Vec<String> = arguments.collect();
+        let mut globals = Globals {
+            node,
+            node_explicit,
+            agent,
+            room,
+            token,
+            tls_ca,
+            json,
+        };
+        let rest = extract_globals(&command, rest, &mut globals)?;
+        let Globals {
+            node,
+            node_explicit,
+            agent,
+            room,
+            token,
+            tls_ca,
+            json,
+        } = globals;
+        let room_for_output = room.clone();
+        let mut arguments = rest.into_iter().peekable();
+
         if arguments
             .peek()
             .is_some_and(|argument| argument == "--help" || argument == "-h")
@@ -901,17 +1037,17 @@ impl Arguments {
                 let mut to_node = None;
                 while let Some(flag) = arguments.next() {
                     match flag.as_str() {
-                        "--agent" => {
+                        "--to" => {
                             to_agent = Some(
-                                AgentId::new(arguments.next().ok_or("--agent requires a name")?)
+                                AgentId::new(arguments.next().ok_or("--to requires a name")?)
                                     .map_err(|error| error.to_string())?,
                             );
                         }
-                        "--node" => {
+                        "--to-node" => {
                             to_node = Some(
                                 arguments
                                     .next()
-                                    .ok_or("--node requires an id")?
+                                    .ok_or("--to-node requires an id")?
                                     .parse::<NodeId>()
                                     .map_err(|error| error.to_string())?,
                             );
@@ -922,8 +1058,8 @@ impl Arguments {
                 ready(ClientRequest::Grant {
                     room: resolve_room()?,
                     to: Mouth {
-                        agent: to_agent.ok_or("grant requires --agent")?,
-                        node: to_node.ok_or("grant requires --node")?,
+                        agent: to_agent.ok_or("grant requires --to")?,
+                        node: to_node.ok_or("grant requires --to-node")?,
                     },
                 })
             }
@@ -1172,6 +1308,8 @@ impl Arguments {
             output,
             command,
             node_is_default,
+            json,
+            room: room_for_output,
         })
     }
 }
@@ -1180,13 +1318,14 @@ fn print_help() {
     println!(
         "conch {}\n\
          Floor-controlled rooms for people and coding agents.\n\n\
-         Usage: conch [GLOBAL OPTIONS] <COMMAND> [ARGS]\n\n\
+         Usage: conch <COMMAND> [ARGS] [GLOBAL OPTIONS]  (global options may also precede the command)\n\n\
          Global options:\n\
            --node URL            Local daemon [default: tcp://127.0.0.1:7421]\n\
-           --agent ID            Stable mouth identity [default: local]\n\
+           --agent ID            Stable mouth identity [default: human:<username>]\n\
            --room ID             Room id (or CONCH_ROOM/current-room)\n\
            --token HEX           32-byte room capability\n\
            --tls-ca FILE         Additional CA bundle for HTTPS tickets\n\
+           --json                Print the wire reply as JSON\n\
            -V, --version         Print version\n\
            -h, --help            Print help\n\n\
          Commands:\n\
@@ -1215,7 +1354,7 @@ fn print_command_help(command: &str) -> Result<(), String> {
         "wait-for-floor" => "conch --room ID wait-for-floor [--timeout SECONDS]",
         "speak" => "printf 'text' | conch --room ID speak --file - [--request-id ID]",
         "yield" => "conch --room ID yield",
-        "grant" => "conch --room ID grant --agent ID --node NODE_ID",
+        "grant" => "conch grant --to AGENT --to-node NODE_ID [--room ID]",
         "yank" => "conch --room ID yank",
         "config" => {
             "conch --room ID config [--mode stick|moderator] [--moderator ID --moderator-node NODE_ID] [--timeout SECS] [--stake-json JSON]"
@@ -1450,5 +1589,92 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("redirect limit exceeded"));
         rejected_server.await.unwrap();
+    }
+
+    fn parse(args: &[&str]) -> Arguments {
+        Arguments::parse(args.iter().map(|s| s.to_string())).unwrap()
+    }
+
+    #[test]
+    fn globals_are_accepted_after_the_command() {
+        let before = parse(&[
+            "--room",
+            "0101010101010101010101010101010101010101010101010101010101010101",
+            "--agent",
+            "agent:x",
+            "history",
+            "--from",
+            "3",
+        ]);
+        let after = parse(&[
+            "history",
+            "--from",
+            "3",
+            "--room",
+            "0101010101010101010101010101010101010101010101010101010101010101",
+            "--agent",
+            "agent:x",
+        ]);
+        assert_eq!(before.agent, after.agent);
+        assert_eq!(before.room, after.room);
+        assert!(
+            matches!(after.request, ParsedRequest::Ready(ref r) if matches!(**r, ClientRequest::History { from_n: 3, .. }))
+        );
+        assert!(!after.json);
+        assert!(parse(&["status", "--json"]).json);
+        assert!(parse(&["--json", "status"]).json);
+    }
+
+    #[test]
+    fn a_commands_own_flags_win_over_globals() {
+        // setup owns --agent; the global agent stays the default.
+        let setup = parse(&["setup", "claude", "--agent", "agent:custom"]);
+        assert!(matches!(
+            setup.request,
+            ParsedRequest::Local(LocalCommand::Setup { ref agent, .. }) if agent.as_deref() == Some("agent:custom")
+        ));
+        assert!(setup.agent.as_str().starts_with("human:"));
+    }
+
+    #[test]
+    fn grant_takes_to_and_to_node() {
+        let node = "0202020202020202020202020202020202020202020202020202020202020202";
+        let room = "0101010101010101010101010101010101010101010101010101010101010101";
+        let grant = parse(&[
+            "grant",
+            "--to",
+            "agent:codex",
+            "--to-node",
+            node,
+            "--room",
+            room,
+        ]);
+        match grant.request {
+            ParsedRequest::Ready(request) => match *request {
+                ClientRequest::Grant { to, .. } => {
+                    assert_eq!(to.agent.as_str(), "agent:codex");
+                    assert_eq!(to.node.to_string(), node);
+                }
+                other => panic!("{other:?}"),
+            },
+            _ => panic!("grant is a ready request"),
+        }
+        let old = Arguments::parse(
+            ["grant", "--agent", "x", "--node", node, "--room", room]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        assert!(old.is_err(), "the old grant flags are gone");
+    }
+
+    #[test]
+    fn default_identity_is_a_sanitised_human_username() {
+        assert_eq!(sanitise_username("Ray.Hwang"), "ray-hwang");
+        assert_eq!(sanitise_username("ray_h-1"), "ray_h-1");
+        assert_eq!(sanitise_username("réné"), "r-n-");
+        assert_eq!(sanitise_username(""), "operator");
+        assert_eq!(default_agent_from(Some("Ray"), None), "human:ray");
+        assert_eq!(default_agent_from(None, Some("ops")), "human:ops");
+        assert_eq!(default_agent_from(None, None), "human:operator");
     }
 }
