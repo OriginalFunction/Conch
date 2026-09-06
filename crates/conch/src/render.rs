@@ -147,10 +147,10 @@ pub fn render(command: &str, data: &Value, ctx: &Context) -> Option<String> {
             str_of(data, "name"),
             data.get("bytes").and_then(Value::as_u64).unwrap_or(0)
         ),
-        "leave" => format!(
-            "left {}",
-            ctx.room.as_deref().map(short).unwrap_or_default()
-        ),
+        "leave" => match ctx.room.as_deref().map(short) {
+            Some(id) => format!("left {}", id),
+            None => "left".to_owned(),
+        },
         "say" => format!(
             "said #{} as {}",
             data.get("n").and_then(Value::as_u64).unwrap_or(0),
@@ -202,9 +202,9 @@ fn rooms_table(data: &Value, ctx: &Context) -> String {
         .join("\n")
 }
 
-const COLUMNS: usize = 21; // "#12   " (6) + author column (15)
-
 /// One history line per scene: height, author or kind, content.
+/// When a label is longer than 14 characters, continuation lines indent by the head's actual width.
+/// The head is never truncated; the line fits `width` whenever `width` leaves room for one content character.
 pub fn scene_line(record: &Value, oneline: bool, width: usize) -> String {
     let scene = &record["scene"];
     let body = &scene["body"];
@@ -226,7 +226,7 @@ pub fn scene_line(record: &Value, oneline: bool, width: usize) -> String {
             let text = str_of(body, "text");
             (
                 author.unwrap_or("take").to_owned(),
-                if text.is_empty() {
+                if text.trim().is_empty() {
                     "(empty take)".to_owned()
                 } else {
                     text.to_owned()
@@ -267,10 +267,11 @@ pub fn scene_line(record: &Value, oneline: bool, width: usize) -> String {
         other => (other.to_owned(), String::new()),
     };
     let head = format!("{:<5} {:<14} ", format!("#{n}"), label);
+    let head_width = head.chars().count();
     let mut lines = content.lines();
     let first = lines.next().unwrap_or("");
     if oneline {
-        let room_for_text = width.saturating_sub(COLUMNS).max(1);
+        let room_for_text = width.saturating_sub(head_width).max(1);
         let first: String = if first.chars().count() > room_for_text {
             let mut cut: String = first.chars().take(room_for_text - 1).collect();
             cut.push('…');
@@ -283,7 +284,7 @@ pub fn scene_line(record: &Value, oneline: bool, width: usize) -> String {
     let mut out = format!("{head}{first}");
     for line in lines {
         out.push('\n');
-        out.push_str(&" ".repeat(COLUMNS));
+        out.push_str(&" ".repeat(head_width));
         out.push_str(line);
     }
     out
@@ -498,5 +499,58 @@ mod tests {
         );
         assert_eq!(render("say", &json!({ "n": 15, "grant_hash": "h", "author": { "agent": "human:ray", "node": "n" } }), &c).unwrap(), "said #15 as human:ray");
         assert!(render("mcp", &json!({}), &c).is_none());
+    }
+
+    #[test]
+    fn continuation_lines_align_with_long_labels() {
+        let speech = record(
+            2,
+            json!({ "type": "speech", "closes_grant": "h", "text": "first\nsecond" }),
+            Some("human:ray-hwang"),
+        );
+        let line = scene_line(&speech, false, 80);
+        let lines: Vec<&str> = line.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "#2    human:ray-hwang first");
+        assert_eq!(lines[1], "                      second");
+        assert_eq!(lines[1].chars().take_while(|c| *c == ' ').count(), 22);
+    }
+
+    #[test]
+    fn oneline_with_narrow_width() {
+        let speech = record(
+            2,
+            json!({ "type": "speech", "closes_grant": "h", "text": "content" }),
+            Some("agent:x"),
+        );
+        let line = scene_line(&speech, true, 10);
+        assert_eq!(line.lines().count(), 1);
+        assert!(line.ends_with('…'));
+        // When width < head_width, the line does not fit in width, but head is never truncated
+    }
+
+    #[test]
+    fn leave_with_no_room() {
+        let c = Context {
+            room: None,
+            current_room: None,
+            oneline: false,
+            width: 80,
+        };
+        assert_eq!(
+            render("leave", &json!({ "ok": true, "role": "observe" }), &c).unwrap(),
+            "left"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_text_renders_as_empty_take() {
+        let speech_ws = record(
+            3,
+            json!({ "type": "speech", "closes_grant": "h", "text": "  \n  " }),
+            Some("human:test"),
+        );
+        let line = scene_line(&speech_ws, false, 80);
+        assert!(line.contains("(empty take)"));
     }
 }
