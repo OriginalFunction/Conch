@@ -95,7 +95,7 @@ keeps only the first line, cut at the terminal width or 120 columns.
 | `speak` | `appended (rev 2)` |
 | `yield` | `take frozen (rev 2); closes grant a1b2c3d4…` |
 | `raise-hand` | `queued` |
-| `grant` | `granted to agent:codex` |
+| `grant` | `granted to agent:codex (#20)` |
 | `yank` | `yanked; closes grant a1b2c3d4…` |
 | `config` | `config committed (#16)` |
 | `breakout` | `breakout "Side room" (b2c3d4e5…) created` |
