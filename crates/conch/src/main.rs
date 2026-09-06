@@ -705,6 +705,7 @@ impl Arguments {
                 let mut create_token = token;
                 let mut open = false;
                 let mut show_secret = false;
+                let mut timeout_secs = 300_u64;
                 while let Some(flag) = arguments.next() {
                     match flag.as_str() {
                         "--name" => {
@@ -716,6 +717,16 @@ impl Arguments {
                                 Some("moderator") => FloorMode::Moderator,
                                 _ => return Err("--mode must be stick or moderator".into()),
                             };
+                        }
+                        "--timeout" => {
+                            timeout_secs = arguments
+                                .next()
+                                .ok_or("--timeout requires seconds")?
+                                .parse::<u64>()
+                                .map_err(|error| error.to_string())?;
+                            if timeout_secs < 1 {
+                                return Err("--timeout must be at least 1".into());
+                            }
                         }
                         "--moderator" => {
                             moderator_agent = Some(
@@ -802,7 +813,7 @@ impl Arguments {
                     stake: StakePolicy::default(),
                     floor: FloorConfig {
                         mode,
-                        timeout_secs: 30,
+                        timeout_secs,
                         moderator,
                     },
                     token: create_token,
@@ -921,6 +932,7 @@ impl Arguments {
                 let mut moderator_agent = None;
                 let mut moderator_node = None;
                 let mut stake = None;
+                let mut timeout = None;
                 while let Some(flag) = arguments.next() {
                     match flag.as_str() {
                         "--mode" => {
@@ -947,6 +959,14 @@ impl Arguments {
                                     .map_err(|error| error.to_string())?,
                             );
                         }
+                        "--timeout" => {
+                            let secs = arguments
+                                .next()
+                                .ok_or("--timeout requires seconds")?
+                                .parse::<u64>()
+                                .map_err(|error| error.to_string())?;
+                            timeout = Some(secs);
+                        }
                         "--stake-json" => {
                             stake = Some(
                                 serde_json::from_str::<StakePolicy>(
@@ -970,13 +990,14 @@ impl Arguments {
                     }
                     _ => return Err("moderator config requires both moderator fields".into()),
                 };
-                if floor.is_none() && stake.is_none() {
-                    return Err("config requires a floor or stake change".into());
+                if floor.is_none() && stake.is_none() && timeout.is_none() {
+                    return Err("config requires a floor, stake, or timeout change".into());
                 }
                 ready(ClientRequest::Membership {
                     room: resolve_room()?,
                     stake,
                     floor,
+                    timeout_secs: timeout,
                 })
             }
             "breakout" => {
@@ -1172,9 +1193,10 @@ fn print_help() {
 fn print_command_help(command: &str) -> Result<(), String> {
     let usage = match command {
         "create" => {
-            "conch create --name NAME [--open | --token HEX | --token-file FILE] [--show-secret]\n\
+            "conch create --name NAME [--timeout SECS] [--open | --token HEX | --token-file FILE] [--show-secret]\n\
              Creates a private room by default and writes ./<slug>.conch mode 0600.\n\
-             --open is local/LAN only; a public-mode daemon refuses tokenless rooms."
+             --open is local/LAN only; a public-mode daemon refuses tokenless rooms.\n\
+             Takes longer than --timeout (default 300 s) are closed by the leader."
         }
         "join" => {
             "conch [--tls-ca CA.pem] join TICKET|MAGNET|HTTPS_URL [--stake | --observe]"
@@ -1188,7 +1210,7 @@ fn print_command_help(command: &str) -> Result<(), String> {
         "grant" => "conch --room ID grant --agent ID --node NODE_ID",
         "yank" => "conch --room ID yank",
         "config" => {
-            "conch --room ID config [--mode stick|moderator] [--moderator ID --moderator-node NODE_ID] [--stake-json JSON]"
+            "conch --room ID config [--mode stick|moderator] [--moderator ID --moderator-node NODE_ID] [--timeout SECS] [--stake-json JSON]"
         }
         "breakout" => "conch --room ID breakout --name NAME [--members NODE_ID,...]",
         "blob" => "conch --room ID blob put FILE",

@@ -799,7 +799,7 @@ impl Daemon {
 
     pub fn create_genesis(&self, name: &str) -> Result<RoomId, DaemonError> {
         Ok(self
-            .create_ticket(name, StakePolicy::default(), FloorConfig::stick(30))?
+            .create_ticket(name, StakePolicy::default(), FloorConfig::stick(300))?
             .id)
     }
 
@@ -2561,6 +2561,7 @@ impl Daemon {
                                 request.room,
                                 request.stake,
                                 request.floor,
+                                None,
                             )
                             .await
                         {
@@ -3071,8 +3072,14 @@ impl Daemon {
                 name,
                 members,
             } => self.client_breakout(agent, room, name, members).await,
-            ClientRequest::Membership { room, stake, floor } => {
-                self.client_membership(agent, room, stake, floor).await
+            ClientRequest::Membership {
+                room,
+                stake,
+                floor,
+                timeout_secs,
+            } => {
+                self.client_membership(agent, room, stake, floor, timeout_secs)
+                    .await
             }
             ClientRequest::Leave { room, vacate } => self.client_leave(agent, room, vacate).await,
             ClientRequest::PutBlob { .. } => Err(DaemonError::Protocol(
@@ -3423,6 +3430,7 @@ impl Daemon {
         room: RoomId,
         stake: Option<StakePolicy>,
         floor_config: Option<FloorConfig>,
+        timeout_secs: Option<u64>,
     ) -> Result<Value, DaemonError> {
         self.client_membership_from(
             Mouth {
@@ -3432,6 +3440,7 @@ impl Daemon {
             room,
             stake,
             floor_config,
+            timeout_secs,
         )
         .await
     }
@@ -3442,12 +3451,24 @@ impl Daemon {
         room: RoomId,
         stake: Option<StakePolicy>,
         floor_config: Option<FloorConfig>,
+        timeout_secs: Option<u64>,
     ) -> Result<Value, DaemonError> {
         let floor = self.floor(room)?;
         if !self.can_certify(room)? {
             return Err(FloorError::NotStaker.into());
         }
         let replay = self.replay(room)?;
+        let floor_config = match (floor_config, timeout_secs) {
+            (floor, Some(secs)) => {
+                if secs < 1 {
+                    return Err(DaemonError::Protocol("timeout_secs must be at least 1"));
+                }
+                let mut merged = floor.unwrap_or_else(|| floor_config_from_chain(&replay.chain));
+                merged.timeout_secs = secs;
+                Some(merged)
+            }
+            (floor, None) => floor,
+        };
         if let Some(leader) = replay
             .consensus
             .leader_id
@@ -3544,6 +3565,7 @@ impl Daemon {
     ) -> Result<Value, DaemonError> {
         let floor = self.floor(room)?;
         let replay = self.replay(room)?;
+        let parent_timeout = replay.chain.timeout_secs.unwrap_or(300);
         if let Some(leader) = replay
             .consensus
             .leader_id
@@ -3598,7 +3620,7 @@ impl Daemon {
                             let ticket = daemon.prepare_breakout_ticket(
                                 &child_name,
                                 StakePolicy::default(),
-                                FloorConfig::stick(30),
+                                FloorConfig::stick(parent_timeout),
                                 token,
                                 room,
                             )?;
@@ -3728,7 +3750,7 @@ impl Daemon {
                 daemon.prepare_breakout_ticket(
                     &child_name,
                     StakePolicy::default(),
-                    FloorConfig::stick(30),
+                    FloorConfig::stick(parent_timeout),
                     token,
                     room,
                 )

@@ -59,6 +59,10 @@ pub enum ClientRequest {
         stake: Option<StakePolicy>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         floor: Option<FloorConfig>,
+        /// Override only the take duration; mode and moderator carry over from
+        /// `floor` when given, otherwise from the committed chain state.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_secs: Option<u64>,
     },
     PutBlob {
         room: RoomId,

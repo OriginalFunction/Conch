@@ -330,6 +330,7 @@ async fn history_records_name_the_author_of_each_take() {
             room,
             stake: None,
             floor: Some(conch_core::types::FloorConfig::stick(120)),
+            timeout_secs: None,
         },
     )
     .await;

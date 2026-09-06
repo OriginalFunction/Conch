@@ -164,11 +164,15 @@ impl Server {
             "create" => {
                 let name = arguments.string("name")?;
                 let mode = arguments.optional_string("mode").unwrap_or("stick");
+                let timeout_secs = arguments.optional_u64("timeout").unwrap_or(300);
+                if timeout_secs < 1 {
+                    return Err("timeout must be at least 1".into());
+                }
                 let floor = match mode {
-                    "stick" => FloorConfig::stick(30),
+                    "stick" => FloorConfig::stick(timeout_secs),
                     "moderator" => FloorConfig {
                         mode: FloorMode::Moderator,
-                        timeout_secs: 30,
+                        timeout_secs,
                         moderator: Some(Mouth {
                             agent: arguments.agent("moderator")?,
                             node: arguments.node("moderator_node")?,
@@ -298,14 +302,16 @@ impl Server {
                     .map(serde_json::from_value)
                     .transpose()
                     .map_err(|error| format!("invalid stake: {error}"))?;
-                if floor.is_none() && stake.is_none() {
-                    return Err("config requires mode or stake".into());
+                let timeout_secs = arguments.optional_u64("timeout");
+                if floor.is_none() && stake.is_none() && timeout_secs.is_none() {
+                    return Err("config requires mode, stake, or timeout".into());
                 }
                 (
                     ClientRequest::Membership {
                         room: room()?,
                         stake,
                         floor,
+                        timeout_secs,
                     },
                     None,
                 )
@@ -772,6 +778,7 @@ fn tool_definitions() -> Vec<Value> {
                     "mode": { "enum": ["stick", "moderator"] },
                     "moderator": { "type": "string" },
                     "moderator_node": { "type": "string" },
+                    "timeout": { "type": "integer", "minimum": 1, "default": 300, "description": "Seconds a holder may keep the floor before the leader closes the take" },
                     "token": { "type": "string", "description": "Explicit 64-character hex room capability" },
                     "open": { "type": "boolean", "description": "Create a tokenless room instead of the private default (local/LAN only; public mode refuses open rooms)" },
                     "show_secret": { "type": "boolean", "description": "Return the private room capability in this explicit response" }
@@ -868,7 +875,8 @@ fn tool_definitions() -> Vec<Value> {
             object_schema(
                 room_properties(json!({
                     "mode": { "enum": ["stick", "moderator"] }, "moderator": { "type": "string" },
-                    "moderator_node": { "type": "string" }, "stake": { "type": "object" }
+                    "moderator_node": { "type": "string" }, "stake": { "type": "object" },
+                    "timeout": { "type": "integer", "minimum": 1 }
                 })),
                 &[],
             ),

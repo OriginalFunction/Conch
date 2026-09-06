@@ -348,3 +348,72 @@ async fn current_room_file_supplies_the_cli_default() {
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["room"], ticket.id.to_string());
 }
+
+#[tokio::test]
+async fn create_and_config_set_the_floor_timeout() {
+    let data = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let server = daemon.start(loopback()).await.unwrap();
+    let node = format!("tcp://{}", server.addr());
+    let conch = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_conch"));
+        command
+            .arg("--node")
+            .arg(&node)
+            .args(args)
+            .current_dir(cwd.path())
+            .env("CONCH_DATA_DIR", data.path());
+        command
+    };
+
+    let created = conch(&["create", "--name", "Timed", "--timeout", "45"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created: Value = serde_json::from_slice(&created.stdout).unwrap();
+    let room = created["id"].as_str().unwrap().to_owned();
+
+    let status = conch(&["--room", &room, "status"]).output().await.unwrap();
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["timeout_secs"], 45);
+    assert_eq!(status["mode"], "stick");
+
+    let configured = conch(&["--room", &room, "config", "--timeout", "90"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        configured.status.success(),
+        "{}",
+        String::from_utf8_lossy(&configured.stderr)
+    );
+    let status = conch(&["--room", &room, "status"]).output().await.unwrap();
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["timeout_secs"], 90);
+    assert_eq!(status["mode"], "stick", "mode carried over unchanged");
+
+    let rejected = conch(&["--room", &room, "config", "--timeout", "0"])
+        .output()
+        .await
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("at least 1"));
+
+    // A room created without --timeout gets the new default.
+    let plain = conch(&["create", "--name", "Plain"])
+        .output()
+        .await
+        .unwrap();
+    let plain: Value = serde_json::from_slice(&plain.stdout).unwrap();
+    let room = plain["id"].as_str().unwrap().to_owned();
+    let status = conch(&["--room", &room, "status"]).output().await.unwrap();
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["timeout_secs"], 300);
+    server.abort();
+}
