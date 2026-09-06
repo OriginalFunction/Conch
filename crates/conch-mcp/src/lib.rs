@@ -24,6 +24,8 @@ use tokio::{
     task::{self, JoinSet},
 };
 
+pub mod events;
+
 const LATEST_PROTOCOL: &str = "2025-06-18";
 const SUPPORTED_PROTOCOLS: &[&str] = &["2024-11-05", "2025-03-26", LATEST_PROTOCOL];
 const MAX_BLOB_BYTES: usize = 32 * 1024 * 1024;
