@@ -8,7 +8,7 @@ pub fn connect_error(node_addr: &str) -> String {
 pub fn for_code(code: &str, command: &str) -> Option<&'static str> {
     Some(match (code, command) {
         ("no_grant", _) => {
-            "raise your hand and wait for the floor: `conch raise-hand && conch wait-for-floor`"
+            "wait for the floor first: `conch wait-for-floor` (or the floor timed out; check `conch status`)"
         }
         ("unknown_room", _) => "join it first: `conch join <ticket>`",
         ("not_moderator", _) => {
@@ -32,7 +32,7 @@ mod tests {
     fn known_codes_get_a_remedy_and_unknown_ones_none() {
         assert_eq!(
             for_code("no_grant", "speak"),
-            Some("raise your hand and wait for the floor: `conch raise-hand && conch wait-for-floor`")
+            Some("wait for the floor first: `conch wait-for-floor` (or the floor timed out; check `conch status`)")
         );
         assert_eq!(
             for_code("unknown_room", "history"),

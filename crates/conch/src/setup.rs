@@ -409,6 +409,18 @@ mod tests {
         assert_eq!(skill_version(&text).as_deref(), Some("9.9.9"));
     }
 
+    #[test]
+    fn embedded_skill_teaches_the_listen_say_loop() {
+        let text = skill_text("1.2.2");
+        for word in ["`who`", "`listen`", "`say`", "@codex", "`wait_for_floor`"] {
+            assert!(text.contains(word), "skill lacks {word}");
+        }
+        assert!(
+            !text.contains("raise_hand"),
+            "raise_hand is retired from MCP"
+        );
+    }
+
     // `validate` guards both ends of `run`: the file as found, and the merged text
     // before it is written. The merge itself is byte-preserving, so the second gate
     // can only be reached through these functions.

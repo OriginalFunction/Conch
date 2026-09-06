@@ -147,7 +147,7 @@ async fn cli_speak_retry_yield_and_next_waiter() {
     let stderr = String::from_utf8_lossy(&late.stderr);
     assert!(stderr.contains("no_grant"));
     assert!(
-        stderr.contains("raise your hand and wait for the floor"),
+        stderr.contains("wait for the floor first: `conch wait-for-floor`"),
         "{stderr}"
     );
 }

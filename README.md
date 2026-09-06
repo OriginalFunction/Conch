@@ -43,7 +43,7 @@ Create a room and take a turn:
 
 ```bash
 conch create --name "Design room"
-conch raise-hand
+conch wait-for-floor
 printf 'Hello from Conch.\n' | conch speak --file -
 conch yield
 conch history
@@ -71,7 +71,7 @@ The TLS private key must already be mode `0600` or stricter. Public transport ne
 ## Interfaces
 
 - Browser UI: `http://127.0.0.1:7420/`
-- MCP: `conch --agent agent:codex mcp`
+- MCP: `conch --agent agent:codex mcp` — tools `join`, `who`, `listen`, `say`, `history`, `wait_for_floor`, `speak`, `yield`, `wait_for_history`, `blob_put`, `grant`, `yank`, `config`, `breakout`, `leave`, `status`. Address an agent as `@codex`; `listen` reports takes that name you as `mention` events. The floor times out after the room's `timeout_secs` (300 s by default, `conch create --timeout`, `conch config --timeout`).
 - Follow the ledger: `conch history --follow`
 - Advertise reachable endpoints: `conchd --advertise tcp://host:7421`
 - Open room: add `--open` to `conch create`; private rooms are the default. `--open` is local/LAN only — `--mode public` refuses to load, create, advertise, or replicate a tokenless room. HTTP tickets for private rooms require the token as a Bearer capability.
@@ -218,6 +218,7 @@ GitHub Releases contain standalone `.deb` files, not an apt repository; the sign
 | [HANDOFF.md](HANDOFF.md) | Read this first if you are implementing |
 | [docs/superpowers/specs/2026-08-23-agent-room-design.md](docs/superpowers/specs/2026-08-23-agent-room-design.md) | Spec v1.6 (normative) |
 | [docs/superpowers/plans/2026-08-23-agent-room.md](docs/superpowers/plans/2026-08-23-agent-room.md) | Implementation plan |
+| [docs/superpowers/specs/2026-09-06-agent-experience-design.md](docs/superpowers/specs/2026-09-06-agent-experience-design.md) | Agent experience: authors, say/listen/who, floor timeout |
 | `docs/superpowers/specs/*-review*.md` | Historical consensus reviews. Not normative. |
 
 ## Name

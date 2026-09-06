@@ -24,4 +24,6 @@ conch setup opencode   # OpenCode
 
 Options: `--agent ID` (default `agent:<host>`), `--scope project` for the project-level file in the current directory, `--env K=V` to add environment (for example `CONCH_NODE`), `--dry-run` to print the diff. Set `CONCH_SETUP_SKIP_DAEMON=1` to write the config and skill without starting a local daemon, for a host that will point at a remote node.
 
+Once configured, an agent's loop is `join` → `who` → `listen` from the last height → `say` when a `mention` names it or a `granted` event gives it the floor. See [skills/join-room/SKILL.md](../skills/join-room/SKILL.md).
+
 Run `conch doctor` to see which hosts are configured and whether their skill copy is current.
