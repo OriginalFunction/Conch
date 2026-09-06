@@ -30,7 +30,7 @@ use conch_core::{
     types::{
         AgentId, BlobRef, Body, Cert, CertSigner, ChainState, CommitProof, CommittedScene,
         ConsensusRole, ConsensusState, FloorConfig, FloorMode, GrantReason, Hash32, Intent,
-        IntentKind, Mouth, NodeId, Pending, RoomId, Scene, SignatureBytes, StakePolicy,
+        IntentKind, LiveGrant, Mouth, NodeId, Pending, RoomId, Scene, SignatureBytes, StakePolicy,
         DEFAULT_FLOOR_TIMEOUT_SECS,
     },
 };
@@ -326,6 +326,21 @@ pub struct RunningServer {
     floor_timeouts: Option<FloorTimeoutTicker>,
 }
 
+/// A take this node leads that has outlived its room's `timeout_secs`.
+struct OverdueTake {
+    grant: LiveGrant,
+    age: u64,
+    /// The room has more than one staker, so closing it needs the network.
+    networked: bool,
+}
+
+/// The speech a close committed, so a caller can report what was saved without
+/// re-reading the room.
+struct ClosedTake {
+    text: String,
+    blobs: Vec<BlobRef>,
+}
+
 /// The leader's floor-timeout ticker, owned by the server that started it so
 /// that stopping the server stops the ticker and frees the daemon it pins.
 struct FloorTimeoutTicker {
@@ -342,6 +357,15 @@ impl FloorTimeoutTicker {
             .inner
             .floor_timeouts_started
             .store(false, Ordering::SeqCst);
+    }
+}
+
+impl Drop for FloorTimeoutTicker {
+    /// Dropping the handle stops the ticker, so a `serve` that returns early —
+    /// a bad listener, a shutdown — never leaves the task running with the
+    /// guard still set.
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -390,10 +414,8 @@ impl RunningServer {
 
 impl Drop for RunningServer {
     fn drop(&mut self) {
+        // The ticker stops when its handle drops with the rest of the fields.
         self.task.abort();
-        if let Some(ticker) = &self.floor_timeouts {
-            ticker.stop();
-        }
     }
 }
 
@@ -1181,6 +1203,52 @@ impl Daemon {
             .remove(&room);
     }
 
+    /// The live grant of `room` if this node leads it and its take has outlived
+    /// the room's `timeout_secs`, read without cloning the room's history.
+    fn overdue_take(&self, room: RoomId) -> Option<OverdueTake> {
+        self.with_replay(room, |replay| {
+            let grant = replay.chain.live_grant.clone()?;
+            // A single-node roster leads itself — but only for the node that IS
+            // that roster. An observer of a single-staker room must never try to
+            // close its grant: it would stall a whole FREEZE_WAIT dialling the
+            // holder on every tick and starve its own rooms.
+            let networked = replay.chain.roster.len() > 1;
+            let leads = if networked {
+                replay.consensus.role == ConsensusRole::Leader
+                    && replay.consensus.leader_id == Some(self.node_id())
+            } else {
+                replay.chain.roster.first() == Some(&self.node_id())
+            };
+            if !leads {
+                return None;
+            }
+            let timeout_secs = replay.chain.timeout_secs?;
+            let granted_ts = replay
+                .history
+                .iter()
+                .find(|record| record.scene.n == grant.n)
+                .map(|record| record.scene.ts)?;
+            let age = unix_timestamp().saturating_sub(granted_ts);
+            if age < timeout_secs {
+                return None;
+            }
+            Some(OverdueTake {
+                grant,
+                age,
+                networked,
+            })
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// The hash of a room's live grant, without cloning its history.
+    fn live_grant_hash(&self, room: RoomId) -> Result<Option<Hash32>, DaemonError> {
+        self.with_replay(room, |replay| {
+            replay.chain.live_grant.as_ref().map(|live| live.hash)
+        })
+    }
+
     /// One pass over every loaded room: close the live grant of any room this node
     /// leads whose take is older than the room's `timeout_secs`.
     async fn enforce_floor_timeouts(&self) {
@@ -1193,40 +1261,14 @@ impl Daemon {
             .copied()
             .collect();
         for room in rooms {
-            let Ok(replay) = self.replay(room) else {
+            let Some(overdue) = self.overdue_take(room) else {
                 continue;
             };
-            let Some(grant) = replay.chain.live_grant.clone() else {
-                continue;
-            };
-            // A single-node roster leads itself — but only for the node that IS
-            // that roster. An observer of a single-staker room must never try to
-            // close its grant: it would stall a whole FREEZE_WAIT dialling the
-            // holder on every tick and starve its own rooms.
-            let leads = if replay.chain.roster.len() <= 1 {
-                replay.chain.roster.first() == Some(&self.node_id())
-            } else {
-                replay.consensus.role == ConsensusRole::Leader
-                    && replay.consensus.leader_id == Some(self.node_id())
-            };
-            if !leads {
-                continue;
-            }
-            let Some(timeout_secs) = replay.chain.timeout_secs else {
-                continue;
-            };
-            let Some(granted_ts) = replay
-                .history
-                .iter()
-                .find(|record| record.scene.n == grant.n)
-                .map(|record| record.scene.ts)
-            else {
-                continue;
-            };
-            let age = unix_timestamp().saturating_sub(granted_ts);
-            if age < timeout_secs {
-                continue;
-            }
+            let OverdueTake {
+                grant,
+                age,
+                networked,
+            } = overdue;
             let Ok(floor) = self.floor(room) else {
                 continue;
             };
@@ -1234,21 +1276,12 @@ impl Daemon {
             let Ok(_mutation) = floor.mutation.try_lock() else {
                 continue;
             };
-            let Ok(replay) = self.replay(room) else {
-                continue;
-            };
-            if replay.chain.live_grant.as_ref().map(|live| live.hash) != Some(grant.hash) {
+            if self.live_grant_hash(room).ok().flatten() != Some(grant.hash) {
                 continue;
             }
-            match self.close_live_grant(room, &floor, &replay).await {
-                Ok(_) => {
-                    let empty = self
-                        .replay(room)
-                        .ok()
-                        .and_then(|replay| replay.history.last().cloned())
-                        .is_some_and(|record| {
-                            matches!(&record.scene.body, Body::Speech { text, blobs, .. } if text.is_empty() && blobs.is_empty())
-                        });
+            match self.close_live_grant(room, &floor, &grant, networked).await {
+                Ok(closed) => {
+                    let empty = closed.text.is_empty() && closed.blobs.is_empty();
                     self.forget_floor_timeout_notice(room);
                     eprintln!(
                         "conchd: room {room}: floor timeout after {age}s, holder {}@{}, empty={empty}",
@@ -3570,20 +3603,23 @@ impl Daemon {
         let _mutation = floor.mutation.lock().await;
         let replay = self.replay(room)?;
         self.require_moderator_mouth(&replay, &from)?;
-        self.close_live_grant(room, &floor, &replay).await
+        let grant = replay.chain.live_grant.clone().ok_or(FloorError::NoGrant)?;
+        self.close_live_grant(room, &floor, &grant, replay.chain.roster.len() > 1)
+            .await?;
+        Ok(json!({ "ok": true, "closes_grant": grant.hash }))
     }
 
-    /// Freeze and commit the live take (spec §12.1). The caller holds
-    /// `floor.mutation` and has already decided this node may close it: a
-    /// moderator yank, or the leader's floor timeout.
+    /// Freeze and commit the live take (spec §12.1), returning the speech it
+    /// committed. The caller holds `floor.mutation` and has already decided this
+    /// node may close it: a moderator yank, or the leader's floor timeout.
     async fn close_live_grant(
         &self,
         room: RoomId,
         floor: &Arc<RoomFloor>,
-        replay: &Replay,
-    ) -> Result<Value, DaemonError> {
-        let grant = replay.chain.live_grant.clone().ok_or(FloorError::NoGrant)?;
-        if replay.chain.roster.len() > 1 {
+        grant: &LiveGrant,
+        networked: bool,
+    ) -> Result<ClosedTake, DaemonError> {
+        if networked {
             self.ensure_network_leader(room).await?;
             self.broadcast_heartbeat(room).await;
         }
@@ -3626,17 +3662,11 @@ impl Daemon {
                 floor,
             )
             .await?;
-            if self
-                .replay(room)?
-                .chain
-                .live_grant
-                .as_ref()
-                .is_none_or(|live| live.hash != grant.hash)
-            {
+            if self.live_grant_hash(room)? != Some(grant.hash) {
                 break;
             }
         }
-        Ok(json!({ "ok": true, "closes_grant": grant.hash }))
+        Ok(ClosedTake { text, blobs })
     }
 
     async fn client_membership(
