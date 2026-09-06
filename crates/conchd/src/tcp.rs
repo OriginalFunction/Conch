@@ -4472,9 +4472,34 @@ impl Daemon {
         })?)
     }
 
+    /// Unconsumed, uncancelled, unexpired intents in spec §12.3 order.
+    fn floor_queue(
+        &self,
+        room: RoomId,
+        replay: &Replay,
+        now: u64,
+    ) -> Result<Vec<Intent>, DaemonError> {
+        let mut queue = self
+            .floor(room)?
+            .engine
+            .lock()
+            .expect("floor lock is not poisoned")
+            .intents()
+            .filter(|intent| {
+                replay.chain.roster.contains(&intent.node)
+                    && !replay.chain.consumed_intents.contains(&intent.id)
+                    && now < intent.exp
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        queue.sort_by_key(|intent| (intent.ts, intent.id));
+        Ok(queue)
+    }
+
     fn client_status(&self, room: Option<RoomId>) -> Result<Value, DaemonError> {
         if let Some(room) = room {
             let replay = self.replay(room)?;
+            let now = unix_timestamp();
             let name = replay
                 .history
                 .first()
@@ -4482,6 +4507,48 @@ impl Daemon {
                     Body::Genesis { name, .. } => Some(name.clone()),
                     _ => None,
                 });
+            let holder = replay.chain.live_grant.as_ref().map(|grant| {
+                let granted_ts = replay
+                    .history
+                    .iter()
+                    .find(|record| record.scene.n == grant.n)
+                    .map(|record| record.scene.ts);
+                json!({
+                    "agent": grant.to.agent,
+                    "node": grant.to.node,
+                    "grant_hash": grant.hash,
+                    "since_n": grant.n,
+                    "granted_ts": granted_ts,
+                })
+            });
+            let queue = self
+                .floor_queue(room, &replay, now)?
+                .into_iter()
+                .map(|intent| {
+                    json!({
+                        "agent": intent.agent,
+                        "node": intent.node,
+                        "kind": intent.kind,
+                        "ts": intent.ts,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut participants: BTreeSet<AgentId> = self
+                .inner
+                .room_agents
+                .read()
+                .expect("room-agent registry lock is not poisoned")
+                .get(&room)
+                .cloned()
+                .unwrap_or_default();
+            for record in &replay.history {
+                if let Body::Grant { to, .. } = &record.scene.body {
+                    participants.insert(to.agent.clone());
+                }
+            }
+            if let Some(moderator) = &replay.chain.moderator {
+                participants.insert(moderator.agent.clone());
+            }
             return Ok(json!({
                 "room": room,
                 "name": name,
@@ -4489,6 +4556,11 @@ impl Daemon {
                 "head_n": replay.chain.head_n,
                 "head_hash": replay.chain.head_hash,
                 "current_term": replay.consensus.current_term,
+                "mode": replay.chain.floor_mode,
+                "timeout_secs": replay.chain.timeout_secs,
+                "holder": holder,
+                "queue": queue,
+                "participants": participants,
             }));
         }
         let rooms = self
@@ -5977,21 +6049,8 @@ impl Daemon {
                 })
             })
             .collect::<Vec<_>>();
-        let mut queue = self
-            .floor(room)?
-            .engine
-            .lock()
-            .expect("floor lock is not poisoned")
-            .intents()
-            .filter(|intent| {
-                replay.chain.roster.contains(&intent.node)
-                    && !replay.chain.consumed_intents.contains(&intent.id)
-                    && now < intent.exp
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        queue.sort_by_key(|intent| (intent.ts, intent.id));
-        let queue = queue
+        let queue = self
+            .floor_queue(room, &replay, now)?
             .into_iter()
             .enumerate()
             .map(|(index, intent)| {

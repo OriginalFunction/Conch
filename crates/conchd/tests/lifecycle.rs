@@ -377,3 +377,97 @@ async fn history_records_name_the_author_of_each_take() {
     assert_eq!(scenes[0]["author"]["agent"], "agent:test");
     server.abort();
 }
+
+#[tokio::test]
+async fn status_reports_holder_queue_and_participants() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let ticket = daemon
+        .create_ticket(
+            "Who",
+            conch_core::types::StakePolicy::default(),
+            conch_core::types::FloorConfig::stick(300),
+        )
+        .unwrap();
+    let server = daemon
+        .start(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .await
+        .unwrap();
+    let room = ticket.id;
+
+    // agent:test takes the floor; a second mouth queues behind it.
+    assert!(
+        request(
+            server.addr(),
+            &ClientRequest::WaitForFloor {
+                room,
+                timeout_secs: Some(5)
+            }
+        )
+        .await
+        .ok
+    );
+    let mut second = TcpStream::connect(server.addr()).await.unwrap();
+    for message in [
+        &ClientRequest::Attach {
+            agent: AgentId::new("agent:second").unwrap(),
+        },
+        &ClientRequest::RaiseHand { room },
+    ] {
+        second
+            .write_all(&frame::encode(message).unwrap())
+            .await
+            .unwrap();
+        let length = second.read_u32().await.unwrap() as usize;
+        let mut payload = vec![0; length];
+        second.read_exact(&mut payload).await.unwrap();
+        let reply: ClientReply = frame::decode_payload(&payload).unwrap();
+        assert!(reply.ok, "{reply:?}");
+    }
+
+    let reply = request(server.addr(), &ClientRequest::Status { room: Some(room) }).await;
+    assert!(reply.ok, "{reply:?}");
+    let data = reply.data.unwrap();
+    assert_eq!(data["name"], "Who");
+    assert_eq!(data["mode"], "stick");
+    assert_eq!(data["timeout_secs"], 300);
+    assert_eq!(data["holder"]["agent"], "agent:test");
+    assert_eq!(data["holder"]["since_n"], 1);
+    assert!(data["holder"]["granted_ts"].as_u64().unwrap() > 1_700_000_000);
+    assert_eq!(data["holder"]["grant_hash"].as_str().unwrap().len(), 64);
+    let queue = data["queue"].as_array().unwrap();
+    assert_eq!(queue.len(), 1, "{queue:?}");
+    assert_eq!(queue[0]["agent"], "agent:second");
+    assert_eq!(queue[0]["kind"], "raise");
+    assert_eq!(data["participants"], json!(["agent:second", "agent:test"]));
+
+    assert!(
+        request(server.addr(), &ClientRequest::Yield { room })
+            .await
+            .ok
+    );
+    // The stick passes to agent:second on its own; wait for that grant.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let replay = daemon.replay(room).unwrap();
+            if replay
+                .chain
+                .live_grant
+                .as_ref()
+                .is_some_and(|g| g.to.agent.as_str() == "agent:second")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let data = request(server.addr(), &ClientRequest::Status { room: Some(room) })
+        .await
+        .data
+        .unwrap();
+    assert_eq!(data["holder"]["agent"], "agent:second");
+    assert_eq!(data["queue"].as_array().unwrap().len(), 0);
+    server.abort();
+}
