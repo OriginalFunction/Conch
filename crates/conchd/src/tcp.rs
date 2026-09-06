@@ -11,7 +11,7 @@ use std::{
 };
 
 use conch_core::{
-    apply::{apply, ApplyMode},
+    apply::{apply, closes_grant, ApplyMode},
     client::{ClientReply, ClientRequest},
     consensus::{
         advance_term, begin_campaign, tail, up_to_date, AdvanceSource, Append, Auth, Authed,
@@ -6880,19 +6880,6 @@ fn hash_scene(scene: &Scene) -> Hash32 {
     Hash32::from_bytes(scene_hash(
         &serde_json::to_value(scene).expect("typed scene is serializable"),
     ))
-}
-
-/// The grant a scene closes, for every body kind that can be issued as a take.
-fn closes_grant(body: &Body) -> Option<Hash32> {
-    match body {
-        Body::Speech { closes_grant, .. } | Body::Breakout { closes_grant, .. } => {
-            Some(*closes_grant)
-        }
-        Body::Membership { closes_grant, .. } | Body::ViewChange { closes_grant, .. } => {
-            *closes_grant
-        }
-        Body::Genesis { .. } | Body::Grant { .. } => None,
-    }
 }
 
 fn scene_blobs(scene: &Scene) -> &[BlobRef] {

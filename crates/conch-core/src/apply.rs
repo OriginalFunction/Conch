@@ -604,7 +604,9 @@ fn apply_config(state: &mut ChainState, stake: &crate::types::StakePolicy, floor
     state.timeout_secs = Some(floor.timeout_secs);
 }
 
-fn closes_grant(body: &Body) -> Option<Hash32> {
+/// Which bodies close a grant: Speech, Breakout, and optionally Membership and ViewChange.
+/// Genesis and Grant records do not close any grant.
+pub fn closes_grant(body: &Body) -> Option<Hash32> {
     match body {
         Body::Speech { closes_grant, .. } | Body::Breakout { closes_grant, .. } => {
             Some(*closes_grant)
