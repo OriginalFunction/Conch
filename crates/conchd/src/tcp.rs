@@ -31,6 +31,7 @@ use conch_core::{
         AgentId, BlobRef, Body, Cert, CertSigner, ChainState, CommitProof, CommittedScene,
         ConsensusRole, ConsensusState, FloorConfig, FloorMode, GrantReason, Hash32, Intent,
         IntentKind, Mouth, NodeId, Pending, RoomId, Scene, SignatureBytes, StakePolicy,
+        DEFAULT_FLOOR_TIMEOUT_SECS,
     },
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -832,7 +833,11 @@ impl Daemon {
 
     pub fn create_genesis(&self, name: &str) -> Result<RoomId, DaemonError> {
         Ok(self
-            .create_ticket(name, StakePolicy::default(), FloorConfig::stick(300))?
+            .create_ticket(
+                name,
+                StakePolicy::default(),
+                FloorConfig::stick(DEFAULT_FLOOR_TIMEOUT_SECS),
+            )?
             .id)
     }
 
@@ -1058,6 +1063,19 @@ impl Daemon {
             .lock()
             .expect("replay lock is not poisoned")
             .clone())
+    }
+
+    /// Read a few fields out of a room's replay without cloning its history.
+    /// Callers that only need chain or consensus state should prefer this to
+    /// [`Daemon::replay`], which deep-copies every committed scene.
+    fn with_replay<T>(
+        &self,
+        room: RoomId,
+        read: impl FnOnce(&Replay) -> T,
+    ) -> Result<T, DaemonError> {
+        let entry = self.replay_entry(room)?;
+        let replay = entry.lock().expect("replay lock is not poisoned");
+        Ok(read(&replay))
     }
 
     pub async fn start(&self, addr: SocketAddr) -> Result<RunningServer, DaemonError> {
@@ -2742,12 +2760,11 @@ impl Daemon {
                     });
                     if declared && self.room_authorized(request.room, &authed)? {
                         if let Ok(scene) = self
-                            .client_membership_from(
+                            .peer_membership(
                                 request.from,
                                 request.room,
                                 request.stake,
                                 request.floor,
-                                None,
                             )
                             .await
                         {
@@ -3643,6 +3660,9 @@ impl Daemon {
         .await
     }
 
+    /// A local client's config change. The client names a mode, a moderator, or
+    /// a timeout; the committed timeout is the daemon's to carry, so a
+    /// mode-only change never resets a timeout the leader is enforcing.
     async fn client_membership_from(
         &self,
         from: Mouth,
@@ -3651,22 +3671,61 @@ impl Daemon {
         floor_config: Option<FloorConfig>,
         timeout_secs: Option<u64>,
     ) -> Result<Value, DaemonError> {
+        let committed = self.with_replay(room, |replay| replay.chain.timeout_secs)?;
+        let floor_config = match (floor_config, timeout_secs) {
+            (None, None) => None,
+            (floor, requested) => {
+                let mut merged = match floor {
+                    Some(floor) => floor,
+                    None => {
+                        self.with_replay(room, |replay| floor_config_from_chain(&replay.chain))?
+                    }
+                };
+                merged.timeout_secs = match requested {
+                    Some(secs) => secs,
+                    // The client's own `timeout_secs` field is a placeholder it
+                    // cannot fill in: only the chain knows the current value.
+                    None => committed.ok_or(DaemonError::Protocol("room has no floor timeout"))?,
+                };
+                Some(merged)
+            }
+        };
+        self.commit_membership_change(from, room, stake, floor_config)
+            .await
+    }
+
+    /// A roster peer forwards a config change it has already merged against the
+    /// same chain, so its floor config is taken as given — and therefore has to
+    /// be checked, or a peer could commit a timeout every take is born past.
+    async fn peer_membership(
+        &self,
+        from: Mouth,
+        room: RoomId,
+        stake: Option<StakePolicy>,
+        floor_config: Option<FloorConfig>,
+    ) -> Result<Value, DaemonError> {
+        self.commit_membership_change(from, room, stake, floor_config)
+            .await
+    }
+
+    async fn commit_membership_change(
+        &self,
+        from: Mouth,
+        room: RoomId,
+        stake: Option<StakePolicy>,
+        floor_config: Option<FloorConfig>,
+    ) -> Result<Value, DaemonError> {
         let floor = self.floor(room)?;
         if !self.can_certify(room)? {
             return Err(FloorError::NotStaker.into());
         }
+        if floor_config
+            .as_ref()
+            .is_some_and(|config| config.timeout_secs < 1)
+        {
+            return Err(DaemonError::Protocol("timeout_secs must be at least 1"));
+        }
         let replay = self.replay(room)?;
-        let floor_config = match (floor_config, timeout_secs) {
-            (floor, Some(secs)) => {
-                if secs < 1 {
-                    return Err(DaemonError::Protocol("timeout_secs must be at least 1"));
-                }
-                let mut merged = floor.unwrap_or_else(|| floor_config_from_chain(&replay.chain));
-                merged.timeout_secs = secs;
-                Some(merged)
-            }
-            (floor, None) => floor,
-        };
         if let Some(leader) = replay
             .consensus
             .leader_id
@@ -3763,7 +3822,10 @@ impl Daemon {
     ) -> Result<Value, DaemonError> {
         let floor = self.floor(room)?;
         let replay = self.replay(room)?;
-        let parent_timeout = replay.chain.timeout_secs.unwrap_or(300);
+        let parent_timeout = replay
+            .chain
+            .timeout_secs
+            .unwrap_or(DEFAULT_FLOOR_TIMEOUT_SECS);
         if let Some(leader) = replay
             .consensus
             .leader_id
@@ -8553,6 +8615,56 @@ mod tests {
         let replay = observer.replay(ticket.id).unwrap();
         assert_eq!(replay.chain.live_grant, Some(grant));
         assert_eq!(replay.history.len(), committed);
+    }
+
+    /// A peer's `MembershipReq` carries a floor config the leader commits as
+    /// given. A zero timeout would make every later take overdue the instant it
+    /// was granted, so the leader refuses it instead of enforcing it.
+    #[tokio::test]
+    async fn a_peer_cannot_commit_a_zero_floor_timeout() {
+        let data = TempDir::new().unwrap();
+        let daemon = Daemon::open(data.path()).unwrap();
+        let ticket = daemon
+            .create_ticket(
+                "peer config",
+                StakePolicy::default(),
+                FloorConfig::stick(45),
+            )
+            .unwrap();
+        let from = Mouth {
+            agent: AgentId::new("agent:peer").unwrap(),
+            node: NodeId::from_bytes([7; 32]),
+        };
+
+        let refused = daemon
+            .peer_membership(
+                from.clone(),
+                ticket.id,
+                None,
+                Some(FloorConfig {
+                    mode: FloorMode::Stick,
+                    timeout_secs: 0,
+                    moderator: None,
+                }),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(DaemonError::Protocol(message)) if message.contains("at least 1")),
+            "{refused:?}"
+        );
+        let replay = daemon.replay(ticket.id).unwrap();
+        assert_eq!(replay.chain.timeout_secs, Some(45));
+        assert_eq!(replay.history.len(), 1, "nothing was committed");
+
+        // A peer's merged config with a real timeout is still honoured.
+        daemon
+            .peer_membership(from, ticket.id, None, Some(FloorConfig::stick(90)))
+            .await
+            .unwrap();
+        assert_eq!(
+            daemon.replay(ticket.id).unwrap().chain.timeout_secs,
+            Some(90)
+        );
     }
 
     fn copy_tree(from: &Path, to: &Path) {

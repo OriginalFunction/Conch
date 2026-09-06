@@ -13,7 +13,10 @@ use conch_core::{
     floor::valid_request_id,
     frame::{self, MAX_FRAME_BYTES},
     ticket::{JoinRole, Ticket, TicketSource},
-    types::{AgentId, FloorConfig, FloorMode, Hash32, Mouth, NodeId, RoomId, StakePolicy},
+    types::{
+        AgentId, FloorConfig, FloorMode, Hash32, Mouth, NodeId, RoomId, StakePolicy,
+        DEFAULT_FLOOR_TIMEOUT_SECS,
+    },
 };
 use rand::random;
 use serde::de::DeserializeOwned;
@@ -171,7 +174,9 @@ impl Server {
             "create" => {
                 let name = arguments.string("name")?;
                 let mode = arguments.optional_string("mode").unwrap_or("stick");
-                let timeout_secs = arguments.optional_u64("timeout").unwrap_or(300);
+                let timeout_secs = arguments
+                    .optional_u64("timeout")
+                    .unwrap_or(DEFAULT_FLOOR_TIMEOUT_SECS);
                 if timeout_secs < 1 {
                     return Err("timeout must be at least 1".into());
                 }
@@ -288,12 +293,15 @@ impl Server {
             ),
             "yank" => (ClientRequest::Yank { room: room()? }, None),
             "config" => {
+                // `timeout_secs` here is a placeholder: only the `timeout`
+                // argument changes the timeout, and the daemon carries the
+                // committed one through a mode or moderator change.
                 let floor = match arguments.optional_string("mode") {
                     None => None,
-                    Some("stick") => Some(FloorConfig::stick(30)),
+                    Some("stick") => Some(FloorConfig::stick(DEFAULT_FLOOR_TIMEOUT_SECS)),
                     Some("moderator") => Some(FloorConfig {
                         mode: FloorMode::Moderator,
-                        timeout_secs: 30,
+                        timeout_secs: DEFAULT_FLOOR_TIMEOUT_SECS,
                         moderator: Some(Mouth {
                             agent: arguments.agent("moderator")?,
                             node: arguments.node("moderator_node")?,

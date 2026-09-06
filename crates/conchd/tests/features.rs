@@ -1621,3 +1621,53 @@ async fn floor_timeouts_are_enforced_again_after_a_server_is_aborted_and_restart
     .expect("the restarted server enforces the floor timeout again");
     second.abort();
 }
+
+#[tokio::test]
+async fn a_mode_only_membership_keeps_the_committed_floor_timeout() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let ticket = daemon
+        .create_ticket(
+            "Reconfigured",
+            StakePolicy::default(),
+            FloorConfig::stick(45),
+        )
+        .unwrap();
+    let server = daemon.start(loopback()).await.unwrap();
+    let mut operator = attach(server.addr(), "human:operator").await;
+
+    // The client names a mode, not a timeout: its `timeout_secs` is a placeholder
+    // the daemon must ignore in favour of the committed one.
+    let configured = request(
+        &mut operator,
+        ClientRequest::Membership {
+            room: ticket.id,
+            stake: None,
+            floor: Some(FloorConfig::stick(30)),
+            timeout_secs: None,
+        },
+    )
+    .await;
+    assert!(configured.ok, "{configured:?}");
+    let chain = daemon.replay(ticket.id).unwrap().chain;
+    assert_eq!(chain.timeout_secs, Some(45));
+    assert_eq!(chain.floor_mode, Some(FloorMode::Stick));
+
+    // An explicit timeout still wins.
+    let retimed = request(
+        &mut operator,
+        ClientRequest::Membership {
+            room: ticket.id,
+            stake: None,
+            floor: Some(FloorConfig::stick(30)),
+            timeout_secs: Some(120),
+        },
+    )
+    .await;
+    assert!(retimed.ok, "{retimed:?}");
+    assert_eq!(
+        daemon.replay(ticket.id).unwrap().chain.timeout_secs,
+        Some(120)
+    );
+    server.abort();
+}

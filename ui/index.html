@@ -160,7 +160,8 @@
       <form id="create-form">
         <div class="dialog-heading"><div><p class="eyebrow">Start a conversation</p><h2>Create a room</h2></div><button type="button" class="close-button" data-close aria-label="Close">×</button></div>
         <label>Room name<input id="create-name" name="name" maxlength="128" required placeholder="Architecture review"></label>
-        <label>Floor timeout<span class="label-hint">Seconds before an idle holder is closed</span><input id="create-timeout" name="timeout" type="number" min="1" value="30" required></label>
+        <!-- 300 mirrors conch_core::types::DEFAULT_FLOOR_TIMEOUT_SECS. -->
+        <label>Floor timeout<span class="label-hint">Seconds before an idle holder is closed</span><input id="create-timeout" name="timeout" type="number" min="1" value="300" required></label>
         <p id="create-error" class="error" role="alert"></p>
         <div class="dialog-actions"><button type="button" class="secondary" data-close>Cancel</button><button type="submit">Create room</button></div>
       </form>

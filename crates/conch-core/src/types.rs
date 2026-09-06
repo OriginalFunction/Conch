@@ -225,6 +225,10 @@ pub enum FloorMode {
     Moderator,
 }
 
+/// Seconds a holder may keep the floor before the leader closes the take, for
+/// every room created without an explicit timeout. Enforced from spec §12.1.
+pub const DEFAULT_FLOOR_TIMEOUT_SECS: u64 = 300;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FloorConfig {

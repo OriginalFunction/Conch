@@ -588,7 +588,8 @@ async function createRoom(event) {
     state.invitation = result.ticket;
     el.createDialog.close();
     el.createForm.reset();
-    el.createTimeout.value = "30";
+    // 300 mirrors conch_core::types::DEFAULT_FLOOR_TIMEOUT_SECS.
+    el.createTimeout.value = "300";
     await loadCatalog();
     await openRoom(result.ticket.id);
     el.ticketDialog.showModal();

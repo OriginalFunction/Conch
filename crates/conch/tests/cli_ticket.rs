@@ -405,6 +405,24 @@ async fn create_and_config_set_the_floor_timeout() {
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("at least 1"));
 
+    // A mode-only config carries no timeout of its own: the committed one stands.
+    let remoded = conch(&["--room", &room, "config", "--mode", "stick"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        remoded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&remoded.stderr)
+    );
+    let status = conch(&["--room", &room, "status"]).output().await.unwrap();
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(
+        status["timeout_secs"], 90,
+        "a mode-only config must not reset the enforced timeout"
+    );
+    assert_eq!(status["mode"], "stick");
+
     // A room created without --timeout gets the new default.
     let plain = conch(&["create", "--name", "Plain"])
         .output()

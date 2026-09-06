@@ -13,7 +13,10 @@ use conch_core::{
     client::{ClientReply, ClientRequest},
     frame::{self, MAX_FRAME_BYTES},
     ticket::{JoinRole, Ticket, TicketSource},
-    types::{AgentId, FloorConfig, FloorMode, Hash32, Mouth, NodeId, RoomId, StakePolicy},
+    types::{
+        AgentId, FloorConfig, FloorMode, Hash32, Mouth, NodeId, RoomId, StakePolicy,
+        DEFAULT_FLOOR_TIMEOUT_SECS,
+    },
 };
 use rand::random;
 use serde::{de::DeserializeOwned, Serialize};
@@ -705,7 +708,7 @@ impl Arguments {
                 let mut create_token = token;
                 let mut open = false;
                 let mut show_secret = false;
-                let mut timeout_secs = 300_u64;
+                let mut timeout_secs = DEFAULT_FLOOR_TIMEOUT_SECS;
                 while let Some(flag) = arguments.next() {
                     match flag.as_str() {
                         "--name" => {
@@ -978,13 +981,18 @@ impl Arguments {
                         _ => return Err(format!("unknown config argument: {flag}")),
                     }
                 }
+                // `timeout_secs` here is a placeholder: only `--timeout` changes
+                // the timeout, and the daemon carries the committed one through
+                // a mode or moderator change.
                 let floor = match (mode, moderator_agent, moderator_node) {
                     (None, None, None) => None,
-                    (Some(FloorMode::Stick), None, None) => Some(FloorConfig::stick(30)),
+                    (Some(FloorMode::Stick), None, None) => {
+                        Some(FloorConfig::stick(DEFAULT_FLOOR_TIMEOUT_SECS))
+                    }
                     (Some(FloorMode::Moderator) | None, Some(agent), Some(node)) => {
                         Some(FloorConfig {
                             mode: FloorMode::Moderator,
-                            timeout_secs: 30,
+                            timeout_secs: DEFAULT_FLOOR_TIMEOUT_SECS,
                             moderator: Some(Mouth { agent, node }),
                         })
                     }
