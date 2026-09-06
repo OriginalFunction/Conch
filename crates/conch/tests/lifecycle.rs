@@ -319,7 +319,7 @@ fn status_auto_spawns_on_default_node_and_says_so() {
     let _guard = DaemonGuard::new(data.path());
     let mut status = None;
     with_daemon_ports(|tcp, http| {
-        let output = conch(&data, tcp, http, &["status"]);
+        let output = conch(&data, tcp, http, &["status", "--json"]);
         let started = output.status.success();
         status = Some(output);
         started

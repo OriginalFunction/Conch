@@ -22,7 +22,14 @@ async fn create_writes_slug_ticket_and_prints_pinned_magnet() {
     let node = format!("tcp://{}", server.addr());
 
     let output = Command::new(env!("CARGO_BIN_EXE_conch"))
-        .args(["--node", &node, "create", "--name", "My Design Room!"])
+        .args([
+            "--node",
+            &node,
+            "create",
+            "--name",
+            "My Design Room!",
+            "--json",
+        ])
         .current_dir(output_dir.path())
         .output()
         .await
@@ -63,6 +70,7 @@ async fn default_output_and_captured_errors_never_log_the_room_capability() {
             "create",
             "--name",
             "Sentinel Secret",
+            "--json",
         ])
         .current_dir(output_dir.path())
         .output()
@@ -127,7 +135,14 @@ async fn join_file_defaults_to_stake_and_fetches_verified_genesis() {
     let binary = env!("CARGO_BIN_EXE_conch");
 
     let created = Command::new(binary)
-        .args(["--node", &source_node, "create", "--name", "Join Test"])
+        .args([
+            "--node",
+            &source_node,
+            "create",
+            "--name",
+            "Join Test",
+            "--json",
+        ])
         .current_dir(output_dir.path())
         .output()
         .await
@@ -137,7 +152,13 @@ async fn join_file_defaults_to_stake_and_fetches_verified_genesis() {
     let room = created["id"].as_str().unwrap();
 
     let joined = Command::new(binary)
-        .args(["--node", &follower_node, "join", "join-test.conch"])
+        .args([
+            "--node",
+            &follower_node,
+            "join",
+            "join-test.conch",
+            "--json",
+        ])
         .current_dir(output_dir.path())
         .output()
         .await
@@ -239,6 +260,7 @@ async fn magnet_fallback_still_joins() {
             "join",
             &ticket.to_magnet(),
             "--observe",
+            "--json",
         ])
         .current_dir(output_dir.path())
         .output()
@@ -280,6 +302,7 @@ async fn tokened_http_ticket_join_sends_bearer_and_authenticates_swarm() {
             "Private Room",
             "--token",
             token,
+            "--json",
         ])
         .current_dir(output_dir.path())
         .output()
@@ -335,7 +358,12 @@ async fn current_room_file_supplies_the_cli_default() {
     let server = daemon.start(loopback()).await.unwrap();
 
     let status = Command::new(env!("CARGO_BIN_EXE_conch"))
-        .args(["--node", &format!("tcp://{}", server.addr()), "status"])
+        .args([
+            "--node",
+            &format!("tcp://{}", server.addr()),
+            "status",
+            "--json",
+        ])
         .env("CONCH_DATA_DIR", data.path())
         .output()
         .await
@@ -367,7 +395,7 @@ async fn create_and_config_set_the_floor_timeout() {
         command
     };
 
-    let created = conch(&["create", "--name", "Timed", "--timeout", "45"])
+    let created = conch(&["create", "--name", "Timed", "--timeout", "45", "--json"])
         .output()
         .await
         .unwrap();
@@ -379,7 +407,10 @@ async fn create_and_config_set_the_floor_timeout() {
     let created: Value = serde_json::from_slice(&created.stdout).unwrap();
     let room = created["id"].as_str().unwrap().to_owned();
 
-    let status = conch(&["--room", &room, "status"]).output().await.unwrap();
+    let status = conch(&["--room", &room, "status", "--json"])
+        .output()
+        .await
+        .unwrap();
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["timeout_secs"], 45);
     assert_eq!(status["mode"], "stick");
@@ -393,7 +424,10 @@ async fn create_and_config_set_the_floor_timeout() {
         "{}",
         String::from_utf8_lossy(&configured.stderr)
     );
-    let status = conch(&["--room", &room, "status"]).output().await.unwrap();
+    let status = conch(&["--room", &room, "status", "--json"])
+        .output()
+        .await
+        .unwrap();
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["timeout_secs"], 90);
     assert_eq!(status["mode"], "stick", "mode carried over unchanged");
@@ -415,7 +449,10 @@ async fn create_and_config_set_the_floor_timeout() {
         "{}",
         String::from_utf8_lossy(&remoded.stderr)
     );
-    let status = conch(&["--room", &room, "status"]).output().await.unwrap();
+    let status = conch(&["--room", &room, "status", "--json"])
+        .output()
+        .await
+        .unwrap();
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(
         status["timeout_secs"], 90,
@@ -424,13 +461,16 @@ async fn create_and_config_set_the_floor_timeout() {
     assert_eq!(status["mode"], "stick");
 
     // A room created without --timeout gets the new default.
-    let plain = conch(&["create", "--name", "Plain"])
+    let plain = conch(&["create", "--name", "Plain", "--json"])
         .output()
         .await
         .unwrap();
     let plain: Value = serde_json::from_slice(&plain.stdout).unwrap();
     let room = plain["id"].as_str().unwrap().to_owned();
-    let status = conch(&["--room", &room, "status"]).output().await.unwrap();
+    let status = conch(&["--room", &room, "status", "--json"])
+        .output()
+        .await
+        .unwrap();
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["timeout_secs"], 300);
     server.abort();

@@ -24,7 +24,7 @@ async fn two_wait_for_floor_processes_only_unblock_one() {
     let binary = env!("CARGO_BIN_EXE_conch");
 
     let created = Command::new(binary)
-        .args(["--node", &node, "create", "--name", "cli test"])
+        .args(["--node", &node, "create", "--name", "cli test", "--json"])
         .current_dir(data.path())
         .output()
         .await
@@ -169,6 +169,7 @@ async fn raise_retry_and_wait_while_granted_do_not_queue_a_second_turn() {
         "--room",
         &room,
         "raise-hand",
+        "--json",
     ];
 
     let first = run(binary, &raise_args, data.path()).await;
@@ -221,7 +222,7 @@ async fn raise_retry_and_wait_while_granted_do_not_queue_a_second_turn() {
     let history = run(
         binary,
         &[
-            "--node", &node, "--agent", "alpha", "--room", &room, "history",
+            "--node", &node, "--agent", "alpha", "--room", &room, "history", "--json",
         ],
         data.path(),
     )
@@ -235,7 +236,7 @@ async fn raise_retry_and_wait_while_granted_do_not_queue_a_second_turn() {
 async fn create(binary: &str, node: &str, cwd: &Path) -> String {
     let created = run(
         binary,
-        &["--node", node, "create", "--name", "cli test"],
+        &["--node", node, "create", "--name", "cli test", "--json"],
         cwd,
     )
     .await;
@@ -273,6 +274,7 @@ async fn speak(
             request_id,
             "--file",
             "-",
+            "--json",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

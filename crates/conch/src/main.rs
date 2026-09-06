@@ -20,6 +20,7 @@ use conch_core::{
 };
 use rand::random;
 use serde::{de::DeserializeOwned, Serialize};
+use serde_json::Value;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -43,8 +44,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         output,
         command,
         node_is_default,
-        json: _,
-        room: _,
+        json,
+        room,
+        oneline,
     } = parsed;
     if let ParsedRequest::Mcp { room } = &request {
         return conch_mcp::run(node, agent, *room, tls_ca, node_is_default)
@@ -59,9 +61,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ParsedRequest::Ready(request)
             if matches!(request.as_ref(), ClientRequest::History { follow: true, .. })
     );
+    let ctx = conch::render::Context {
+        room,
+        current_room: read_current_room(),
+        oneline,
+        width: terminal_width(),
+    };
     let (request, raw) = request.resolve(tls_ca.as_deref()).await?;
     let mut stream = connect_with_spawn(&node, node_is_default).await?;
-    write_frame(&mut stream, &ClientRequest::Attach { agent }).await?;
+    write_frame(
+        &mut stream,
+        &ClientRequest::Attach {
+            agent: agent.clone(),
+        },
+    )
+    .await?;
     let attached: ClientReply = read_frame(&mut stream).await?;
     if !attached.ok {
         return Err(format_reply_error(&attached, &command).into());
@@ -78,10 +92,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             if !reply.ok {
                 return Err(format_reply_error(&reply, &command).into());
             }
-            println!(
-                "{}",
-                serde_json::to_string(&reply.data.unwrap_or_default())?
-            );
+            print_reply(&command, &reply.data.unwrap_or_default(), json, &ctx)?;
         }
     }
     let reply: ClientReply = read_frame(&mut stream).await?;
@@ -89,6 +100,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format_reply_error(&reply, &command).into());
     }
     let data = reply.data.unwrap_or_default();
+    let data = if command == "join" {
+        enrich_join(&node, &agent, node_is_default, data).await
+    } else {
+        data
+    };
     let output = match output {
         Output::Json => data,
         Output::Create {
@@ -118,10 +134,63 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "ticket_path": format!("./{}", ticket_path.display()),
                 "magnet": magnet,
                 "id": ticket.id,
+                "name": ticket.name,
             })
         }
     };
-    println!("{}", serde_json::to_string(&output)?);
+    print_reply(&command, &output, json, &ctx)?;
+    Ok(())
+}
+
+/// After a successful join, look up the room's name and current head so the reply
+/// reads naturally; a failed status leaves the join reply exactly as the daemon sent it.
+async fn enrich_join(node: &str, agent: &AgentId, node_is_default: bool, mut data: Value) -> Value {
+    let Some(room) = data
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(|id| id.parse::<RoomId>().ok())
+    else {
+        return data;
+    };
+    let Ok(status) = call(
+        node,
+        agent,
+        node_is_default,
+        "status",
+        ClientRequest::Status { room: Some(room) },
+    )
+    .await
+    else {
+        return data;
+    };
+    if let Some(object) = data.as_object_mut() {
+        if let Some(name) = status.get("name") {
+            object.insert("name".to_owned(), name.clone());
+        }
+        if let Some(head_n) = status.get("head_n") {
+            object.insert("head_n".to_owned(), head_n.clone());
+        }
+    }
+    data
+}
+
+/// Print a successful reply: `--json` prints the wire reply verbatim; otherwise the
+/// render layer's text, falling back to JSON for a command it does not know.
+fn print_reply(
+    command: &str,
+    data: &Value,
+    json: bool,
+    ctx: &conch::render::Context,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if json {
+        println!("{}", serde_json::to_string(data)?);
+        return Ok(());
+    }
+    match conch::render::render(command, data, ctx) {
+        Some(text) if text.is_empty() => {}
+        Some(text) => println!("{text}"),
+        None => println!("{}", serde_json::to_string(data)?),
+    }
     Ok(())
 }
 
@@ -453,6 +522,35 @@ async fn connect_with_spawn(
     }
 }
 
+/// One request on its own connection: attach, send, read the reply. An error reply
+/// is returned as the CLI's usual `code: message` plus remedy text.
+async fn call(
+    node: &str,
+    agent: &AgentId,
+    node_is_default: bool,
+    command: &str,
+    request: ClientRequest,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut stream = connect_with_spawn(node, node_is_default).await?;
+    write_frame(
+        &mut stream,
+        &ClientRequest::Attach {
+            agent: agent.clone(),
+        },
+    )
+    .await?;
+    let attached: ClientReply = read_frame(&mut stream).await?;
+    if !attached.ok {
+        return Err(format_reply_error(&attached, command).into());
+    }
+    write_frame(&mut stream, &request).await?;
+    let reply: ClientReply = read_frame(&mut stream).await?;
+    if !reply.ok {
+        return Err(format_reply_error(&reply, command).into());
+    }
+    Ok(reply.data.unwrap_or_default())
+}
+
 fn default_tcp() -> String {
     conch_launch::default_tcp()
 }
@@ -504,11 +602,9 @@ struct Arguments {
     output: Output,
     command: String,
     node_is_default: bool,
-    // Read by later tasks in the human-CLI series (rendering and room resolution).
-    #[allow(dead_code)]
     json: bool,
-    #[allow(dead_code)]
     room: Option<String>,
+    oneline: bool,
 }
 
 enum Output {
@@ -814,6 +910,7 @@ impl Arguments {
                 .map_err(|error| format!("invalid room id: {error}"))
         };
         let mut output = Output::Json;
+        let mut oneline = false;
         let request = match command.as_str() {
             "create" => {
                 let mut name = None;
@@ -1186,6 +1283,7 @@ impl Arguments {
                                 .map_err(|_| "invalid history height")?;
                         }
                         "--follow" => follow = true,
+                        "--oneline" => oneline = true,
                         _ => return Err(format!("unknown history argument: {flag}")),
                     }
                 }
@@ -1289,6 +1387,7 @@ impl Arguments {
             node_is_default,
             json,
             room: room_for_output,
+            oneline,
         })
     }
 }
@@ -1328,7 +1427,7 @@ fn print_command_help(command: &str) -> Result<(), String> {
             "conch [--tls-ca CA.pem] join TICKET|MAGNET|HTTPS_URL [--stake | --observe]"
         }
         "status" => "conch [--room ID] status",
-        "history" => "conch --room ID history [--from N] [--follow]",
+        "history" => "conch history [--from N] [--follow] [--oneline] [--room ID]",
         "raise-hand" => "conch --room ID raise-hand",
         "wait-for-floor" => "conch --room ID wait-for-floor [--timeout SECONDS]",
         "speak" => "printf 'text' | conch --room ID speak --file - [--request-id ID]",
@@ -1430,8 +1529,9 @@ fn slug(name: &str) -> String {
     }
 }
 
-fn read_current_room() -> Option<String> {
-    let data_dir = env::var_os("CONCH_DATA_DIR").map_or_else(
+/// Where the CLI reads and writes local state (the current-room marker, pid files, logs).
+fn data_dir() -> PathBuf {
+    env::var_os("CONCH_DATA_DIR").map_or_else(
         || {
             env::var_os("HOME")
                 .map(PathBuf::from)
@@ -1439,11 +1539,22 @@ fn read_current_room() -> Option<String> {
                 .join(".conch")
         },
         PathBuf::from,
-    );
-    let bytes = fs::read(data_dir.join("current-room")).ok()?;
+    )
+}
+
+fn read_current_room() -> Option<String> {
+    let bytes = fs::read(data_dir().join("current-room")).ok()?;
     serde_json::from_slice::<RoomId>(&bytes)
         .ok()
         .map(|room| room.to_string())
+}
+
+/// The terminal width used to cut `--oneline` text; 120 columns when unknown.
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(120)
 }
 
 #[cfg(test)]
