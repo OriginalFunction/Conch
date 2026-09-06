@@ -3367,7 +3367,19 @@ impl Daemon {
         let _mutation = floor.mutation.lock().await;
         let replay = self.replay(room)?;
         self.require_moderator_mouth(&replay, &from)?;
-        let grant = replay.chain.live_grant.ok_or(FloorError::NoGrant)?;
+        self.close_live_grant(room, &floor, &replay).await
+    }
+
+    /// Freeze and commit the live take (spec §12.1). The caller holds
+    /// `floor.mutation` and has already decided this node may close it: a
+    /// moderator yank, or the leader's floor timeout.
+    async fn close_live_grant(
+        &self,
+        room: RoomId,
+        floor: &Arc<RoomFloor>,
+        replay: &Replay,
+    ) -> Result<Value, DaemonError> {
+        let grant = replay.chain.live_grant.clone().ok_or(FloorError::NoGrant)?;
         if replay.chain.roster.len() > 1 {
             self.ensure_network_leader(room).await?;
             self.broadcast_heartbeat(room).await;
@@ -3408,7 +3420,7 @@ impl Daemon {
                     text: text.clone(),
                     blobs: blobs.clone(),
                 },
-                &floor,
+                floor,
             )
             .await?;
             if self
