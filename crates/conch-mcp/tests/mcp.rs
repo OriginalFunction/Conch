@@ -62,7 +62,10 @@ async fn initialize_and_tools_list_use_current_mcp_envelopes() {
         .collect::<Vec<_>>();
     assert!(names.contains(&"wait_for_floor"));
     assert!(names.contains(&"wait_for_history"));
-    assert!(names.contains(&"raise_hand"));
+    assert!(names.contains(&"say"));
+    assert!(names.contains(&"listen"));
+    assert!(names.contains(&"who"));
+    assert!(!names.contains(&"raise_hand"), "{names:?}");
     assert!(names.contains(&"blob_put"));
     assert!(names.contains(&"breakout"));
 
@@ -233,7 +236,7 @@ async fn mcp_calls_the_same_daemon_floor_protocol() {
     let raised = server
         .handle_message(json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": { "name": "raise_hand", "arguments": {} }
+            "params": { "name": "wait_for_floor", "arguments": { "timeout": 3 } }
         }))
         .await
         .unwrap();
@@ -320,7 +323,7 @@ async fn mcp_calls_the_same_daemon_floor_protocol() {
     let raised_again = server
         .handle_message(json!({
             "jsonrpc": "2.0", "id": 6, "method": "tools/call",
-            "params": { "name": "raise_hand", "arguments": {} }
+            "params": { "name": "wait_for_floor", "arguments": { "timeout": 3 } }
         }))
         .await
         .unwrap();

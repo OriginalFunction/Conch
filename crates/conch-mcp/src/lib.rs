@@ -4,11 +4,12 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
+    time::Duration,
 };
 
 use conch_core::{
     client::{ClientReply, ClientRequest},
-    encoding::signed_object_digest,
+    encoding::{scene_hash, signed_object_digest},
     floor::valid_request_id,
     frame::{self, MAX_FRAME_BYTES},
     ticket::{JoinRole, Ticket, TicketSource},
@@ -85,7 +86,7 @@ impl Server {
                         "title": "Conch Room Server",
                         "version": env!("CARGO_PKG_VERSION")
                     },
-                    "instructions": "Join a room, inspect committed history, then use Conch floor tools. Do not speak without a grant. Unless the operator gave a terminal condition, remain present by repeatedly calling wait_for_history after the latest committed height."
+                    "instructions": "Join a room, call who, then loop listen from the last height. Answer a mention or take a granted floor with say. Do not speak without a grant. Unless the operator gave a terminal condition, remain present by calling listen again after every page."
                 }))
             }
             Some("ping") => Ok(json!({})),
@@ -119,6 +120,18 @@ impl Server {
             .cloned()
             .unwrap_or_else(|| json!({}));
         let arguments = Arguments::new(arguments, self.room)?;
+        let composite = match name {
+            "say" => Some(self.say(&arguments).await),
+            "listen" => Some(self.listen(&arguments).await),
+            "who" => Some(self.who(&arguments).await),
+            _ => None,
+        };
+        if let Some(result) = composite {
+            return Ok(match result {
+                Ok(data) => tool_success(data),
+                Err((code, message)) => tool_error(&code, &message),
+            });
+        }
         let prepared = self.prepare(name, &arguments).await;
         let reply = match prepared {
             Ok((request, raw)) => self.send(request, raw).await,
@@ -130,15 +143,7 @@ impl Server {
                 if name == "create" && !arguments.optional_bool("show_secret").unwrap_or(false) {
                     redact_created_room(&mut data);
                 }
-                let structured = match &data {
-                    Value::Object(object) => Value::Object(object.clone()),
-                    _ => json!({ "data": data }),
-                };
-                Ok(json!({
-                    "content": [{ "type": "text", "text": serde_json::to_string(&data).unwrap_or_else(|_| "null".into()) }],
-                    "structuredContent": structured,
-                    "isError": false
-                }))
+                Ok(tool_success(data))
             }
             Ok(reply) => {
                 let (code, message) = reply.error.map_or_else(
@@ -271,7 +276,6 @@ impl Server {
                 )
             }
             "yield" => (ClientRequest::Yield { room: room()? }, None),
-            "raise_hand" => (ClientRequest::RaiseHand { room: room()? }, None),
             "grant" => (
                 ClientRequest::Grant {
                     room: room()?,
@@ -376,6 +380,140 @@ impl Server {
             _ => return Err(format!("unknown Conch tool: {name}")),
         };
         Ok(prepared)
+    }
+
+    /// One daemon round trip; an error reply becomes `(code, message)`.
+    async fn ask(&self, request: ClientRequest) -> Result<Value, (String, String)> {
+        match self.send(request, None).await {
+            Ok(reply) if reply.ok => Ok(reply.data.unwrap_or(Value::Null)),
+            Ok(reply) => Err(reply.error.map_or_else(
+                || {
+                    (
+                        "invalid".to_owned(),
+                        "daemon returned an unspecified error".to_owned(),
+                    )
+                },
+                |error| (error.code, error.message),
+            )),
+            Err(error) => Err(("unavailable".to_owned(), error)),
+        }
+    }
+
+    fn you(&self, node: &Value) -> Value {
+        json!({ "agent": self.agent, "node": node })
+    }
+
+    async fn who(&self, arguments: &Arguments) -> Result<Value, (String, String)> {
+        let room = arguments.room().map_err(|e| ("invalid".to_owned(), e))?;
+        let mut status = self.ask(ClientRequest::Status { room: Some(room) }).await?;
+        let node = status["node"].clone();
+        let head = status["head_n"].clone();
+        if let Some(object) = status.as_object_mut() {
+            object.insert("head".into(), head);
+            object.insert("you".into(), self.you(&node));
+        }
+        Ok(status)
+    }
+
+    async fn listen(&self, arguments: &Arguments) -> Result<Value, (String, String)> {
+        let invalid = |message: String| ("invalid".to_owned(), message);
+        let room = arguments.room().map_err(invalid)?;
+        let after = arguments
+            .optional_u64("after")
+            .ok_or_else(|| invalid("listen requires after".into()))?;
+        let timeout_secs = arguments.optional_u64("timeout").unwrap_or(60);
+        if timeout_secs > MAX_HISTORY_WAIT_SECS {
+            return Err(invalid(format!(
+                "timeout must be at most {MAX_HISTORY_WAIT_SECS} seconds"
+            )));
+        }
+        let page = self
+            .ask(ClientRequest::WaitForHistory {
+                room,
+                after_n: after,
+                timeout_secs: Some(timeout_secs),
+            })
+            .await?;
+        let records = page["scenes"].as_array().cloned().unwrap_or_default();
+        let node = self.local_node(room).await?;
+        let you = Mouth {
+            agent: self.agent.clone(),
+            node,
+        };
+        Ok(json!({
+            "events": events::flatten(&records, &you),
+            "height": events::last_height(&records).unwrap_or(after),
+            "timed_out": page["timed_out"].as_bool().unwrap_or(false),
+        }))
+    }
+
+    /// The daemon's node id, needed to tell our own grants and takes from others'.
+    async fn local_node(&self, room: RoomId) -> Result<NodeId, (String, String)> {
+        let status = self.ask(ClientRequest::Status { room: Some(room) }).await?;
+        serde_json::from_value(status["node"].clone()).map_err(|error| {
+            (
+                "unavailable".to_owned(),
+                format!("status omitted node: {error}"),
+            )
+        })
+    }
+
+    async fn say(&self, arguments: &Arguments) -> Result<Value, (String, String)> {
+        let invalid = |message: String| ("invalid".to_owned(), message);
+        let room = arguments.room().map_err(invalid)?;
+        let text = arguments.string("text").map_err(invalid)?;
+        let timeout_secs = arguments.optional_u64("timeout").unwrap_or(300).min(300);
+        let grant = self
+            .ask(ClientRequest::WaitForFloor {
+                room,
+                timeout_secs: Some(timeout_secs),
+            })
+            .await?;
+        let grant_n = grant["n"].as_u64().unwrap_or(0);
+        let grant_hash = Hash32::from_bytes(scene_hash(&grant));
+        let request_id = derived_request_id(&room, &self.agent, &text);
+        let speak = ClientRequest::Speak {
+            room,
+            text: text.clone(),
+            request_id,
+        };
+        let spoke = match self.ask(speak.clone()).await {
+            Err((code, _)) if code == "invalid" => self.ask(speak).await,
+            other => other,
+        };
+        // Whatever happened to the append, never leave the grant held.
+        let yielded = self.ask(ClientRequest::Yield { room }).await;
+        spoke?;
+        yielded?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut after = grant_n;
+        loop {
+            let page = self
+                .ask(ClientRequest::WaitForHistory {
+                    room,
+                    after_n: after,
+                    timeout_secs: Some(10),
+                })
+                .await?;
+            let records = page["scenes"].as_array().cloned().unwrap_or_default();
+            if let Some(record) = records
+                .iter()
+                .find(|record| record["scene"]["body"]["closes_grant"] == json!(grant_hash))
+            {
+                return Ok(json!({
+                    "n": record["scene"]["n"],
+                    "grant_hash": grant_hash,
+                    "author": record.get("author").cloned().unwrap_or(Value::Null),
+                }));
+            }
+            after = events::last_height(&records).unwrap_or(after);
+            if std::time::Instant::now() >= deadline {
+                return Err((
+                    "unavailable".to_owned(),
+                    "the take was accepted but its closing speech has not committed within 60 s; check history".to_owned(),
+                ));
+            }
+        }
     }
 
     async fn send(
@@ -740,6 +878,18 @@ fn json_rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
+fn tool_success(data: Value) -> Value {
+    let structured = match &data {
+        Value::Object(object) => Value::Object(object.clone()),
+        _ => json!({ "data": data }),
+    };
+    json!({
+        "content": [{ "type": "text", "text": serde_json::to_string(&data).unwrap_or_else(|_| "null".into()) }],
+        "structuredContent": structured,
+        "isError": false
+    })
+}
+
 fn tool_error(code: &str, message: &str) -> Value {
     json!({
         "content": [{ "type": "text", "text": message }],
@@ -852,11 +1002,6 @@ fn tool_definitions() -> Vec<Value> {
             object_schema(room_properties(json!({})), &[]),
         ),
         tool(
-            "raise_hand",
-            "Queue this agent for the talking stick",
-            object_schema(room_properties(json!({})), &[]),
-        ),
-        tool(
             "grant",
             "Moderator: grant the floor to a mouth",
             object_schema(
@@ -916,6 +1061,33 @@ fn tool_definitions() -> Vec<Value> {
         tool(
             "status",
             "Show local Conch status",
+            object_schema(room_properties(json!({})), &[]),
+        ),
+        tool(
+            "say",
+            "Take one turn: wait for the floor, speak the whole text, yield, and return the committed scene",
+            object_schema(
+                room_properties(json!({
+                    "text": { "type": "string" },
+                    "timeout": { "type": "integer", "minimum": 0, "maximum": 300, "default": 300, "description": "Seconds to wait for the floor" }
+                })),
+                &["text"],
+            ),
+        ),
+        tool(
+            "listen",
+            "Wait for committed scenes after a height and return them as events: mention, speech, granted, floor, roster, config",
+            object_schema(
+                room_properties(json!({
+                    "after": { "type": "integer", "minimum": 0, "description": "Last committed height already processed" },
+                    "timeout": { "type": "integer", "minimum": 0, "maximum": 300, "default": 60 }
+                })),
+                &["after"],
+            ),
+        ),
+        tool(
+            "who",
+            "Room name, head, floor mode and timeout, current holder, queue, participants, and your own mouth",
             object_schema(room_properties(json!({})), &[]),
         ),
     ]
