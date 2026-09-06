@@ -5,7 +5,10 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, RwLock,
+    },
     task::{Context as TaskContext, Poll},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -141,6 +144,7 @@ struct Inner {
     auth_failures: Mutex<BTreeMap<IpAddr, AuthFailureBucket>>,
     outbound_slots: Arc<Semaphore>,
     room_dials: Mutex<BTreeMap<RoomId, usize>>,
+    floor_timeouts_started: AtomicBool,
 }
 
 struct AuthFailureBucket {
@@ -462,6 +466,7 @@ impl Daemon {
                 auth_failures: Mutex::new(BTreeMap::new()),
                 outbound_slots: Arc::new(Semaphore::new(64)),
                 room_dials: Mutex::new(BTreeMap::new()),
+                floor_timeouts_started: AtomicBool::new(false),
             }),
         };
         daemon.recover_staged_breakouts()?;
@@ -1028,6 +1033,7 @@ impl Daemon {
     }
 
     pub async fn start(&self, addr: SocketAddr) -> Result<RunningServer, DaemonError> {
+        self.spawn_floor_timeouts();
         let listener = bind_listener(addr).await?;
         let addr = listener.local_addr()?;
         self.remember_addr(addr)?;
@@ -1037,6 +1043,7 @@ impl Daemon {
     }
 
     pub async fn serve(&self, addr: SocketAddr) -> Result<(), DaemonError> {
+        self.spawn_floor_timeouts();
         let listener = bind_listener(addr).await?;
         self.remember_addr(listener.local_addr()?)?;
         self.clone().serve_listener(listener).await
@@ -1047,6 +1054,7 @@ impl Daemon {
         addr: SocketAddr,
         config: Arc<ServerConfig>,
     ) -> Result<(), DaemonError> {
+        self.spawn_floor_timeouts();
         let listener = bind_listener(addr).await?;
         self.remember_secure_addr(listener.local_addr()?)?;
         self.clone()
@@ -1059,6 +1067,7 @@ impl Daemon {
         addr: SocketAddr,
         config: Arc<ServerConfig>,
     ) -> Result<RunningServer, DaemonError> {
+        self.spawn_floor_timeouts();
         let listener = bind_listener(addr).await?;
         let addr = listener.local_addr()?;
         self.remember_secure_addr(addr)?;
@@ -1069,6 +1078,99 @@ impl Daemon {
                 .await
         });
         Ok(RunningServer { addr, task })
+    }
+
+    /// Start the leader's floor-timeout ticker once per process (spec §12.1).
+    pub fn spawn_floor_timeouts(&self) {
+        if self
+            .inner
+            .floor_timeouts_started
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let daemon = self.clone();
+        tokio::spawn(async move {
+            let mut tick = interval(Duration::from_secs(1));
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                daemon.enforce_floor_timeouts().await;
+            }
+        });
+    }
+
+    /// One pass over every loaded room: close the live grant of any room this node
+    /// leads whose take is older than the room's `timeout_secs`.
+    async fn enforce_floor_timeouts(&self) {
+        let rooms: Vec<RoomId> = self
+            .inner
+            .rooms
+            .read()
+            .expect("room registry lock is not poisoned")
+            .keys()
+            .copied()
+            .collect();
+        for room in rooms {
+            let Ok(replay) = self.replay(room) else {
+                continue;
+            };
+            let Some(grant) = replay.chain.live_grant.clone() else {
+                continue;
+            };
+            let leads = replay.chain.roster.len() <= 1
+                || (replay.consensus.role == ConsensusRole::Leader
+                    && replay.consensus.leader_id == Some(self.node_id()));
+            if !leads {
+                continue;
+            }
+            let Some(timeout_secs) = replay.chain.timeout_secs else {
+                continue;
+            };
+            let Some(granted_ts) = replay
+                .history
+                .iter()
+                .find(|record| record.scene.n == grant.n)
+                .map(|record| record.scene.ts)
+            else {
+                continue;
+            };
+            let age = unix_timestamp().saturating_sub(granted_ts);
+            if age < timeout_secs {
+                continue;
+            }
+            let Ok(floor) = self.floor(room) else {
+                continue;
+            };
+            // A close already in flight (a yank, or the previous tick) keeps the lock.
+            let Ok(_mutation) = floor.mutation.try_lock() else {
+                continue;
+            };
+            let Ok(replay) = self.replay(room) else {
+                continue;
+            };
+            if replay.chain.live_grant.as_ref().map(|live| live.hash) != Some(grant.hash) {
+                continue;
+            }
+            match self.close_live_grant(room, &floor, &replay).await {
+                Ok(_) => {
+                    let empty = self
+                        .replay(room)
+                        .ok()
+                        .and_then(|replay| replay.history.last().cloned())
+                        .is_some_and(|record| {
+                            matches!(&record.scene.body, Body::Speech { text, blobs, .. } if text.is_empty() && blobs.is_empty())
+                        });
+                    eprintln!(
+                        "conchd: room {room}: floor timeout after {age}s, holder {}@{}, empty={empty}",
+                        grant.to.agent, grant.to.node
+                    );
+                }
+                // The holder acknowledged the freeze and is still CLOSING; try again next tick.
+                Err(DaemonError::MutationUnavailable) => {}
+                Err(error) => eprintln!("conchd: room {room}: floor timeout close failed: {error}"),
+            }
+        }
     }
 
     fn remember_addr(&self, mut addr: SocketAddr) -> Result<(), DaemonError> {

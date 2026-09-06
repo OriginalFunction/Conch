@@ -1447,3 +1447,118 @@ async fn follower_leave_is_signed_and_forwarded_to_the_leader() {
         Body::ViewChange { remove, .. } if remove == vec![second.node_id()]
     ));
 }
+
+#[tokio::test]
+async fn leader_closes_an_overdue_local_take_with_its_appended_text() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let ticket = daemon
+        .create_ticket("Timed", StakePolicy::default(), FloorConfig::stick(1))
+        .unwrap();
+    let server = daemon.start(loopback()).await.unwrap();
+    let mut holder = attach(server.addr(), "agent:slow").await;
+    let granted = request(
+        &mut holder,
+        ClientRequest::WaitForFloor {
+            room: ticket.id,
+            timeout_secs: Some(5),
+        },
+    )
+    .await;
+    assert!(granted.ok, "{granted:?}");
+    let spoke = request(
+        &mut holder,
+        ClientRequest::Speak {
+            room: ticket.id,
+            text: "half a thought".into(),
+            request_id: "00000000000000000000000000000031".into(),
+        },
+    )
+    .await;
+    assert!(spoke.ok, "{spoke:?}");
+    // The holder never yields. Within the timeout plus one tick the leader closes it.
+    let closed = tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            let replay = daemon.replay(ticket.id).unwrap();
+            if replay.chain.live_grant.is_none() {
+                return replay.history;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the overdue grant was closed");
+    assert!(matches!(
+        &closed.last().unwrap().scene.body,
+        Body::Speech { text, .. } if text == "half a thought"
+    ));
+    // Nothing else is committed afterwards: a vacant floor has nothing to time out.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        daemon.replay(ticket.id).unwrap().history.len(),
+        closed.len()
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn leader_empty_closes_an_overdue_remote_holder_it_cannot_reach() {
+    let _network_test = network_test_guard().await;
+    let source_data = TempDir::new().unwrap();
+    let second_data = TempDir::new().unwrap();
+    let holder_data = TempDir::new().unwrap();
+    let source = Daemon::open(source_data.path()).unwrap();
+    let second = Daemon::open(second_data.path()).unwrap();
+    let holder = Daemon::open(holder_data.path()).unwrap();
+    let source_server = source.start(loopback()).await.unwrap();
+    let second_server = second.start(loopback()).await.unwrap();
+    let holder_server = holder.start(loopback()).await.unwrap();
+    let ticket = source
+        .create_ticket(
+            "Remote timeout",
+            StakePolicy::default(),
+            FloorConfig::stick(2),
+        )
+        .unwrap();
+    // Three stakers, so the source and the second still form a majority once the
+    // holder's node is gone (spec section 11: one of two cannot wrap).
+    second
+        .join_ticket(ticket.clone(), JoinRole::Stake)
+        .await
+        .unwrap();
+    holder
+        .join_ticket(ticket.clone(), JoinRole::Stake)
+        .await
+        .unwrap();
+    let mut writer = attach(holder_server.addr(), "agent:remote").await;
+    let granted = request(
+        &mut writer,
+        ClientRequest::WaitForFloor {
+            room: ticket.id,
+            timeout_secs: Some(10),
+        },
+    )
+    .await;
+    assert!(granted.ok, "{granted:?}");
+    // The holder's daemon disappears without yielding.
+    holder_server.abort();
+    drop(writer);
+    drop(holder);
+    let history = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let replay = source.replay(ticket.id).unwrap();
+            if replay.chain.live_grant.is_none() {
+                return replay.history;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the leader empty-closed the unreachable holder");
+    assert!(matches!(
+        &history.last().unwrap().scene.body,
+        Body::Speech { text, blobs, .. } if text.is_empty() && blobs.is_empty()
+    ));
+    source_server.abort();
+    second_server.abort();
+}
