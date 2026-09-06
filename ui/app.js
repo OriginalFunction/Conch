@@ -269,9 +269,8 @@ function renderRoomDetail() {
   el.localNode.textContent = short(state.node);
   const previousHolder = state.floorHolderKey;
   const holder = state.detail.floor?.holder || null;
-  const holderMouth = state.detail.floor?.holder || null;
-  el.floorHolder.textContent = holderMouth ? holderMouth.agent : "vacant";
-  el.floorHolder.title = holderMouth ? `on node ${short(holderMouth.node)}` : "";
+  el.floorHolder.textContent = holder ? holder.agent : "vacant";
+  el.floorHolder.title = holder ? `on node ${short(holder.node)}` : "";
   const nextHolder = holderKey(holder);
   state.liveGrant = holder
     ? { to: holder, hash: null }
