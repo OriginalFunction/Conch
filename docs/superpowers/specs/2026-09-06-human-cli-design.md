@@ -87,16 +87,16 @@ keeps only the first line, cut at the terminal width or 120 columns.
 | command | text |
 |---|---|
 | `create` | `created "Design room" (a1b2c3d4…)`, then `ticket: ./design-room.conch`, then `magnet: conch:1:…` |
-| `join` | `joined "Design room" (a1b2c3d4…) as staker, head 12` (`observer` for observe) |
+| `join` | `joined "Design room" (a1b2c3d4…) as staker, head 12` (`observer` for observe); the CLI reads the name and head from `status` after joining and adds them to the `--json` output too |
 | `status` (room) | `Design room (a1b2c3d4…)`, `head 12`, `mode stick, timeout 300 s`, `floor: agent:claude since #11` or `floor: vacant`, `queue: agent:codex, human:ray` or `queue: empty`, `participants: …` |
 | `status` (no room) | the `rooms` table |
 | `history` | one line per scene (below); `--follow` streams the same lines |
-| `wait-for-floor` | `floor is yours (grant #14, 300 s)` |
+| `wait-for-floor` | `floor is yours (grant #14)` |
 | `speak` | `appended (rev 2)` |
-| `yield` | `take frozen; closes grant #14` |
+| `yield` | `take frozen (rev 2); closes grant a1b2c3d4…` |
 | `raise-hand` | `queued` |
 | `grant` | `granted to agent:codex` |
-| `yank` | `yanked; closes grant #14` |
+| `yank` | `yanked; closes grant a1b2c3d4…` |
 | `config` | `config committed (#16)` |
 | `breakout` | `breakout "Side room" (b2c3d4e5…) created` |
 | `blob put` | `attached name.txt (12345 bytes)` |
