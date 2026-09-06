@@ -598,10 +598,11 @@ async fn ui_html_is_embedded_and_served_at_root_and_ui() {
     let daemon = Daemon::open(data.path()).unwrap();
     let server = daemon.start_http(loopback()).await.unwrap();
 
+    let mut html = String::new();
     for path in ["/", "/ui/"] {
         let response = http_get(server.addr(), path, None).await;
         assert_eq!(response.0, 200);
-        let html = String::from_utf8(response.1).unwrap();
+        html = String::from_utf8(response.1).unwrap();
         assert!(html.contains("Conch"));
         assert!(html.contains("id=\"transcript\""));
         assert!(html.contains("id=\"speech\""));
@@ -622,6 +623,18 @@ async fn ui_html_is_embedded_and_served_at_root_and_ui() {
     assert!(!script.contains("scrollIntoView"));
     assert!(!script.contains("localStorage"));
     assert!(!script.contains("roomList.replaceChildren"));
+    assert!(
+        script.contains("Empty take"),
+        "speech cards label empty takes"
+    );
+    assert!(
+        !script.contains("Wrapped take"),
+        "speech cards are titled by author"
+    );
+    assert!(
+        html.contains("id=\"floor-holder\""),
+        "room header shows the holder"
+    );
 }
 
 #[tokio::test]

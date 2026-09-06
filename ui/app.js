@@ -34,7 +34,7 @@ const el = Object.fromEntries([
   "connection", "connection-label", "rooms-toggle", "people-toggle", "rooms-rail", "people-rail",
   "room-count", "room-list", "rooms-empty", "local-node", "home-view", "room-view", "room-name",
   "room-search",
-  "room-role", "room-id", "copy-room-id", "head-number", "floor-mode", "floor-status", "take-button",
+  "room-role", "room-id", "copy-room-id", "head-number", "floor-mode", "floor-holder", "floor-status", "take-button",
   "transcript", "scene-list", "history-empty", "new-messages", "new-message-count", "draft-preview",
   "draft-text", "speech", "compose-hint", "yield-button", "wrap-button", "people-count", "people-list",
   "people-empty", "create-room-button", "join-room-button", "home-create-button", "home-join-button",
@@ -269,6 +269,9 @@ function renderRoomDetail() {
   el.localNode.textContent = short(state.node);
   const previousHolder = state.floorHolderKey;
   const holder = state.detail.floor?.holder || null;
+  const holderMouth = state.detail.floor?.holder || null;
+  el.floorHolder.textContent = holderMouth ? holderMouth.agent : "vacant";
+  el.floorHolder.title = holderMouth ? `on node ${short(holderMouth.node)}` : "";
   const nextHolder = holderKey(holder);
   state.liveGrant = holder
     ? { to: holder, hash: null }
@@ -394,7 +397,7 @@ async function renderScene(record) {
   const body = scene.body;
   article.classList.add(body.type === "speech" ? "speech" : body.type === "grant" ? "grant" : "system");
   fragment.querySelector(".scene-marker span").textContent = scene.n;
-  const rendered = describe(body);
+  const rendered = describe(body, record.author);
   fragment.querySelector("strong").textContent = rendered.title;
   fragment.querySelector(".scene-kind").textContent = rendered.kind;
   fragment.querySelector(".scene-content > p").textContent = rendered.copy;
@@ -406,11 +409,11 @@ async function renderScene(record) {
   return fragment;
 }
 
-function describe(body) {
+function describe(body, author) {
   switch (body.type) {
     case "genesis": return { title: body.name, kind: "Genesis", copy: "Room opened and its first scene committed." };
     case "grant": return { title: body.to.agent, kind: "Floor granted", copy: `Now holds Conch on node ${short(body.to.node)}.` };
-    case "speech": return { title: "Wrapped take", kind: "Speech", copy: body.text || "Empty take" };
+    case "speech": return { title: author?.agent || "Unknown author", kind: "Speech", copy: body.text || "Empty take" };
     case "breakout": return { title: "Breakout created", kind: "System", copy: `Opened a child room for ${body.auto_join.length} node(s).` };
     case "membership": return { title: "Room configuration changed", kind: "System", copy: `Floor mode is now ${body.floor.mode}.` };
     case "view-change": return { title: "Roster changed", kind: "System", copy: describeViewChange(body) };
