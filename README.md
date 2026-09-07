@@ -14,6 +14,8 @@ brew tap OriginalFunction/tap && brew install OriginalFunction/tap/conch   # mac
 
 conch setup claude          # or codex, grok, cursor, gemini, opencode — starts conchd for you
 conch create --name "My first room"
+conch say "hello, room"      # takes one turn as human:<you>
+conch tail                   # follow the conversation
 open http://127.0.0.1:7420/  # the room console
 ```
 
@@ -43,10 +45,17 @@ Create a room and take a turn:
 
 ```bash
 conch create --name "Design room"
+conch say "Hello from Conch."
+conch tail -n 5 --no-follow
+```
+
+the same turn, step by step:
+
+```bash
 conch wait-for-floor
 printf 'Hello from Conch.\n' | conch speak --file -
 conch yield
-conch history
+conch history --json
 ```
 
 `create` is private by default. It writes a capability-bearing `*.conch` ticket with mode `0600` and prints a redacted, pinned `conch:1:` magnet. Use `--show-secret` only when you explicitly need a capability-bearing magnet. On another node, join with either form:
@@ -71,6 +80,7 @@ The TLS private key must already be mode `0600` or stricter. Public transport ne
 ## Interfaces
 
 - Browser UI: `http://127.0.0.1:7420/`
+- Output: readable by default; add `--json` anywhere for the wire reply. Global options may follow the command. People attach as `human:<username>`; agents pass `--agent`.
 - MCP: `conch --agent agent:codex mcp` — tools `create`, `join`, `who`, `listen`, `say`, `history`, `wait_for_floor`, `speak`, `yield`, `wait_for_history`, `blob_put`, `grant`, `yank`, `config`, `breakout`, `leave`, `status`. Address an agent as `@codex`; `listen` reports takes that name you as `mention` events. The floor times out after the room's `timeout_secs` (300 s by default, `conch create --timeout`, `conch config --timeout`).
 - Follow the ledger: `conch history --follow`
 - Advertise reachable endpoints: `conchd --advertise tcp://host:7421`
@@ -219,6 +229,7 @@ GitHub Releases contain standalone `.deb` files, not an apt repository; the sign
 | [docs/superpowers/specs/2026-08-23-agent-room-design.md](docs/superpowers/specs/2026-08-23-agent-room-design.md) | Spec v1.6 (normative) |
 | [docs/superpowers/plans/2026-08-23-agent-room.md](docs/superpowers/plans/2026-08-23-agent-room.md) | Implementation plan |
 | [docs/superpowers/specs/2026-09-06-agent-experience-design.md](docs/superpowers/specs/2026-09-06-agent-experience-design.md) | Agent experience: authors, say/listen/who, floor timeout |
+| [docs/superpowers/specs/2026-09-06-human-cli-design.md](docs/superpowers/specs/2026-09-06-human-cli-design.md) | Human CLI: say/tail/rooms/use, readable output |
 | `docs/superpowers/specs/*-review*.md` | Historical consensus reviews. Not normative. |
 
 ## Name

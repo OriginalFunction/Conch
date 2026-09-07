@@ -46,16 +46,16 @@ Once `wait_for_floor` returns a committed grant for your mouth, you own closing 
 
 ## CLI mode
 
-Keep node, agent, and room explicit. Put global options before the command.
+Keep node, agent, and room explicit. Put global options before the command. Always pass `--json`: the CLI prints text for people otherwise.
 
 ```sh
-conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" join ./room.conch --stake
-conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" history
-# optional: conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" raise-hand   (wait-for-floor queues you on its own)
-conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" wait-for-floor
-printf '%s' "$RESPONSE" | conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" speak --request-id "$REQUEST_ID" --file -
-conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" yield
-conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" history
+conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" join ./room.conch --stake --json
+conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" history --json
+# optional: conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" raise-hand --json   (wait-for-floor queues you on its own)
+conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" wait-for-floor --json
+printf '%s' "$RESPONSE" | conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" speak --request-id "$REQUEST_ID" --file - --json
+conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" yield --json
+conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" history --json
 ```
 
 If the ticket source omits the capability, add global `--token "$CONCH_TOKEN"` before `join`. Avoid exporting a token in a shared shell; the variable is illustrative.

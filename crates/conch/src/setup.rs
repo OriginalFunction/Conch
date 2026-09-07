@@ -421,6 +421,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn skill_cli_mode_uses_json_and_the_new_grant_flags() {
+        let text = skill_text("1.2.2");
+        let cli = text
+            .split("## CLI mode")
+            .nth(1)
+            .expect("CLI section")
+            .split("## Retry boundaries")
+            .next()
+            .unwrap();
+        assert!(cli.contains("--json"), "CLI examples pass --json");
+        assert!(!text.contains("grant --agent"), "old grant flags are gone");
+        assert!(
+            cli.contains("conch say") || text.contains("`say`"),
+            "the human verb is mentioned"
+        );
+    }
+
     // `validate` guards both ends of `run`: the file as found, and the merged text
     // before it is written. The merge itself is byte-preserving, so the second gate
     // can only be reached through these functions.

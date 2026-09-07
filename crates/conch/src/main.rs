@@ -1697,9 +1697,9 @@ fn print_help() {
            -V, --version         Print version\n\
            -h, --help            Print help\n\n\
          Commands:\n\
-           create, join, status, history, rooms, use, raise-hand, wait-for-floor\n\
-           say, speak, yield, grant, yank, config, breakout, blob, leave, mcp, setup\n\
-           up, down, doctor\n\n\
+           say, tail, rooms, use, create, join, status, history\n\
+           wait-for-floor, speak, yield, raise-hand, grant, yank, config, breakout, blob, leave\n\
+           mcp, setup, up, down, doctor\n\n\
          Run `conch help <command>` for command-specific usage.",
         env!("CARGO_PKG_VERSION")
     );
