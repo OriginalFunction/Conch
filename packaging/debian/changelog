@@ -1,3 +1,18 @@
+conch (1.3.0) stable; urgency=medium
+
+  * conch setup <host> wires Claude Code, Codex, Grok, Cursor, Gemini CLI, and
+    OpenCode in one command; conch up/down/doctor manage the daemon, which the
+    CLI and MCP server now start on demand; Python integrations removed.
+  * Served history names the author of every take; per-room status reports the
+    holder, queue, and participants; MCP gains say, listen, and who, and drops
+    raise_hand; the leader enforces the floor timeout (new rooms default to
+    300 s, configurable with --timeout).
+  * Readable output by default with --json for machines; say, tail, rooms, and
+    use for people; global options accepted anywhere; people attach as
+    human:<username>; grant takes --to and --to-node.
+
+ -- Conch packagers <conch@localhost>  Mon, 07 Sep 2026 08:00:00 -0400
+
 conch (1.2.2) stable; urgency=medium
 
   * Retransmit durable local floor intents to a newly elected leader so queued
