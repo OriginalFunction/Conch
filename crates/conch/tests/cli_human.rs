@@ -306,3 +306,88 @@ async fn say_reports_a_floor_timeout_with_the_queue_position() {
     );
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tail_prints_a_backlog_then_follows() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let data = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let server = daemon.start(loopback()).await.unwrap();
+    let node = format!("tcp://{}", server.addr());
+    text(&conch(&node, cwd.path(), data.path(), &["create", "--name", "Log"]).await);
+    for word in ["one", "two", "three"] {
+        text(&conch(&node, cwd.path(), data.path(), &["say", word]).await);
+    }
+    // Backlog of the last two takes: scenes #5 (grant) and #6 (speech "three").
+    let backlog = text(
+        &conch(
+            &node,
+            cwd.path(),
+            data.path(),
+            &["tail", "-n", "2", "--no-follow"],
+        )
+        .await,
+    );
+    assert_eq!(backlog.lines().count(), 2, "{backlog}");
+    assert!(backlog.starts_with("#5    grant"), "{backlog}");
+    assert!(backlog.ends_with("three"), "{backlog}");
+    let json = text(
+        &conch(
+            &node,
+            cwd.path(),
+            data.path(),
+            &["tail", "-n", "1", "--no-follow", "--json"],
+        )
+        .await,
+    );
+    let record: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(record["scene"]["n"], 6);
+
+    // Following: a new take appears while tail runs.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_conch"))
+        .args(["--node", &node, "tail", "-n", "1"])
+        .current_dir(cwd.path())
+        .env("CONCH_DATA_DIR", data.path())
+        .env("USER", "Ray.Hwang")
+        .env_remove("CONCH_AGENT")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(first.ends_with("three"), "{first}");
+    text(
+        &conch(
+            &node,
+            cwd.path(),
+            data.path(),
+            &["say", "four", "--agent", "agent:codex"],
+        )
+        .await,
+    );
+    let mut seen = Vec::new();
+    while let Ok(Ok(Some(line))) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line()).await
+    {
+        seen.push(line.clone());
+        if line.contains("four") {
+            break;
+        }
+    }
+    assert!(
+        seen.iter().any(|line| line.starts_with("#7    grant")),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter().any(|line| line.contains("agent:codex    four")),
+        "{seen:?}"
+    );
+    child.kill().await.unwrap();
+    server.abort();
+}

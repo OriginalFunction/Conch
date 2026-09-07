@@ -3,7 +3,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::{
     env,
     fs::{self, OpenOptions},
-    io::{self, Read},
+    io::{self, Read, Write},
     net::SocketAddr,
     path::PathBuf,
     str::FromStr,
@@ -178,6 +178,54 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    if let ParsedRequest::Tail {
+        room,
+        backlog,
+        follow,
+    } = request
+    {
+        let status = call(
+            &node,
+            &agent,
+            node_is_default,
+            "tail",
+            ClientRequest::Status { room: Some(room) },
+        )
+        .await?;
+        let head = status["head_n"].as_u64().unwrap_or(0);
+        let from_n = head.saturating_add(1).saturating_sub(backlog);
+        let page = call(
+            &node,
+            &agent,
+            node_is_default,
+            "tail",
+            ClientRequest::History {
+                room,
+                from_n,
+                follow: false,
+            },
+        )
+        .await?;
+        let mut last = head;
+        print_scenes(&page, json, &ctx, &mut io::stdout())?;
+        if !follow {
+            return Ok(());
+        }
+        loop {
+            let next = tokio::select! {
+                _ = tokio::signal::ctrl_c() => return Ok(()),
+                page = call(&node, &agent, node_is_default, "tail", ClientRequest::WaitForHistory { room, after_n: last, timeout_secs: Some(60) }) => page?,
+            };
+            if let Some(n) = next["scenes"]
+                .as_array()
+                .and_then(|scenes| scenes.last())
+                .and_then(|record| record["scene"]["n"].as_u64())
+            {
+                last = n;
+            }
+            print_scenes(&next, json, &ctx, &mut io::stdout())?;
+        }
+    }
     let follow = matches!(
         &request,
         ParsedRequest::Ready(request)
@@ -307,6 +355,28 @@ fn print_reply(
         Some(text) => println!("{text}"),
         None => println!("{}", serde_json::to_string(data)?),
     }
+    Ok(())
+}
+
+/// Print a history page as one line per record (JSON record per line with --json).
+fn print_scenes(
+    page: &Value,
+    json: bool,
+    ctx: &conch::render::Context,
+    out: &mut impl Write,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for record in page["scenes"].as_array().into_iter().flatten() {
+        if json {
+            writeln!(out, "{}", serde_json::to_string(record)?)?;
+        } else {
+            writeln!(
+                out,
+                "{}",
+                conch::render::scene_line(record, ctx.oneline, ctx.width)
+            )?;
+        }
+    }
+    out.flush()?;
     Ok(())
 }
 
@@ -753,6 +823,11 @@ enum ParsedRequest {
         text: String,
         timeout_secs: u64,
     },
+    Tail {
+        room: RoomId,
+        backlog: u64,
+        follow: bool,
+    },
     Local(LocalCommand),
 }
 
@@ -839,6 +914,9 @@ impl ParsedRequest {
             }
             Self::Say { .. } => {
                 unreachable!("say is handled before client request resolution")
+            }
+            Self::Tail { .. } => {
+                unreachable!("tail is handled before client request resolution")
             }
             Self::Local(_) => {
                 unreachable!("local commands are handled before client request resolution")
@@ -1475,6 +1553,29 @@ impl Arguments {
                     follow,
                 }
             }),
+            "tail" => {
+                let mut backlog = 20_u64;
+                let mut follow = true;
+                while let Some(arg) = arguments.next() {
+                    match arg.as_str() {
+                        "-n" | "--lines" => {
+                            backlog = arguments
+                                .next()
+                                .ok_or("-n requires a count")?
+                                .parse()
+                                .map_err(|_| "invalid count")?
+                        }
+                        "--no-follow" => follow = false,
+                        "--oneline" => oneline = true,
+                        other => return Err(format!("unknown tail argument: {other}")),
+                    }
+                }
+                ParsedRequest::Tail {
+                    room: resolve_room()?,
+                    backlog,
+                    follow,
+                }
+            }
             "status" => ready(ClientRequest::Status {
                 room: room
                     .as_deref()
@@ -1617,6 +1718,8 @@ fn print_command_help(command: &str) -> Result<(), String> {
         }
         "status" => "conch [--room ID] status",
         "history" => "conch history [--from N] [--follow] [--oneline] [--room ID]",
+        "tail" => "conch tail [-n N] [--no-follow] [--oneline] [--room ID]\n\
+             Prints the last N takes (default 20), then streams new ones until Ctrl-C.",
         "rooms" => "conch rooms [--json]\n\
              Lists the rooms this daemon has loaded; * marks the current room.",
         "use" => "conch use ROOM\n\
