@@ -353,6 +353,7 @@ async fn tail_prints_a_backlog_then_follows() {
         .env_remove("CONCH_AGENT")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();

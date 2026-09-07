@@ -206,7 +206,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
         .await?;
-        let mut last = head;
+        let mut last = page["scenes"]
+            .as_array()
+            .and_then(|scenes| scenes.last())
+            .and_then(|record| record["scene"]["n"].as_u64())
+            .unwrap_or(head);
         print_scenes(&page, json, &ctx, &mut io::stdout())?;
         if !follow {
             return Ok(());
