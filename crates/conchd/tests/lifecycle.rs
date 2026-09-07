@@ -13,7 +13,7 @@ use conch_core::{
 };
 use conch_launch::{spawn_detached, PidFile, SpawnOptions};
 use conchd::tcp::Daemon;
-use serde_json::json;
+use serde_json::{json, Value};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -470,5 +470,58 @@ async fn status_reports_holder_queue_and_participants() {
         .unwrap();
     assert_eq!(data["holder"]["agent"], "agent:second");
     assert_eq!(data["queue"].as_array().unwrap().len(), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn status_without_a_room_lists_room_summaries() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let _first = daemon
+        .create_ticket(
+            "First",
+            conch_core::types::StakePolicy::default(),
+            conch_core::types::FloorConfig::stick(300),
+        )
+        .unwrap();
+    let second = daemon
+        .create_ticket(
+            "Second",
+            conch_core::types::StakePolicy::default(),
+            conch_core::types::FloorConfig::stick(300),
+        )
+        .unwrap();
+    let server = daemon
+        .start(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .await
+        .unwrap();
+    // Activity in the second room makes it the most recent.
+    assert!(
+        request(
+            server.addr(),
+            &ClientRequest::WaitForFloor {
+                room: second.id,
+                timeout_secs: Some(5)
+            }
+        )
+        .await
+        .ok
+    );
+
+    let reply = request(server.addr(), &ClientRequest::Status { room: None }).await;
+    assert!(reply.ok, "{reply:?}");
+    let rooms = reply.data.unwrap()["rooms"].as_array().unwrap().clone();
+    assert_eq!(rooms.len(), 2);
+    assert_eq!(rooms[0]["name"], "Second");
+    assert_eq!(rooms[0]["id"], json!(second.id));
+    assert_eq!(rooms[0]["head_n"], 1);
+    assert_eq!(rooms[0]["holder"]["agent"], "agent:test");
+    assert_eq!(rooms[0]["role"], "stake");
+    assert!(
+        rooms[0]["last_activity"].as_u64().unwrap() >= rooms[1]["last_activity"].as_u64().unwrap()
+    );
+    assert_eq!(rooms[1]["name"], "First");
+    assert_eq!(rooms[1]["holder"], Value::Null);
+    assert_eq!(rooms[1]["head_n"], 0);
     server.abort();
 }
