@@ -201,25 +201,10 @@ async fn rooms_lists_and_use_switches_the_current_room() {
         format!("{{\"id\":\"{second_id}\",\"name\":\"Second\"}}")
     );
 
-    // Ambiguous and unknown inputs fail with the candidates listed.
-    let common = std::iter::zip(first_id.chars(), second_id.chars())
-        .take_while(|(a, b)| a == b)
-        .count();
-    if common > 0 {
-        let ambiguous = conch(
-            &node,
-            cwd.path(),
-            data.path(),
-            &["use", &first_id[..common]],
-        )
-        .await;
-        assert!(!ambiguous.status.success());
-        let err = String::from_utf8_lossy(&ambiguous.stderr);
-        assert!(
-            err.contains("ambiguous") && err.contains("First") && err.contains("Second"),
-            "{err}"
-        );
-    }
+    // Unknown input fails and names what was asked for; the ambiguous-prefix
+    // case is covered deterministically by `resolve_room_query`'s unit tests
+    // in `crates/conch/src/main.rs` (two random room ids rarely share a
+    // leading nibble, so this subprocess test can't rely on it).
     let unknown = conch(&node, cwd.path(), data.path(), &["use", "Nowhere"]).await;
     assert!(!unknown.status.success());
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("no room matches \"Nowhere\""));

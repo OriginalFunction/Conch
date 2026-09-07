@@ -72,42 +72,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
         let rooms = summaries["rooms"].as_array().cloned().unwrap_or_default();
-        let matches = |pick: &dyn Fn(&Value) -> bool| {
-            rooms
-                .iter()
-                .filter(|room| pick(room))
-                .cloned()
-                .collect::<Vec<Value>>()
-        };
-        let mut found = matches(&|room| room["id"].as_str() == Some(query.as_str()));
-        if found.is_empty() {
-            found = matches(&|room| {
-                room["id"]
-                    .as_str()
-                    .is_some_and(|id| id.starts_with(query.as_str()))
-            });
-        }
-        if found.is_empty() {
-            found = matches(&|room| room["name"].as_str() == Some(query.as_str()));
-        }
-        let chosen = match found.as_slice() {
-            [one] => one.clone(),
-            [] => return Err(format!("no room matches \"{query}\"; run `conch rooms`").into()),
-            many => {
-                let names = many
-                    .iter()
-                    .map(|room| {
-                        format!(
-                            "{} \"{}\"",
-                            conch::render::short(room["id"].as_str().unwrap_or("")),
-                            room["name"].as_str().unwrap_or("")
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(format!("\"{query}\" is ambiguous: {names}").into());
-            }
-        };
+        let chosen = resolve_room_query(&rooms, query)?;
         let id: RoomId = serde_json::from_value(chosen["id"].clone())?;
         write_current_room(&id)?;
         let data = serde_json::json!({ "id": id, "name": chosen["name"] });
@@ -1779,6 +1744,40 @@ fn read_current_room() -> Option<String> {
         .map(|room| room.to_string())
 }
 
+/// Resolve a `use` query against the no-room `status` summaries: full id, then
+/// unique id prefix, then exact (case-sensitive) name. `Err` names the room that
+/// couldn't be resolved, or lists every candidate when the query is ambiguous.
+fn resolve_room_query(rooms: &[Value], query: &str) -> Result<Value, String> {
+    let matches = |pick: &dyn Fn(&Value) -> bool| -> Vec<Value> {
+        rooms.iter().filter(|room| pick(room)).cloned().collect()
+    };
+    let mut found = matches(&|room| room["id"].as_str() == Some(query));
+    if found.is_empty() {
+        found = matches(&|room| room["id"].as_str().is_some_and(|id| id.starts_with(query)));
+    }
+    if found.is_empty() {
+        found = matches(&|room| room["name"].as_str() == Some(query));
+    }
+    match found.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => Err(format!("no room matches \"{query}\"; run `conch rooms`")),
+        many => {
+            let names = many
+                .iter()
+                .map(|room| {
+                    format!(
+                        "{} \"{}\"",
+                        conch::render::short(room["id"].as_str().unwrap_or("")),
+                        room["name"].as_str().unwrap_or("")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!("\"{query}\" is ambiguous: {names}"))
+        }
+    }
+}
+
 /// Write the `current-room` marker atomically, mirroring the daemon's own write.
 fn write_current_room(id: &RoomId) -> io::Result<()> {
     let dir = data_dir();
@@ -1995,6 +1994,66 @@ mod tests {
                 .map(|s| s.to_string()),
         );
         assert!(old.is_err(), "the old grant flags are gone");
+    }
+
+    fn room(id: &str, name: &str) -> Value {
+        serde_json::json!({ "id": id, "name": name })
+    }
+
+    /// Two ids sharing the "aaaa" prefix, plus a third that doesn't, so the
+    /// ambiguous and unique-prefix cases are deterministic instead of depending
+    /// on randomly generated room ids happening to collide.
+    fn sample_rooms() -> Vec<Value> {
+        vec![
+            room(&format!("aaaa1111{}", "0".repeat(56)), "Alpha"),
+            room(&format!("aaaa2222{}", "0".repeat(56)), "Beta"),
+            room(&format!("bbbb3333{}", "0".repeat(56)), "Gamma"),
+        ]
+    }
+
+    #[test]
+    fn resolve_room_query_prefers_a_full_id_match_even_when_its_prefix_is_ambiguous() {
+        let rooms = sample_rooms();
+        let full_id = format!("aaaa1111{}", "0".repeat(56));
+        let found = resolve_room_query(&rooms, &full_id).unwrap();
+        assert_eq!(found["name"], "Alpha");
+    }
+
+    #[test]
+    fn resolve_room_query_resolves_a_unique_prefix() {
+        let rooms = sample_rooms();
+        let found = resolve_room_query(&rooms, "aaaa11").unwrap();
+        assert_eq!(found["name"], "Alpha");
+    }
+
+    #[test]
+    fn resolve_room_query_resolves_an_exact_name() {
+        let rooms = sample_rooms();
+        let found = resolve_room_query(&rooms, "Beta").unwrap();
+        assert_eq!(found["name"], "Beta");
+    }
+
+    #[test]
+    fn resolve_room_query_name_matching_is_case_sensitive() {
+        let rooms = sample_rooms();
+        let error = resolve_room_query(&rooms, "beta").unwrap_err();
+        assert!(error.contains("no room matches \"beta\""), "{error}");
+    }
+
+    #[test]
+    fn resolve_room_query_lists_every_candidate_when_a_prefix_is_ambiguous() {
+        let rooms = sample_rooms();
+        let error = resolve_room_query(&rooms, "aaaa").unwrap_err();
+        assert!(error.contains("\"aaaa\" is ambiguous:"), "{error}");
+        assert!(error.contains("Alpha") && error.contains("Beta"), "{error}");
+        assert!(!error.contains("Gamma"), "{error}");
+    }
+
+    #[test]
+    fn resolve_room_query_reports_an_unknown_query() {
+        let rooms = sample_rooms();
+        let error = resolve_room_query(&rooms, "Nowhere").unwrap_err();
+        assert_eq!(error, "no room matches \"Nowhere\"; run `conch rooms`");
     }
 
     #[test]
