@@ -84,6 +84,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         timeout_secs,
     } = request
     {
+        // The `starts_with("timeout")` and `starts_with("invalid")` checks below
+        // rely on `format_reply_error` rendering every daemon error as `code:
+        // message`, and on no other daemon error code sharing either prefix.
         let grant = match call(
             &node,
             &agent,
@@ -950,6 +953,8 @@ fn default_agent_from(user: Option<&str>, logname: Option<&str>) -> String {
 }
 
 /// Lower-case, and only the characters an agent id allows besides `:` and `.`.
+/// Truncated to 58 characters so `human:<name>` never exceeds `AgentId`'s
+/// 64-character limit.
 fn sanitise_username(raw: &str) -> String {
     let cleaned: String = raw
         .to_ascii_lowercase()
@@ -961,6 +966,7 @@ fn sanitise_username(raw: &str) -> String {
                 '-'
             }
         })
+        .take(58)
         .collect();
     if cleaned.is_empty() {
         "operator".into()
@@ -970,6 +976,21 @@ fn sanitise_username(raw: &str) -> String {
 }
 
 /// Global options a command may claim for itself; the parser leaves these alone.
+///
+/// `extract_globals` checks this list first: a `--flag` listed here for the
+/// current command is left in the command's own arguments; every other `--flag`
+/// that matches one of the six global names (`--node`, `--agent`, `--room`,
+/// `--token`, `--tls-ca`, `--json`) is consumed by `take_global` instead. Today
+/// only two commands reuse a global's name for their own, differently scoped
+/// argument: `create --token` (a room capability, not the connection's) and
+/// `setup --agent` (the identity to register, not the caller's).
+///
+/// The trap: a *future* command flag named after a global (say, a new `--node`
+/// meaning something command-specific) that is not added here would be silently
+/// swallowed by `extract_globals` before the command's own parsing code ever
+/// sees it — the flag would appear to do nothing, with no error to point at the
+/// mistake. `command_help_never_reuses_an_unowned_global_flag_name` below is a
+/// regression guard: it scans every command's own usage text for exactly this.
 fn owned_flags(command: &str) -> &'static [&'static str] {
     match command {
         "create" => &["--token"],
@@ -1709,40 +1730,49 @@ fn print_help() {
     );
 }
 
-fn print_command_help(command: &str) -> Result<(), String> {
-    let usage = match command {
+/// The usage text for one command's `conch help <command>`, or `None` for an
+/// unrecognised name. `--room`, `--agent`, `--tls-ca`, and `--json` are omitted
+/// from these strings on purpose: they are global options (already documented in
+/// `print_help`), not this command's own, and `owned_flags` only lists the two
+/// commands that genuinely reuse a global's name for a command-specific
+/// argument (`create --token`, `setup --agent`).
+fn command_usage(command: &str) -> Option<&'static str> {
+    Some(match command {
         "create" => {
             "conch create --name NAME [--timeout SECS] [--open | --token HEX | --token-file FILE] [--show-secret]\n\
              Creates a private room by default and writes ./<slug>.conch mode 0600.\n\
              --open is local/LAN only; a public-mode daemon refuses tokenless rooms.\n\
              Takes longer than --timeout (default 300 s) are closed by the leader."
         }
-        "join" => {
-            "conch [--tls-ca CA.pem] join TICKET|MAGNET|HTTPS_URL [--stake | --observe]"
-        }
-        "status" => "conch [--room ID] status",
-        "history" => "conch history [--from N] [--follow] [--oneline] [--room ID]",
-        "tail" => "conch tail [-n N] [--no-follow] [--oneline] [--room ID]\n\
-             Prints the last N takes (default 20), then streams new ones until Ctrl-C.",
-        "rooms" => "conch rooms [--json]\n\
-             Lists the rooms this daemon has loaded; * marks the current room.",
+        "join" => "conch join TICKET|MAGNET|HTTPS_URL [--stake | --observe]",
+        "status" => "conch status",
+        "history" => "conch history [--from N] [--follow] [--oneline]\n\
+             --oneline keeps the first line of each take, cut at the terminal width (or $COLUMNS, else 120 columns).",
+        "tail" => "conch tail [-n N] [--no-follow] [--oneline]\n\
+             Prints the last N takes (default 20), then streams new ones until Ctrl-C.\n\
+             --oneline keeps the first line of each take, cut at the terminal width (or $COLUMNS, else 120 columns).\n\
+             --json prints one record per line (unlike history --json, which prints the page object).",
+        "rooms" => "conch rooms\n\
+             Lists the rooms this daemon has loaded; * marks the current room.\n\
+             --json returns the summaries as served.",
         "use" => "conch use ROOM\n\
              ROOM is a room id, a unique id prefix, or an exact name. Sets the current room.",
-        "raise-hand" => "conch --room ID raise-hand",
-        "wait-for-floor" => "conch --room ID wait-for-floor [--timeout SECONDS]",
-        "say" => "conch say TEXT | conch say --file PATH [--timeout SECS] [--room ID]\n\
+        "raise-hand" => "conch raise-hand",
+        "wait-for-floor" => "conch wait-for-floor [--timeout SECONDS]",
+        "say" => "conch say TEXT | conch say --file PATH [--timeout SECS]\n\
              Takes one turn: waits for the floor (default 300 s), speaks, yields, and prints the committed scene.",
-        "speak" => "printf 'text' | conch --room ID speak --file - [--request-id ID]",
-        "yield" => "conch --room ID yield",
-        "grant" => "conch grant --to AGENT --to-node NODE_ID [--room ID]",
-        "yank" => "conch --room ID yank",
+        "speak" => "printf 'text' | conch speak --file - [--request-id ID]",
+        "yield" => "conch yield",
+        "grant" => "conch grant --to AGENT --to-node NODE_ID",
+        "yank" => "conch yank",
         "config" => {
-            "conch --room ID config [--mode stick|moderator] [--moderator ID --moderator-node NODE_ID] [--timeout SECS] [--stake-json JSON]"
+            "conch config [--mode stick|moderator] [--moderator ID --moderator-node NODE_ID] [--timeout SECS] [--stake-json JSON]"
         }
-        "breakout" => "conch --room ID breakout --name NAME [--members NODE_ID,...]",
-        "blob" => "conch --room ID blob put FILE",
-        "leave" => "conch --room ID leave [--vacate]",
-        "mcp" => "conch [--room ID] --agent ID mcp",
+        "breakout" => "conch breakout --name NAME [--members NODE_ID,...]",
+        "blob" => "conch blob put FILE",
+        "leave" => "conch leave [--vacate]",
+        "mcp" => "conch mcp\n\
+             Runs the stdio MCP server; use an explicit identity (the setup command records one).",
         "setup" => {
             "conch setup <claude|codex|grok|cursor|gemini|opencode> [--agent ID] [--scope user|project] [--env K=V ...] [--dry-run]\n\
              Example: conch setup claude"
@@ -1756,8 +1786,12 @@ fn print_command_help(command: &str) -> Result<(), String> {
              Example: conch down --service   # stop and remove the login service"
         }
         "doctor" => "conch doctor\nExample: conch doctor   # exit 1 if anything is red",
-        _ => return Err(format!("unknown command: {command}")),
-    };
+        _ => return None,
+    })
+}
+
+fn print_command_help(command: &str) -> Result<(), String> {
+    let usage = command_usage(command).ok_or_else(|| format!("unknown command: {command}"))?;
     println!("{usage}");
     Ok(())
 }
@@ -1885,7 +1919,8 @@ fn resolve_room_query(rooms: &[Value], query: &str) -> Result<Value, String> {
     }
 }
 
-/// Write the `current-room` marker atomically, mirroring the daemon's own write.
+/// Write the `current-room` marker atomically, using the same path and JSON form
+/// the daemon writes (this does not replicate its fsync or 0600 permissions).
 fn write_current_room(id: &RoomId) -> io::Result<()> {
     let dir = data_dir();
     fs::create_dir_all(&dir)?;
@@ -1895,12 +1930,41 @@ fn write_current_room(id: &RoomId) -> io::Result<()> {
     fs::rename(&tmp, &path)
 }
 
-/// The terminal width used to cut `--oneline` text; 120 columns when unknown.
+/// The terminal width used to cut `--oneline` text: `$COLUMNS` when it parses,
+/// else the controlling terminal's width via `TIOCGWINSZ`, else 120 columns.
+/// Shells commonly leave `$COLUMNS` unexported, so the ioctl fallback matters.
 fn terminal_width() -> usize {
-    std::env::var("COLUMNS")
-        .ok()
-        .and_then(|c| c.parse().ok())
-        .unwrap_or(120)
+    width_from(env::var("COLUMNS").ok().as_deref(), tty_width())
+}
+
+/// Pure precedence rule behind `terminal_width`, kept separate from the
+/// environment and ioctl calls so it is unit-testable: `columns` wins when it
+/// parses to a number; otherwise a `tty` reading wins when it is non-zero;
+/// otherwise 120.
+fn width_from(columns: Option<&str>, tty: Option<u16>) -> usize {
+    if let Some(width) = columns.and_then(|value| value.parse::<usize>().ok()) {
+        return width;
+    }
+    if let Some(width) = tty.filter(|&width| width > 0) {
+        return width as usize;
+    }
+    120
+}
+
+/// The controlling terminal's column count via `TIOCGWINSZ`, or `None` when
+/// stdout isn't a terminal or the ioctl otherwise fails.
+#[cfg(unix)]
+fn tty_width() -> Option<u16> {
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: `size` is a plain `winsize` struct the kernel writes into on
+    // success; STDOUT_FILENO is a valid fd for the lifetime of the process.
+    let succeeded = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0;
+    succeeded.then_some(size.ws_col)
+}
+
+#[cfg(not(unix))]
+fn tty_width() -> Option<u16> {
+    None
 }
 
 #[cfg(test)]
@@ -2172,5 +2236,95 @@ mod tests {
         assert_eq!(default_agent_from(Some("Ray"), None), "human:ray");
         assert_eq!(default_agent_from(None, Some("ops")), "human:ops");
         assert_eq!(default_agent_from(None, None), "human:operator");
+    }
+
+    #[test]
+    fn sanitise_username_truncates_so_the_agent_id_fits_in_64_characters() {
+        let seventy_chars = "a".repeat(70);
+        let sanitised = sanitise_username(&seventy_chars);
+        assert_eq!(sanitised.len(), 58);
+        assert_eq!(sanitised, "a".repeat(58));
+        assert_eq!(format!("human:{sanitised}").len(), 64);
+    }
+
+    #[test]
+    fn width_from_prefers_a_parseable_columns_env_over_the_tty_reading() {
+        assert_eq!(width_from(Some("80"), Some(200)), 80);
+    }
+
+    #[test]
+    fn width_from_falls_back_to_the_tty_then_to_120() {
+        assert_eq!(width_from(None, Some(64)), 64);
+        assert_eq!(width_from(None, Some(0)), 120);
+        assert_eq!(width_from(None, None), 120);
+        assert_eq!(width_from(Some("not a number"), None), 120);
+        assert_eq!(width_from(Some(""), Some(90)), 90);
+    }
+
+    /// The `--flag` tokens shown on any line of `usage` that actually depicts a
+    /// runnable `conch ...` invocation (the synopsis, or an `Example: conch ...`
+    /// line) — plain prose sentences that never say "conch" are not scanned, so
+    /// documentation like "history --json prints the page object" doesn't count.
+    /// Brackets and pipes marking optional/alternative flags are token boundaries.
+    fn command_line_flags(usage: &str) -> Vec<&str> {
+        usage
+            .lines()
+            .filter_map(|line| line.find("conch ").map(|start| &line[start..]))
+            .flat_map(|invocation| {
+                invocation
+                    .split(|c: char| c.is_whitespace() || matches!(c, '[' | ']' | '(' | ')' | '|'))
+            })
+            .filter(|token| token.starts_with("--"))
+            .collect()
+    }
+
+    /// Every command name `print_command_help` recognises.
+    const COMMANDS: &[&str] = &[
+        "create",
+        "join",
+        "status",
+        "history",
+        "tail",
+        "rooms",
+        "use",
+        "raise-hand",
+        "wait-for-floor",
+        "say",
+        "speak",
+        "yield",
+        "grant",
+        "yank",
+        "config",
+        "breakout",
+        "blob",
+        "leave",
+        "mcp",
+        "setup",
+        "up",
+        "down",
+        "doctor",
+    ];
+
+    #[test]
+    fn command_help_never_reuses_an_unowned_global_flag_name() {
+        const GLOBALS: &[&str] = &[
+            "--node", "--agent", "--room", "--token", "--tls-ca", "--json",
+        ];
+        for &command in COMMANDS {
+            let usage =
+                command_usage(command).unwrap_or_else(|| panic!("{command} has no usage text"));
+            let owned = owned_flags(command);
+            for flag in command_line_flags(usage) {
+                if GLOBALS.contains(&flag) {
+                    assert!(
+                        owned.contains(&flag),
+                        "{command}'s help shows global flag {flag} without owning it \
+                         (owned_flags(\"{command}\") = {owned:?}); either it is being \
+                         swallowed silently by extract_globals or the help text should \
+                         drop the redundant global mention"
+                    );
+                }
+            }
+        }
     }
 }

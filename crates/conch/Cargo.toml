@@ -24,6 +24,7 @@ thiserror.workspace = true
 toml_edit.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 reqwest.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 conchd = { path = "../conchd" }

@@ -433,9 +433,21 @@ mod tests {
             .unwrap();
         assert!(cli.contains("--json"), "CLI examples pass --json");
         assert!(!text.contains("grant --agent"), "old grant flags are gone");
+        let command_lines: Vec<&str> = cli
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("conch "))
+            .collect();
+        assert!(!command_lines.is_empty(), "the CLI section shows commands");
+        for line in &command_lines {
+            assert!(
+                line.contains("--json"),
+                "every conch line passes --json: {line}"
+            );
+        }
         assert!(
-            cli.contains("conch say") || text.contains("`say`"),
-            "the human verb is mentioned"
+            cli.contains("Always pass `--json`"),
+            "the CLI section tells the reader to always pass --json"
         );
     }
 
