@@ -10,6 +10,9 @@ pub enum Host {
     Cursor,
     Gemini,
     Opencode,
+    /// Google Antigravity (IDE and the `agy` CLI); MCP config and skills live under
+    /// `~/.gemini/config/`, shared by both surfaces.
+    Antigravity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,13 +31,14 @@ pub enum Format {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Env(pub Vec<(String, String)>);
 
-pub const ALL_HOSTS: [Host; 6] = [
+pub const ALL_HOSTS: [Host; 7] = [
     Host::Claude,
     Host::Codex,
     Host::Grok,
     Host::Cursor,
     Host::Gemini,
     Host::Opencode,
+    Host::Antigravity,
 ];
 
 fn json_string(value: &str) -> String {
@@ -60,7 +64,11 @@ fn json_env(env: &Env) -> String {
 }
 
 impl Host {
+    /// A host by its name, or by the name of its CLI (`agy` for Antigravity).
     pub fn parse(name: &str) -> Option<Host> {
+        if name == "agy" {
+            return Some(Host::Antigravity);
+        }
         ALL_HOSTS.into_iter().find(|host| host.name() == name)
     }
 
@@ -72,6 +80,7 @@ impl Host {
             Host::Cursor => "cursor",
             Host::Gemini => "gemini",
             Host::Opencode => "opencode",
+            Host::Antigravity => "antigravity",
         }
     }
 
@@ -83,7 +92,7 @@ impl Host {
         match self {
             Host::Codex | Host::Grok => Format::Toml,
             Host::Opencode => Format::Jsonc,
-            Host::Claude | Host::Cursor | Host::Gemini => Format::Json,
+            Host::Claude | Host::Cursor | Host::Gemini | Host::Antigravity => Format::Json,
         }
     }
 
@@ -91,7 +100,9 @@ impl Host {
         match self {
             Host::Codex | Host::Grok => &["mcp_servers", "conch"],
             Host::Opencode => &["mcp", "conch"],
-            Host::Claude | Host::Cursor | Host::Gemini => &["mcpServers", "conch"],
+            Host::Claude | Host::Cursor | Host::Gemini | Host::Antigravity => {
+                &["mcpServers", "conch"]
+            }
         }
     }
 
@@ -114,6 +125,8 @@ impl Host {
             (Host::Cursor, Scope::Project) => cwd.join(".cursor/mcp.json"),
             (Host::Gemini, Scope::User) => home.join(".gemini/settings.json"),
             (Host::Gemini, Scope::Project) => cwd.join(".gemini/settings.json"),
+            (Host::Antigravity, Scope::User) => home.join(".gemini/config/mcp_config.json"),
+            (Host::Antigravity, Scope::Project) => cwd.join(".agents/mcp_config.json"),
             (Host::Opencode, Scope::User) => {
                 if let Some(explicit) = std::env::var_os("OPENCODE_CONFIG") {
                     return PathBuf::from(explicit);
@@ -143,7 +156,9 @@ impl Host {
         let argv = json_array(args.iter().cloned());
         let mut out = match self {
             Host::Claude => format!(r#"{{"type":"stdio","command":{cmd},"args":{argv}"#),
-            Host::Cursor | Host::Gemini => format!(r#"{{"command":{cmd},"args":{argv}"#),
+            Host::Cursor | Host::Gemini | Host::Antigravity => {
+                format!(r#"{{"command":{cmd},"args":{argv}"#)
+            }
             Host::Opencode => format!(
                 r#"{{"type":"local","command":{},"enabled":true"#,
                 json_array(std::iter::once(command.to_string()).chain(args.iter().cloned()))
@@ -166,6 +181,7 @@ impl Host {
         match self {
             Host::Claude => home.join(".claude/skills/join-room"),
             Host::Opencode => home.join(".config/opencode/skills/join-room"),
+            Host::Antigravity => home.join(".gemini/config/skills/join-room"),
             Host::Codex | Host::Grok | Host::Cursor | Host::Gemini => {
                 home.join(".agents/skills/join-room")
             }
@@ -184,6 +200,9 @@ impl Host {
             }
             Host::Gemini => "Restart gemini; `/mcp` lists conch.",
             Host::Opencode => "Restart opencode.",
+            Host::Antigravity => {
+                "Start a new agy session (or reload the Antigravity window); `/mcp` lists conch."
+            }
         }
     }
 
@@ -195,6 +214,7 @@ impl Host {
             Host::Codex => format!("codex mcp add conch -- {command} {argv}"),
             Host::Grok => format!("grok mcp add conch -- {command} {argv}"),
             Host::Gemini => format!("gemini mcp add -s user conch {command} {argv}"),
+            Host::Antigravity => format!("agy mcp add conch -- {command} {argv}"),
             Host::Cursor | Host::Opencode => format!(
                 "add this to {}:\n{}",
                 self.config_path(Scope::User, Path::new("~"), Path::new("."))
@@ -302,5 +322,48 @@ mod tests {
         assert_eq!(Host::parse("cursor"), Some(Host::Cursor));
         assert_eq!(Host::parse("vim"), None);
         assert_eq!(Host::Gemini.default_agent(), "agent:gemini");
+        assert_eq!(Host::parse("antigravity"), Some(Host::Antigravity));
+        assert_eq!(
+            Host::parse("agy"),
+            Some(Host::Antigravity),
+            "the CLI's own name"
+        );
+        assert_eq!(Host::Antigravity.name(), "antigravity");
+        assert_eq!(Host::Antigravity.default_agent(), "agent:antigravity");
+    }
+
+    #[test]
+    fn antigravity_reads_the_shared_gemini_config_directory() {
+        let home = Path::new("/h");
+        let cwd = Path::new("/p");
+        assert_eq!(
+            Host::Antigravity.config_path(Scope::User, home, cwd),
+            Path::new("/h/.gemini/config/mcp_config.json")
+        );
+        assert_eq!(
+            Host::Antigravity.config_path(Scope::Project, home, cwd),
+            Path::new("/p/.agents/mcp_config.json")
+        );
+        assert_eq!(
+            Host::Antigravity.skill_dir(home),
+            Path::new("/h/.gemini/config/skills/join-room")
+        );
+        assert_eq!(Host::Antigravity.format(), Format::Json);
+        assert_eq!(Host::Antigravity.key_path(), &["mcpServers", "conch"]);
+        let args = vec![
+            "--agent".to_string(),
+            "agent:x".to_string(),
+            "mcp".to_string(),
+        ];
+        assert_eq!(
+            Host::Antigravity.render_json_entry("/b/conch", &args, &Env(vec![])),
+            r#"{"command":"/b/conch","args":["--agent","agent:x","mcp"]}"#
+        );
+        assert_eq!(
+            Host::Antigravity.fallback_command("/b/conch", &args),
+            "agy mcp add conch -- /b/conch --agent agent:x mcp"
+        );
+        assert!(Host::Antigravity.next_step().contains("/mcp"));
+        assert_eq!(ALL_HOSTS.len(), 7);
     }
 }

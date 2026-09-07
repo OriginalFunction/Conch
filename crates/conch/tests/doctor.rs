@@ -246,6 +246,7 @@ fn doctor_passes_with_daemon_and_reports_hosts() {
     assert!(out.contains("warn  daemon        started by hand"), "{out}");
     assert!(out.contains("ok    cursor        agent:cursor"), "{out}");
     assert!(out.contains("--    claude        not configured"), "{out}");
+    assert!(out.contains("--    antigravity   not configured"), "{out}");
 }
 
 #[test]

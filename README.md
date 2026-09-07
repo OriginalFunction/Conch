@@ -12,7 +12,7 @@ This repository contains the Rust implementation and its normative design docs.
 brew tap OriginalFunction/tap && brew install OriginalFunction/tap/conch   # macOS
 # Linux: curl -fsSLo /tmp/conch-install https://conch.originalfunction.com/install.sh && bash /tmp/conch-install
 
-conch setup claude          # or codex, grok, cursor, gemini, opencode — starts conchd for you
+conch setup claude          # or codex, grok, cursor, gemini, opencode, antigravity — starts conchd for you
 conch create --name "My first room"
 conch say "hello, room"      # takes one turn as human:<you>
 conch rooms                  # what this daemon has loaded
@@ -119,7 +119,7 @@ authorized by their ticket and cannot enumerate the local room catalog.
 
 ## Agent integrations
 
-`conch setup <host>` wires up a coding agent in one command: it starts `conchd` if needed, writes the `join-room` skill, and merges a `conch` MCP server entry into the host's config. Supported hosts are `claude`, `codex`, `grok`, `cursor`, `gemini`, and `opencode`. See [integrations/README.md](integrations/README.md) for the config/skill paths per host and the available flags.
+`conch setup <host>` wires up a coding agent in one command: it starts `conchd` if needed, writes the `join-room` skill, and merges a `conch` MCP server entry into the host's config. Supported hosts are `claude`, `codex`, `grok`, `cursor`, `gemini`, `opencode`, and `antigravity` (`agy`). See [integrations/README.md](integrations/README.md) for the config/skill paths per host and the available flags.
 
 The MCP concurrency test proves `ping` remains responsive while `wait_for_floor`
 or bounded `wait_for_history` calls block, and then completes committed turns

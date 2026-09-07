@@ -333,5 +333,42 @@ fn unknown_host_is_rejected() {
     let output = conch(home.path(), home.path(), &["setup", "vim"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("claude, codex, grok, cursor, gemini, opencode"));
+        .contains("claude, codex, grok, cursor, gemini, opencode, antigravity"));
+}
+
+#[test]
+fn antigravity_setup_fills_an_empty_mcp_config_and_accepts_the_agy_alias() {
+    let home = TempDir::new().unwrap();
+    // Antigravity CLI creates ~/.gemini/config/mcp_config.json as an empty file on
+    // first run; setup must treat that as "no config yet", not as damage.
+    let dir = home.path().join(".gemini/config");
+    fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("mcp_config.json");
+    fs::write(&config, "").unwrap();
+
+    let out = ok(&conch(home.path(), home.path(), &["setup", "agy"]));
+    let parsed: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    let entry = &parsed["mcpServers"]["conch"];
+    assert_eq!(entry["command"], env!("CARGO_BIN_EXE_conch"));
+    assert_eq!(
+        entry["args"],
+        serde_json::json!(["--agent", "agent:antigravity", "mcp"])
+    );
+    assert!(
+        entry.get("type").is_none(),
+        "Antigravity entries carry no type field"
+    );
+    let skill = fs::read_to_string(dir.join("skills/join-room/SKILL.md")).unwrap();
+    assert!(skill.starts_with("---\nname: join-room\n"));
+    assert!(out.contains("antigravity: wrote"), "{out}");
+    assert!(out.contains("agy") && out.contains("/mcp"), "{out}");
+    assert!(
+        !dir.join("mcp_config.json.conch-bak").exists(),
+        "an empty file is not worth backing up"
+    );
+
+    // A rerun with the full name changes nothing.
+    let again = ok(&conch(home.path(), home.path(), &["setup", "antigravity"]));
+    assert!(again.contains("already configured"), "{again}");
 }

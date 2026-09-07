@@ -196,7 +196,8 @@ pub fn run(options: &SetupOptions) -> Result<SetupReport, SetupError> {
     let mut backup_path = None;
     if !options.dry_run {
         if config_changed {
-            if let Some(original) = &existing {
+            // A blank file (Antigravity creates one on first run) holds nothing worth keeping.
+            if let Some(original) = existing.as_ref().filter(|text| !text.trim().is_empty()) {
                 let backup = config_path.with_file_name(format!(
                     "{}.conch-bak",
                     config_path.file_name().unwrap().to_string_lossy()
