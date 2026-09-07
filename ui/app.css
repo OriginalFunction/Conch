@@ -235,7 +235,10 @@ fieldset legend { margin-bottom: .35rem; font-size: .76rem; font-weight: 800; }
   .brand small { display: none; }
   .connection { font-size: 0; }
   .connection .status-dot { margin-right: .1rem; }
-  .app-shell { position: relative; display: block; }
+  /* Clip the parked rails: an off-screen transform still widens the document, and iOS Safari zooms the page out to fit it. */
+  .app-shell { position: relative; display: block; overflow: hidden; }
+  /* iOS zooms in on any focused field under 16px. */
+  input, textarea { font-size: 16px; }
   .rail { position: absolute; z-index: 10; top: 0; bottom: 0; width: min(310px, 86vw); box-shadow: 12px 0 40px rgb(16 41 36 / .2); transition: transform .2s ease; }
   .rooms-rail { left: 0; transform: translateX(-105%); }
   .rooms-rail.open { transform: translateX(0); }
@@ -255,22 +258,75 @@ fieldset legend { margin-bottom: .35rem; font-size: .76rem; font-weight: 800; }
 }
 
 @media (max-width: 520px) {
-  .masthead { height: 62px; }
-  .app-shell { height: calc(100vh - 62px); }
-  .brand-mark { width: 34px; height: 34px; }
-  .brand strong { font-size: 1.15rem; }
-  .header-actions { gap: .35rem; }
-  .icon-button { padding-inline: .55rem; }
-  .home-hero h2 { font-size: 2.8rem; }
+  /* Phones: everything in rem shrinks with the root, then the chrome gets pared back by hand. */
+  html { font-size: 14px; }
+  .masthead { height: 52px; padding: 0 .6rem; }
+  .app-shell { height: calc(100vh - 52px); }
+  .brand { gap: .5rem; }
+  .brand-mark { width: 30px; height: 30px; font-size: 1.1rem; }
+  .brand strong { font-size: 1.1rem; }
+  .header-actions { gap: .3rem; }
+  .icon-button { min-height: 32px; padding: .3rem .55rem; }
+  .rail { width: min(290px, 84vw); }
+  .rail-heading { padding: .8rem .9rem .5rem; }
+  .rail-heading h1, .rail-heading h2 { font-size: 1.3rem; }
+  .room-actions { gap: .4rem; padding: 0 .9rem .6rem; }
+  .room-actions button { min-height: 34px; padding: .4rem .6rem; }
+  .room-search { padding: 0 .6rem .4rem; }
+  .room-search input { padding: .4rem .6rem; }
+  .room-list { padding: .1rem .4rem .6rem; }
+  .room-item { min-height: 50px; gap: .5rem; padding: .4rem .5rem; }
+  .room-avatar { width: 32px; height: 32px; }
+  .room-item { grid-template-columns: 32px minmax(0, 1fr) auto; }
+  .room-copy small { margin-top: .1rem; }
+  .node-card { padding: .6rem .9rem; }
+  .people-list { padding: .1rem .6rem .6rem; }
+  .person { grid-template-columns: 30px 1fr; gap: .5rem; padding: .5rem .2rem; }
+  .person-avatar { width: 30px; height: 30px; font-size: .68rem; }
+  .badges { gap: .2rem; margin-top: .25rem; }
+  .badge { min-height: 17px; padding: .1rem .38rem; font-size: .55rem; }
+  .legend { display: none; }
+  .home-view { padding: 1.4rem 1rem 3rem; }
+  .home-hero h2 { font-size: 2.2rem; }
+  .home-guide { margin-top: 1.6rem; }
   .hero-actions, .ticket-actions { align-items: stretch; flex-direction: column; }
-  .room-header { align-items: flex-start; }
-  .title-line h2 { max-width: 52vw; font-size: 1.12rem; }
+  .room-header { align-items: center; gap: .5rem; padding: .5rem .8rem; }
+  .room-title { gap: .5rem; }
+  .title-line h2 { max-width: 62vw; font-size: 1.05rem; }
   .role-badge { display: none; }
+  .room-id { max-width: 62vw; min-height: 18px; font-size: .6rem; }
   .room-meta { display: none; }
-  .floor-banner { grid-template-columns: auto 1fr; }
-  .floor-banner button { grid-column: 1 / -1; width: 100%; }
-  .composer-actions { align-items: stretch; flex-direction: column; }
-  .composer-actions > div { justify-content: flex-end; }
+  .floor-banner { grid-template-columns: 1fr auto; gap: .5rem; margin: .4rem .6rem 0; padding: .45rem .6rem; border-left-width: 3px; }
+  .floor-orb { display: none; }
+  .floor-banner .eyebrow { display: none; }
+  .floor-banner p { margin: 0; font-size: .8rem; line-height: 1.35; }
+  .floor-banner button { min-height: 32px; padding: .35rem .65rem; font-size: .72rem; white-space: nowrap; }
+  .transcript { padding: .5rem .6rem .8rem; }
+  .history-start { margin: .1rem auto .6rem; }
+  .scene, .turn { display: block; padding-bottom: .5rem; }
+  .scene::before, .turn::before, .scene-marker, .turn-avatar { display: none; }
+  .scene-content { padding: .5rem .6rem; border-radius: 9px; box-shadow: none; }
+  .scene-content p { margin: .3rem 0; font-size: .82rem; line-height: 1.4; }
+  .turn-body { border-radius: 9px; box-shadow: none; }
+  .turn-body header { flex-wrap: wrap; gap: .2rem .5rem; padding: .3rem .6rem; }
+  .turn-body header > div { gap: .4rem; }
+  .turn-body header strong { font-size: .84rem; }
+  .turn-grants { display: none; }
+  .turn-span { font-size: .58rem; }
+  .take { grid-template-columns: auto minmax(0, 1fr); gap: .45rem; padding: .35rem .6rem .4rem .5rem; }
+  .take-n { font-size: .58rem; }
+  .take p { font-size: .88rem; line-height: 1.4; }
+  .take-meta { display: none; }
+  .new-messages { bottom: .5rem; min-height: 30px; padding: .3rem .7rem; }
+  .draft-preview { margin: .2rem .6rem .4rem; padding: .45rem .6rem; }
+  .composer { margin: .4rem .6rem .5rem; padding: .5rem .55rem; border-radius: 10px; box-shadow: none; }
+  .composer > label { margin-bottom: .25rem; font-size: .68rem; }
+  .composer textarea { min-height: 44px; max-height: 120px; padding: .45rem .55rem; }
+  .composer-actions { margin-top: .4rem; }
+  .composer-actions p { display: none; }
+  .composer-actions > div { flex: 1; justify-content: flex-end; }
+  .composer-actions button { min-height: 32px; padding: .4rem .65rem; font-size: .7rem; }
+  .composer-actions > div button { flex: 1; }
   fieldset { grid-template-columns: 1fr; }
 }
 
