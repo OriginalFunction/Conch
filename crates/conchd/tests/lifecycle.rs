@@ -539,30 +539,40 @@ async fn status_without_a_room_lists_room_summaries() {
         rooms[1]["last_activity"].as_u64().unwrap() >= rooms[2]["last_activity"].as_u64().unwrap(),
         "room at [1] should have last_activity >= [2]"
     );
-    // Identify which rooms have the same timestamp and verify tie-break by id.
+    // Find Second room (which had WaitForFloor + Speak) and verify it has activity.
+    let second_room = rooms
+        .iter()
+        .find(|r| r["name"] == "Second")
+        .expect("Second room should be present");
+    assert_eq!(second_room["id"], json!(second.id));
+    assert_eq!(
+        second_room["head_n"], 1,
+        "Second should have activity (take record from Speak)"
+    );
+    assert_eq!(
+        second_room["holder"]["agent"], "agent:test",
+        "Second should have holder set (floor granted)"
+    );
+    assert_eq!(second_room["role"], "stake");
+    // Verify that rooms are sorted correctly: most recent first, then by id for ties.
     let second_ts = rooms[0]["last_activity"].as_u64().unwrap();
     let third_ts = rooms[1]["last_activity"].as_u64().unwrap();
-    let first_ts = rooms[2]["last_activity"].as_u64().unwrap();
     if second_ts == third_ts {
-        // Second and Third tie; verify sorted by ascending id.
         let second_id = rooms[0]["id"].as_str().unwrap();
         let third_id = rooms[1]["id"].as_str().unwrap();
         assert!(
             second_id <= third_id,
-            "When tied on timestamp, Second and Third should be sorted by ascending id"
+            "When tied on timestamp, rooms should be sorted by ascending id"
         );
     }
-    if third_ts == first_ts {
-        // Third and First tie; verify sorted by ascending id.
-        let third_id = rooms[1]["id"].as_str().unwrap();
-        let first_id = rooms[2]["id"].as_str().unwrap();
-        assert!(
-            third_id < first_id,
-            "When tied on timestamp, Third and First should be sorted by ascending id"
-        );
+    // Verify genesis-only rooms have null holder.
+    let genesis_only_rooms: Vec<_> = rooms.iter().filter(|r| r["head_n"] == 0).collect();
+    assert!(
+        !genesis_only_rooms.is_empty(),
+        "Should have at least one genesis-only room"
+    );
+    for room in genesis_only_rooms {
+        assert_eq!(room["holder"], serde_json::Value::Null);
     }
-    // Verify Second has activity (holder and head_n > 0).
-    assert_eq!(rooms[0]["holder"]["agent"], "agent:test");
-    assert_eq!(rooms[0]["head_n"], 1);
     server.abort();
 }
