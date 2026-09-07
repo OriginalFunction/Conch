@@ -131,13 +131,25 @@ fn spawn_kills_a_daemon_that_never_listens() {
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
     }
     let refused = "127.0.0.1:1".parse().expect("literal address");
-    let error = spawn_detached(&SpawnOptions {
+    let options = SpawnOptions {
         conchd: fake,
         data_dir: data,
         tcp: refused,
         http: refused,
-    })
-    .unwrap_err();
+    };
+    let mut error = spawn_detached(&options).unwrap_err();
+    // On Linux a fork in a parallel test can briefly hold the just-written script
+    // open, and exec reports ETXTBSY; that is the test binary racing itself, not
+    // the launcher, so try again.
+    for _ in 0..10 {
+        match &error {
+            LaunchError::Io(io) if io.raw_os_error() == Some(26) => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                error = spawn_detached(&options).unwrap_err();
+            }
+            _ => break,
+        }
+    }
     assert!(
         matches!(error, LaunchError::NotListening { addr, .. } if addr == refused),
         "{error}"
