@@ -348,15 +348,14 @@ async function appendHistory(records, initial, room = state.room, epoch = state.
   const fresh = records.filter(({ scene }) => !known.has(scene.n)).sort((a, b) => a.scene.n - b.scene.n);
   if (!fresh.length) return;
   const stickToBottom = initial || isNearBottom();
-  const rendered = await Promise.all(fresh.map(renderScene));
+  const hashes = await Promise.all(fresh.map(({ scene }) => sceneHash(scene)));
   if (!isCurrentRoom(room, epoch)) return;
   for (let index = 0; index < fresh.length; index += 1) {
     const record = fresh[index];
     state.history.push(record);
     state.nextN = Math.max(state.nextN, record.scene.n + 1);
-    await updateGrantFromRecord(record);
-    if (!isCurrentRoom(room, epoch)) return;
-    el.sceneList.append(rendered[index]);
+    updateGrantFromRecord(record, hashes[index]);
+    placeScene(record, hashes[index]);
   }
   el.historyEmpty.hidden = state.history.length > 0;
   el.headNumber.textContent = state.history.at(-1)?.scene.n ?? "—";
@@ -371,7 +370,7 @@ async function appendHistory(records, initial, room = state.room, epoch = state.
   }
 }
 
-async function updateGrantFromRecord(record) {
+function updateGrantFromRecord(record, hash) {
   const body = record.scene.body;
   if (body.closes_grant && state.liveGrant?.hash === body.closes_grant) {
     state.liveGrant = null;
@@ -382,37 +381,86 @@ async function updateGrantFromRecord(record) {
     const nextHolder = holderKey(body.to);
     if (state.floorHolderKey !== null && state.floorHolderKey !== nextHolder) hideDraft();
     state.floorHolderKey = nextHolder;
-    state.liveGrant = { hash: null, to: body.to };
-    const hash = await sceneHash(record.scene);
-    if (state.liveGrant?.to.node === body.to.node && state.liveGrant?.to.agent === body.to.agent) state.liveGrant.hash = hash;
+    state.liveGrant = { hash, to: body.to };
   }
 }
 
-async function renderScene(record) {
+// A turn is one holder's run of scenes: the grants that gave them the floor and
+// the takes they wrapped, in chain order. Anything else ends the run.
+function placeScene(record, hash) {
   const { scene, commit_proof: proof } = record;
+  const body = scene.body;
+  const proofLabel = `${hash} · term ${proof.rpc_term} · ${proof.certs.length} cert${proof.certs.length === 1 ? "" : "s"}`;
+  if (body.type === "grant") {
+    const turn = openTurn(body.to, scene);
+    const grants = turn.querySelector(".turn-grants");
+    const mark = document.createElement("code");
+    mark.textContent = scene.n;
+    mark.title = `Floor granted ${formatTimestamp(scene.ts)} · ${proofLabel}`;
+    grants.append(mark);
+    grants.hidden = false;
+    extendTurn(turn, scene);
+    return;
+  }
+  if (body.type === "speech") {
+    const turn = openTurn(record.author || { agent: "Unknown author", node: "" }, scene);
+    const take = document.getElementById("take-template").content.cloneNode(true);
+    const row = take.querySelector(".take");
+    row.dataset.n = String(scene.n);
+    take.querySelector(".take-n").textContent = scene.n;
+    take.querySelector("p").textContent = body.text || "Empty take";
+    const time = take.querySelector("time");
+    time.dateTime = new Date(scene.ts * 1000).toISOString();
+    time.textContent = formatClock(scene.ts);
+    const code = take.querySelector("code");
+    code.textContent = short(hash);
+    code.title = proofLabel;
+    turn.querySelector(".turn-takes").append(take);
+    extendTurn(turn, scene);
+    return;
+  }
   const fragment = document.getElementById("scene-template").content.cloneNode(true);
   const article = fragment.querySelector("article");
   article.dataset.n = String(scene.n);
-  const body = scene.body;
-  article.classList.add(body.type === "speech" ? "speech" : body.type === "grant" ? "grant" : "system");
+  article.classList.add("system");
   fragment.querySelector(".scene-marker span").textContent = scene.n;
-  const rendered = describe(body, record.author);
+  const rendered = describe(body);
   fragment.querySelector("strong").textContent = rendered.title;
   fragment.querySelector(".scene-kind").textContent = rendered.kind;
   fragment.querySelector(".scene-content > p").textContent = rendered.copy;
   const time = fragment.querySelector("time");
   time.dateTime = new Date(scene.ts * 1000).toISOString();
   time.textContent = formatTimestamp(scene.ts);
-  const hash = await sceneHash(scene);
   fragment.querySelector("footer").textContent = `${short(hash)} · term ${proof.rpc_term} · ${proof.certs.length} cert${proof.certs.length === 1 ? "" : "s"}`;
-  return fragment;
+  el.sceneList.append(fragment);
 }
 
-function describe(body, author) {
+function openTurn(holder, scene) {
+  const key = holderKey(holder);
+  const last = el.sceneList.lastElementChild;
+  if (last?.classList.contains("turn") && last.dataset.holder === key) return last;
+  const fragment = document.getElementById("turn-template").content.cloneNode(true);
+  const article = fragment.querySelector("article");
+  article.dataset.holder = key;
+  article.dataset.since = String(scene.ts);
+  article.querySelector(".turn-avatar span").textContent = mark(holder.agent);
+  article.querySelector("strong").textContent = holder.agent;
+  const time = article.querySelector("time");
+  time.dateTime = new Date(scene.ts * 1000).toISOString();
+  time.textContent = formatTimestamp(scene.ts);
+  el.sceneList.append(fragment);
+  return article;
+}
+
+function extendTurn(turn, scene) {
+  const since = Number(turn.dataset.since);
+  const until = turn.querySelector(".turn-until");
+  until.textContent = formatClock(scene.ts) === formatClock(since) ? "" : `→ ${formatClock(scene.ts)}`;
+}
+
+function describe(body) {
   switch (body.type) {
     case "genesis": return { title: body.name, kind: "Genesis", copy: "Room opened and its first scene committed." };
-    case "grant": return { title: body.to.agent, kind: "Floor granted", copy: `Now holds Conch on node ${short(body.to.node)}.` };
-    case "speech": return { title: author?.agent || "Unknown author", kind: "Speech", copy: body.text || "Empty take" };
     case "breakout": return { title: "Breakout created", kind: "System", copy: `Opened a child room for ${body.auto_join.length} node(s).` };
     case "membership": return { title: "Room configuration changed", kind: "System", copy: `Floor mode is now ${body.floor.mode}.` };
     case "view-change": return { title: "Roster changed", kind: "System", copy: describeViewChange(body) };
@@ -919,6 +967,14 @@ function slug(value) {
 
 function formatTimestamp(seconds) {
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(seconds * 1000));
+}
+
+function formatClock(seconds) {
+  return new Intl.DateTimeFormat(undefined, { timeStyle: "short" }).format(new Date(seconds * 1000));
+}
+
+function mark(agent) {
+  return String(agent).split(":").at(-1).replace(/[^a-z0-9]/gi, "").slice(0, 2).toUpperCase() || "?";
 }
 
 function relativeTime(seconds) {

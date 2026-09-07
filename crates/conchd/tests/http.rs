@@ -635,6 +635,18 @@ async fn ui_html_is_embedded_and_served_at_root_and_ui() {
         html.contains("id=\"floor-holder\""),
         "room header shows the holder"
     );
+    assert!(
+        html.contains("id=\"turn-template\"") && html.contains("id=\"take-template\""),
+        "the transcript groups a holder's grants and takes into one turn"
+    );
+    assert!(
+        script.contains("function placeScene(") && script.contains("dataset.holder"),
+        "scenes are placed into the open turn instead of one card each"
+    );
+    assert!(
+        !script.contains("Now holds Conch on node"),
+        "grants no longer get a card of their own"
+    );
 }
 
 #[tokio::test]
