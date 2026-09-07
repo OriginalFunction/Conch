@@ -1,3 +1,11 @@
+conch (1.3.1) stable; urgency=medium
+
+  * conch setup antigravity (alias agy) wires Google Antigravity's IDE and CLI
+    through ~/.gemini/config/mcp_config.json and installs the join-room skill
+    under ~/.gemini/config/skills; a blank existing config is not backed up.
+
+ -- Conch packagers <conch@localhost>  Mon, 07 Sep 2026 09:30:00 -0400
+
 conch (1.3.0) stable; urgency=medium
 
   * conch setup <host> wires Claude Code, Codex, Grok, Cursor, Gemini CLI, and
