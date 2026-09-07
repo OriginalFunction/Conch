@@ -708,8 +708,38 @@ async fn moderator_yank_freezes_remote_holder_before_commit() {
     let mut writer = attach(holder_server.addr(), "agent:remote-holder").await;
     let raised = request(&mut writer, ClientRequest::RaiseHand { room: ticket.id }).await;
     assert!(raised.ok, "{raised:?}");
-    tokio::time::sleep(Duration::from_millis(100)).await;
     let mut operator = attach(source_server.addr(), moderator.as_str()).await;
+    // The raised-hand intent still has to gossip from the holder to the source
+    // daemon; granting before it arrives is refused ("grant intent bytes are not
+    // available"). Wait for the source's own floor engine to see it instead of a
+    // fixed sleep, which was long enough in practice but not guaranteed.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = request(
+                &mut operator,
+                ClientRequest::Status {
+                    room: Some(ticket.id),
+                },
+            )
+            .await;
+            assert!(status.ok, "{status:?}");
+            let queued = status
+                .data
+                .as_ref()
+                .and_then(|data| data["queue"].as_array())
+                .is_some_and(|queue| {
+                    queue
+                        .iter()
+                        .any(|entry| entry["agent"].as_str() == Some("agent:remote-holder"))
+                });
+            if queued {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("source daemon observes the remote holder's raised-hand intent within 5s");
     let granted = request(
         &mut operator,
         ClientRequest::Grant {
