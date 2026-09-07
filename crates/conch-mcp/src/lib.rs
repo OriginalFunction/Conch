@@ -872,7 +872,9 @@ fn parse_node_addr(node: &str) -> Result<SocketAddr, String> {
         .map_err(|error| format!("invalid node address: {error}"))
 }
 
-fn derived_request_id(room: &RoomId, agent: &AgentId, text: &str) -> String {
+/// Stable request id from room, agent, and exact text, shared by MCP `say`/`speak`
+/// and the CLI `say`.
+pub fn derived_request_id(room: &RoomId, agent: &AgentId, text: &str) -> String {
     let payload = json!({
         "agent": agent,
         "room": room,

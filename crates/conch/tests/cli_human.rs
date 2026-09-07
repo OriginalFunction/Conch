@@ -225,3 +225,99 @@ async fn rooms_lists_and_use_switches_the_current_room() {
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("no room matches \"Nowhere\""));
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn say_takes_one_turn_and_reports_the_committed_scene() {
+    let data = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let server = daemon.start(loopback()).await.unwrap();
+    let node = format!("tcp://{}", server.addr());
+    text(
+        &conch(
+            &node,
+            cwd.path(),
+            data.path(),
+            &["create", "--name", "Chat"],
+        )
+        .await,
+    );
+
+    assert_eq!(
+        text(&conch(&node, cwd.path(), data.path(), &["say", "hello everyone"]).await),
+        "said #2 as human:ray-hwang"
+    );
+    let json = text(
+        &conch(
+            &node,
+            cwd.path(),
+            data.path(),
+            &["say", "again", "--json", "--agent", "agent:codex"],
+        )
+        .await,
+    );
+    let said: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(said["n"], 4);
+    assert_eq!(said["author"]["agent"], "agent:codex");
+    assert_eq!(said["grant_hash"].as_str().unwrap().len(), 64);
+    let history = text(&conch(&node, cwd.path(), data.path(), &["history"]).await);
+    assert!(
+        history.contains("#2    human:ray-hwang hello everyone"),
+        "{history}"
+    );
+    assert!(history.contains("#4    agent:codex    again"), "{history}");
+
+    let empty = conch(&node, cwd.path(), data.path(), &["say", ""]).await;
+    assert!(!empty.status.success());
+    assert!(String::from_utf8_lossy(&empty.stderr).contains("say needs text"));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn say_reports_a_floor_timeout_with_the_queue_position() {
+    let data = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let server = daemon.start(loopback()).await.unwrap();
+    let node = format!("tcp://{}", server.addr());
+    text(
+        &conch(
+            &node,
+            cwd.path(),
+            data.path(),
+            &["create", "--name", "Busy"],
+        )
+        .await,
+    );
+    // agent:holder takes the floor and keeps it.
+    text(
+        &conch(
+            &node,
+            cwd.path(),
+            data.path(),
+            &[
+                "wait-for-floor",
+                "--timeout",
+                "5",
+                "--agent",
+                "agent:holder",
+            ],
+        )
+        .await,
+    );
+
+    let late = conch(
+        &node,
+        cwd.path(),
+        data.path(),
+        &["say", "me next", "--timeout", "1"],
+    )
+    .await;
+    assert!(!late.status.success());
+    let err = String::from_utf8_lossy(&late.stderr);
+    assert!(
+        err.contains("timeout: no floor within 1 s (queue position 1)"),
+        "{err}"
+    );
+    server.abort();
+}

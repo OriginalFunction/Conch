@@ -113,6 +113,106 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let data = serde_json::json!({ "id": id, "name": chosen["name"] });
         return print_reply("use", &data, json, &ctx);
     }
+    if let ParsedRequest::Say {
+        room,
+        text,
+        timeout_secs,
+    } = request
+    {
+        let grant = match call(
+            &node,
+            &agent,
+            node_is_default,
+            "say",
+            ClientRequest::WaitForFloor {
+                room,
+                timeout_secs: Some(timeout_secs),
+            },
+        )
+        .await
+        {
+            Ok(grant) => grant,
+            Err(error) if error.to_string().starts_with("timeout") => {
+                let position = call(
+                    &node,
+                    &agent,
+                    node_is_default,
+                    "say",
+                    ClientRequest::Status { room: Some(room) },
+                )
+                .await
+                .ok()
+                .and_then(|status| {
+                    status["queue"].as_array().map(|queue| {
+                        queue
+                            .iter()
+                            .position(|entry| entry["agent"].as_str() == Some(agent.as_str()))
+                            .map_or(queue.len(), |i| i + 1)
+                    })
+                })
+                .unwrap_or(0);
+                return Err(format!(
+                    "timeout: no floor within {timeout_secs} s (queue position {position})"
+                )
+                .into());
+            }
+            Err(error) => return Err(error),
+        };
+        let grant_n = grant["n"].as_u64().unwrap_or(0);
+        let grant_hash = Hash32::from_bytes(conch_core::encoding::scene_hash(&grant));
+        let request_id = conch_mcp::derived_request_id(&room, &agent, &text);
+        let speak = ClientRequest::Speak {
+            room,
+            text: text.clone(),
+            request_id,
+        };
+        let spoke = match call(&node, &agent, node_is_default, "speak", speak.clone()).await {
+            Err(error) if error.to_string().starts_with("invalid") => {
+                call(&node, &agent, node_is_default, "speak", speak).await
+            }
+            other => other,
+        };
+        let yielded = call(
+            &node,
+            &agent,
+            node_is_default,
+            "yield",
+            ClientRequest::Yield { room },
+        )
+        .await;
+        spoke?;
+        yielded?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut after = grant_n;
+        loop {
+            let page = call(
+                &node,
+                &agent,
+                node_is_default,
+                "say",
+                ClientRequest::WaitForHistory {
+                    room,
+                    after_n: after,
+                    timeout_secs: Some(10),
+                },
+            )
+            .await?;
+            let records = page["scenes"].as_array().cloned().unwrap_or_default();
+            if let Some(record) = records.iter().find(|record| {
+                record["scene"]["body"]["closes_grant"] == serde_json::json!(grant_hash)
+            }) {
+                let data = serde_json::json!({ "n": record["scene"]["n"], "grant_hash": grant_hash, "author": record.get("author").cloned().unwrap_or(Value::Null) });
+                return print_reply("say", &data, json, &ctx);
+            }
+            after = records
+                .last()
+                .and_then(|record| record["scene"]["n"].as_u64())
+                .unwrap_or(after);
+            if std::time::Instant::now() >= deadline {
+                return Err("the take was accepted but its closing speech has not committed within 60 s; check `conch history`".into());
+            }
+        }
+    }
     let follow = matches!(
         &request,
         ParsedRequest::Ready(request)
@@ -683,6 +783,11 @@ enum ParsedRequest {
     Use {
         query: String,
     },
+    Say {
+        room: RoomId,
+        text: String,
+        timeout_secs: u64,
+    },
     Local(LocalCommand),
 }
 
@@ -766,6 +871,9 @@ impl ParsedRequest {
             Self::Mcp { .. } => unreachable!("MCP is handled before client request resolution"),
             Self::Use { .. } => {
                 unreachable!("use is handled before client request resolution")
+            }
+            Self::Say { .. } => {
+                unreachable!("say is handled before client request resolution")
             }
             Self::Local(_) => {
                 unreachable!("local commands are handled before client request resolution")
@@ -1129,6 +1237,58 @@ impl Arguments {
                     timeout_secs,
                 }
             }),
+            "say" => {
+                let mut text = None;
+                let mut file = None;
+                let mut timeout_secs = conch_core::types::DEFAULT_FLOOR_TIMEOUT_SECS;
+                while let Some(arg) = arguments.next() {
+                    match arg.as_str() {
+                        "--file" => {
+                            file = Some(arguments.next().ok_or("--file requires a path or -")?)
+                        }
+                        "--timeout" => {
+                            timeout_secs = arguments
+                                .next()
+                                .ok_or("--timeout requires seconds")?
+                                .parse()
+                                .map_err(|_| "invalid timeout")?;
+                        }
+                        other if text.is_none() && !other.starts_with("--") => {
+                            text = Some(other.to_owned())
+                        }
+                        other => return Err(format!("unknown say argument: {other}")),
+                    }
+                }
+                let text = match (text, file) {
+                    (Some(text), None) => text,
+                    (None, Some(path)) if path == "-" => {
+                        let mut s = String::new();
+                        io::stdin()
+                            .read_to_string(&mut s)
+                            .map_err(|e| e.to_string())?;
+                        s
+                    }
+                    (None, Some(path)) => {
+                        fs::read_to_string(&path).map_err(|e| format!("cannot read {path}: {e}"))?
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err("say takes either TEXT or --file, not both".into())
+                    }
+                    (None, None) => {
+                        return Err(
+                            "say needs text: conch say \"hello\" or conch say --file -".into()
+                        )
+                    }
+                };
+                if text.trim().is_empty() {
+                    return Err("say needs text: the message is empty".into());
+                }
+                ParsedRequest::Say {
+                    room: resolve_room()?,
+                    text,
+                    timeout_secs,
+                }
+            }
             "speak" => ready({
                 let mut request_id = None;
                 let mut read_stdin = false;
@@ -1472,7 +1632,7 @@ fn print_help() {
            -h, --help            Print help\n\n\
          Commands:\n\
            create, join, status, history, rooms, use, raise-hand, wait-for-floor\n\
-           speak, yield, grant, yank, config, breakout, blob, leave, mcp, setup\n\
+           say, speak, yield, grant, yank, config, breakout, blob, leave, mcp, setup\n\
            up, down, doctor\n\n\
          Run `conch help <command>` for command-specific usage.",
         env!("CARGO_PKG_VERSION")
@@ -1498,6 +1658,8 @@ fn print_command_help(command: &str) -> Result<(), String> {
              ROOM is a room id, a unique id prefix, or an exact name. Sets the current room.",
         "raise-hand" => "conch --room ID raise-hand",
         "wait-for-floor" => "conch --room ID wait-for-floor [--timeout SECONDS]",
+        "say" => "conch say TEXT | conch say --file PATH [--timeout SECS] [--room ID]\n\
+             Takes one turn: waits for the floor (default 300 s), speaks, yields, and prints the committed scene.",
         "speak" => "printf 'text' | conch --room ID speak --file - [--request-id ID]",
         "yield" => "conch --room ID yield",
         "grant" => "conch grant --to AGENT --to-node NODE_ID [--room ID]",
