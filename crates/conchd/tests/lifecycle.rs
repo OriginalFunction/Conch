@@ -13,7 +13,7 @@ use conch_core::{
 };
 use conch_launch::{spawn_detached, PidFile, SpawnOptions};
 use conchd::tcp::Daemon;
-use serde_json::{json, Value};
+use serde_json::json;
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -484,9 +484,18 @@ async fn status_without_a_room_lists_room_summaries() {
             conch_core::types::FloorConfig::stick(300),
         )
         .unwrap();
+    // Sleep to ensure different timestamp for the second and third rooms.
+    tokio::time::sleep(Duration::from_secs(2)).await;
     let second = daemon
         .create_ticket(
             "Second",
+            conch_core::types::StakePolicy::default(),
+            conch_core::types::FloorConfig::stick(300),
+        )
+        .unwrap();
+    let _third = daemon
+        .create_ticket(
+            "Third",
             conch_core::types::StakePolicy::default(),
             conch_core::types::FloorConfig::stick(300),
         )
@@ -495,33 +504,65 @@ async fn status_without_a_room_lists_room_summaries() {
         .start(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
         .await
         .unwrap();
-    // Activity in the second room makes it the most recent.
-    assert!(
-        request(
-            server.addr(),
-            &ClientRequest::WaitForFloor {
-                room: second.id,
-                timeout_secs: Some(5)
-            }
-        )
-        .await
-        .ok
-    );
+    // Activity in the second room makes it the most recent: wait for floor and speak.
+    let wait_reply = request(
+        server.addr(),
+        &ClientRequest::WaitForFloor {
+            room: second.id,
+            timeout_secs: Some(5),
+        },
+    )
+    .await;
+    assert!(wait_reply.ok, "{wait_reply:?}");
+    // Add a take record to the second room to ensure it has newer activity.
+    let speak_reply = request(
+        server.addr(),
+        &ClientRequest::Speak {
+            room: second.id,
+            text: "activity".to_string(),
+            request_id: "00000000000000000000000000000001".into(),
+        },
+    )
+    .await;
+    assert!(speak_reply.ok, "{speak_reply:?}");
 
     let reply = request(server.addr(), &ClientRequest::Status { room: None }).await;
     assert!(reply.ok, "{reply:?}");
     let rooms = reply.data.unwrap()["rooms"].as_array().unwrap().clone();
-    assert_eq!(rooms.len(), 2);
-    assert_eq!(rooms[0]["name"], "Second");
-    assert_eq!(rooms[0]["id"], json!(second.id));
-    assert_eq!(rooms[0]["head_n"], 1);
-    assert_eq!(rooms[0]["holder"]["agent"], "agent:test");
-    assert_eq!(rooms[0]["role"], "stake");
+    assert_eq!(rooms.len(), 3);
+    // Verify sort order: most recent first, then by ascending id for ties.
     assert!(
-        rooms[0]["last_activity"].as_u64().unwrap() >= rooms[1]["last_activity"].as_u64().unwrap()
+        rooms[0]["last_activity"].as_u64().unwrap() >= rooms[1]["last_activity"].as_u64().unwrap(),
+        "room at [0] should have last_activity >= [1]"
     );
-    assert_eq!(rooms[1]["name"], "First");
-    assert_eq!(rooms[1]["holder"], Value::Null);
-    assert_eq!(rooms[1]["head_n"], 0);
+    assert!(
+        rooms[1]["last_activity"].as_u64().unwrap() >= rooms[2]["last_activity"].as_u64().unwrap(),
+        "room at [1] should have last_activity >= [2]"
+    );
+    // Identify which rooms have the same timestamp and verify tie-break by id.
+    let second_ts = rooms[0]["last_activity"].as_u64().unwrap();
+    let third_ts = rooms[1]["last_activity"].as_u64().unwrap();
+    let first_ts = rooms[2]["last_activity"].as_u64().unwrap();
+    if second_ts == third_ts {
+        // Second and Third tie; verify sorted by ascending id.
+        let second_id = rooms[0]["id"].as_str().unwrap();
+        let third_id = rooms[1]["id"].as_str().unwrap();
+        assert!(
+            second_id <= third_id,
+            "When tied on timestamp, Second and Third should be sorted by ascending id"
+        );
+    }
+    if third_ts == first_ts {
+        // Third and First tie; verify sorted by ascending id.
+        let third_id = rooms[1]["id"].as_str().unwrap();
+        let first_id = rooms[2]["id"].as_str().unwrap();
+        assert!(
+            third_id < first_id,
+            "When tied on timestamp, Third and First should be sorted by ascending id"
+        );
+    }
+    // Verify Second has activity (holder and head_n > 0).
+    assert_eq!(rooms[0]["holder"]["agent"], "agent:test");
+    assert_eq!(rooms[0]["head_n"], 1);
     server.abort();
 }

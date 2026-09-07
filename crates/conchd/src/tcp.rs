@@ -4885,27 +4885,46 @@ impl Daemon {
             .collect::<Vec<_>>();
         let mut summaries = rooms
             .into_iter()
-            .filter_map(|room| self.operator_room_summary(room).ok())
-            .map(|summary| {
-                let holder = match summary["floor"]["state"].as_str() {
-                    Some("held") => json!({ "agent": summary["floor"]["agent"], "node": summary["floor"]["node"] }),
-                    _ => Value::Null,
-                };
-                json!({
-                    "id": summary["id"],
-                    "name": summary["name"],
-                    "head_n": summary["head_n"],
-                    "holder": holder,
-                    "last_activity": summary["last_activity"],
-                    "role": summary["role"],
-                })
+            .map(|room| {
+                self.operator_room_summary(room)
+                    .ok()
+                    .map(|summary| {
+                        let holder = match summary["floor"]["state"].as_str() {
+                            Some("held") => json!({ "agent": summary["floor"]["agent"], "node": summary["floor"]["node"] }),
+                            _ => Value::Null,
+                        };
+                        json!({
+                            "id": summary["id"],
+                            "name": summary["name"],
+                            "head_n": summary["head_n"],
+                            "holder": holder,
+                            "last_activity": summary["last_activity"],
+                            "role": summary["role"],
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        json!({
+                            "id": room,
+                            "name": "Unavailable room",
+                            "head_n": Value::Null,
+                            "holder": Value::Null,
+                            "last_activity": 0,
+                            "role": "observe",
+                        })
+                    })
             })
             .collect::<Vec<_>>();
         summaries.sort_by(|left, right| {
             right["last_activity"]
                 .as_u64()
-                .cmp(&left["last_activity"].as_u64())
-                .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
+                .unwrap_or(0)
+                .cmp(&left["last_activity"].as_u64().unwrap_or(0))
+                .then_with(|| {
+                    left["id"]
+                        .as_str()
+                        .unwrap_or("")
+                        .cmp(right["id"].as_str().unwrap_or(""))
+                })
         });
         Ok(json!({ "node": self.node_id(), "rooms": summaries }))
     }
