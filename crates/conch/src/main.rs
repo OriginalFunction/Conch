@@ -56,17 +56,68 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let ParsedRequest::Local(command) = request {
         return run_local(command).await;
     }
-    let follow = matches!(
-        &request,
-        ParsedRequest::Ready(request)
-            if matches!(request.as_ref(), ClientRequest::History { follow: true, .. })
-    );
     let ctx = conch::render::Context {
         room,
         current_room: read_current_room(),
         oneline,
         width: terminal_width(),
     };
+    if let ParsedRequest::Use { query } = &request {
+        let summaries = call(
+            &node,
+            &agent,
+            node_is_default,
+            "use",
+            ClientRequest::Status { room: None },
+        )
+        .await?;
+        let rooms = summaries["rooms"].as_array().cloned().unwrap_or_default();
+        let matches = |pick: &dyn Fn(&Value) -> bool| {
+            rooms
+                .iter()
+                .filter(|room| pick(room))
+                .cloned()
+                .collect::<Vec<Value>>()
+        };
+        let mut found = matches(&|room| room["id"].as_str() == Some(query.as_str()));
+        if found.is_empty() {
+            found = matches(&|room| {
+                room["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with(query.as_str()))
+            });
+        }
+        if found.is_empty() {
+            found = matches(&|room| room["name"].as_str() == Some(query.as_str()));
+        }
+        let chosen = match found.as_slice() {
+            [one] => one.clone(),
+            [] => return Err(format!("no room matches \"{query}\"; run `conch rooms`").into()),
+            many => {
+                let names = many
+                    .iter()
+                    .map(|room| {
+                        format!(
+                            "{} \"{}\"",
+                            conch::render::short(room["id"].as_str().unwrap_or("")),
+                            room["name"].as_str().unwrap_or("")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!("\"{query}\" is ambiguous: {names}").into());
+            }
+        };
+        let id: RoomId = serde_json::from_value(chosen["id"].clone())?;
+        write_current_room(&id)?;
+        let data = serde_json::json!({ "id": id, "name": chosen["name"] });
+        return print_reply("use", &data, json, &ctx);
+    }
+    let follow = matches!(
+        &request,
+        ParsedRequest::Ready(request)
+            if matches!(request.as_ref(), ClientRequest::History { follow: true, .. })
+    );
     let (request, raw) = request.resolve(tls_ca.as_deref()).await?;
     let mut stream = connect_with_spawn(&node, node_is_default).await?;
     write_frame(
@@ -629,6 +680,9 @@ enum ParsedRequest {
     Mcp {
         room: Option<RoomId>,
     },
+    Use {
+        query: String,
+    },
     Local(LocalCommand),
 }
 
@@ -710,6 +764,9 @@ impl ParsedRequest {
                 ))
             }
             Self::Mcp { .. } => unreachable!("MCP is handled before client request resolution"),
+            Self::Use { .. } => {
+                unreachable!("use is handled before client request resolution")
+            }
             Self::Local(_) => {
                 unreachable!("local commands are handled before client request resolution")
             }
@@ -1300,6 +1357,13 @@ impl Arguments {
                     .transpose()
                     .map_err(|error| format!("invalid room id: {error}"))?,
             }),
+            "rooms" => ready(ClientRequest::Status { room: None }),
+            "use" => ParsedRequest::Use {
+                query: arguments
+                    .next()
+                    .ok_or("use requires a room id, id prefix, or name")?
+                    .to_owned(),
+            },
             "mcp" => ParsedRequest::Mcp {
                 room: room
                     .as_deref()
@@ -1407,7 +1471,7 @@ fn print_help() {
            -V, --version         Print version\n\
            -h, --help            Print help\n\n\
          Commands:\n\
-           create, join, status, history, raise-hand, wait-for-floor\n\
+           create, join, status, history, rooms, use, raise-hand, wait-for-floor\n\
            speak, yield, grant, yank, config, breakout, blob, leave, mcp, setup\n\
            up, down, doctor\n\n\
          Run `conch help <command>` for command-specific usage.",
@@ -1428,6 +1492,10 @@ fn print_command_help(command: &str) -> Result<(), String> {
         }
         "status" => "conch [--room ID] status",
         "history" => "conch history [--from N] [--follow] [--oneline] [--room ID]",
+        "rooms" => "conch rooms [--json]\n\
+             Lists the rooms this daemon has loaded; * marks the current room.",
+        "use" => "conch use ROOM\n\
+             ROOM is a room id, a unique id prefix, or an exact name. Sets the current room.",
         "raise-hand" => "conch --room ID raise-hand",
         "wait-for-floor" => "conch --room ID wait-for-floor [--timeout SECONDS]",
         "speak" => "printf 'text' | conch --room ID speak --file - [--request-id ID]",
@@ -1547,6 +1615,16 @@ fn read_current_room() -> Option<String> {
     serde_json::from_slice::<RoomId>(&bytes)
         .ok()
         .map(|room| room.to_string())
+}
+
+/// Write the `current-room` marker atomically, mirroring the daemon's own write.
+fn write_current_room(id: &RoomId) -> io::Result<()> {
+    let dir = data_dir();
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("current-room");
+    let tmp = path.with_extension(format!("tmp-{}", hex_string(&random::<[u8; 8]>())));
+    fs::write(&tmp, serde_json::to_vec(id)?)?;
+    fs::rename(&tmp, &path)
 }
 
 /// The terminal width used to cut `--oneline` text; 120 columns when unknown.

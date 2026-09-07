@@ -130,3 +130,98 @@ async fn readable_by_default_and_json_on_request() {
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn rooms_lists_and_use_switches_the_current_room() {
+    let data = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let server = daemon.start(loopback()).await.unwrap();
+    let node = format!("tcp://{}", server.addr());
+
+    assert_eq!(
+        text(&conch(&node, cwd.path(), data.path(), &["rooms"]).await),
+        "no rooms; conch create --name …"
+    );
+    let first = text(
+        &conch(
+            &node,
+            cwd.path(),
+            data.path(),
+            &["create", "--name", "First", "--json"],
+        )
+        .await,
+    );
+    let first: Value = serde_json::from_str(&first).unwrap();
+    let second = text(
+        &conch(
+            &node,
+            cwd.path(),
+            data.path(),
+            &["create", "--name", "Second", "--json"],
+        )
+        .await,
+    );
+    let second: Value = serde_json::from_str(&second).unwrap();
+    let (first_id, second_id) = (
+        first["id"].as_str().unwrap(),
+        second["id"].as_str().unwrap(),
+    );
+
+    // create sets current-room to the newest room, so Second is marked.
+    let rooms = text(&conch(&node, cwd.path(), data.path(), &["rooms"]).await);
+    assert!(
+        rooms.contains(&format!("* {}…  Second", &second_id[..8])),
+        "{rooms}"
+    );
+    assert!(
+        rooms.contains(&format!("  {}…  First", &first_id[..8])),
+        "{rooms}"
+    );
+    assert!(rooms.contains("head 0   vacant"), "{rooms}");
+    let json = text(&conch(&node, cwd.path(), data.path(), &["rooms", "--json"]).await);
+    let summaries: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(summaries["rooms"].as_array().unwrap().len(), 2);
+
+    // use by unique prefix, then by exact name.
+    assert_eq!(
+        text(&conch(&node, cwd.path(), data.path(), &["use", &first_id[..6]]).await),
+        format!("using \"First\" ({}…)", &first_id[..8])
+    );
+    assert_eq!(
+        std::fs::read_to_string(data.path().join("current-room")).unwrap(),
+        format!("\"{first_id}\"")
+    );
+    assert!(
+        text(&conch(&node, cwd.path(), data.path(), &["rooms"]).await)
+            .contains(&format!("* {}…  First", &first_id[..8]))
+    );
+    assert_eq!(
+        text(&conch(&node, cwd.path(), data.path(), &["use", "Second", "--json"]).await),
+        format!("{{\"id\":\"{second_id}\",\"name\":\"Second\"}}")
+    );
+
+    // Ambiguous and unknown inputs fail with the candidates listed.
+    let common = std::iter::zip(first_id.chars(), second_id.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    if common > 0 {
+        let ambiguous = conch(
+            &node,
+            cwd.path(),
+            data.path(),
+            &["use", &first_id[..common]],
+        )
+        .await;
+        assert!(!ambiguous.status.success());
+        let err = String::from_utf8_lossy(&ambiguous.stderr);
+        assert!(
+            err.contains("ambiguous") && err.contains("First") && err.contains("Second"),
+            "{err}"
+        );
+    }
+    let unknown = conch(&node, cwd.path(), data.path(), &["use", "Nowhere"]).await;
+    assert!(!unknown.status.success());
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("no room matches \"Nowhere\""));
+    server.abort();
+}
