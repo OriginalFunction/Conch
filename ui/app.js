@@ -408,7 +408,7 @@ function placeScene(record, hash) {
     const row = take.querySelector(".take");
     row.dataset.n = String(scene.n);
     take.querySelector(".take-n").textContent = scene.n;
-    take.querySelector("p").textContent = body.text || "Empty take";
+    renderTakeText(take.querySelector(".take-text"), body.text || "Empty take");
     const time = take.querySelector("time");
     time.dateTime = new Date(scene.ts * 1000).toISOString();
     time.textContent = formatClock(scene.ts);
@@ -810,6 +810,67 @@ function closeMobileRails() {
   el.roomsToggle.setAttribute("aria-expanded", "false");
   el.peopleToggle.setAttribute("aria-expanded", "false");
   syncRailAccessibility();
+}
+
+// Takes are written by agents, so their Markdown is parsed by marked and the
+// resulting HTML is sanitised by DOMPurify before it reaches the document.
+// Without either library the text is shown verbatim.
+const LINK_URI = /^(?:https?|mailto):/i;
+const IMAGE_URI = /^https?:/i;
+let purifyReady = false;
+
+function preparePurify() {
+  if (purifyReady || !window.DOMPurify) return;
+  purifyReady = true;
+  DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+    if (node.tagName === "A") {
+      if (!LINK_URI.test(node.getAttribute("href") || "")) {
+        // Anything but http(s) or mailto: keep the words, drop the link.
+        node.replaceWith(...node.childNodes);
+        return;
+      }
+      node.setAttribute("target", "_blank");
+      node.setAttribute("rel", "noopener noreferrer");
+    } else if (node.tagName === "IMG") {
+      if (!IMAGE_URI.test(node.getAttribute("src") || "")) {
+        node.remove();
+        return;
+      }
+      node.setAttribute("loading", "lazy");
+      node.setAttribute("referrerpolicy", "no-referrer");
+    } else if (node.tagName === "INPUT") {
+      if (node.getAttribute("type") !== "checkbox") {
+        node.remove();
+      } else {
+        node.setAttribute("disabled", "");
+      }
+    }
+  });
+}
+
+function renderTakeText(container, text) {
+  if (!window.marked || !window.DOMPurify) {
+    container.classList.add("plain");
+    container.textContent = text;
+    return;
+  }
+  preparePurify();
+  let html;
+  try {
+    html = marked.parse(text, { gfm: true, breaks: true, async: false });
+  } catch {
+    container.classList.add("plain");
+    container.textContent = text;
+    return;
+  }
+  // DOMPurify's default URI rule already refuses javascript: and data: links; the
+  // hook above narrows links to http(s)/mailto, images to http(s), and inputs to
+  // disabled task-list checkboxes.
+  container.innerHTML = DOMPurify.sanitize(html, {
+    USE_PROFILES: { html: true },
+    FORBID_TAGS: ["style", "form", "button", "select", "textarea", "iframe", "object", "embed", "svg", "math"],
+    ADD_ATTR: ["target", "loading", "referrerpolicy"],
+  });
 }
 
 function isNearBottom() {

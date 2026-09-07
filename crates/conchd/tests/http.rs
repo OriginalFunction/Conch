@@ -614,6 +614,17 @@ async fn ui_html_is_embedded_and_served_at_root_and_ui() {
     assert_eq!(script.0, 200);
     let script = String::from_utf8(script.1).unwrap();
     assert!(script.contains("BOTTOM_THRESHOLD_PX = 48"));
+    assert!(script.contains("renderTakeText"));
+    assert!(html.contains("class=\"take-text\""));
+    for (path, marker) in [
+        ("/ui/vendor/marked.umd.js", "marked v18.0.11"),
+        ("/ui/vendor/purify.min.js", "DOMPurify"),
+    ] {
+        let (status, body, _) = http_get(server.addr(), path, None).await;
+        assert_eq!(status, 200, "{path}");
+        let body = String::from_utf8(body).unwrap();
+        assert!(body.contains(marker), "{path} is the vendored build");
+    }
     assert!(script.contains("RETRY_MAX_MS = 30000"));
     assert!(script.contains("state.roomStatus === \"locked\""));
     assert!(script.contains("isCurrentRoom(room, epoch)"));

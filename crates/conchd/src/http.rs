@@ -370,6 +370,8 @@ fn router(daemon: Daemon, secure: bool, operator: bool) -> Router {
         .route("/ui/", get(index))
         .route("/ui/app.js", get(app_js))
         .route("/ui/app.css", get(app_css))
+        .route("/ui/vendor/marked.umd.js", get(vendor_marked))
+        .route("/ui/vendor/purify.min.js", get(vendor_purify))
         .with_state(HttpState {
             daemon,
             secure,
@@ -395,6 +397,20 @@ async fn app_css() -> Response<Body> {
     static_asset(
         include_str!("../../../ui/app.css"),
         "text/css; charset=utf-8",
+    )
+}
+
+async fn vendor_marked() -> Response<Body> {
+    static_asset(
+        include_str!("../../../ui/vendor/marked.umd.js"),
+        "text/javascript; charset=utf-8",
+    )
+}
+
+async fn vendor_purify() -> Response<Body> {
+    static_asset(
+        include_str!("../../../ui/vendor/purify.min.js"),
+        "text/javascript; charset=utf-8",
     )
 }
 

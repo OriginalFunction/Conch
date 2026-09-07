@@ -196,12 +196,14 @@
       <article class="turn"><div class="turn-avatar"><span></span></div><div class="turn-body"><header><div><strong></strong><span class="turn-grants" hidden><i>floor</i></span></div><span class="turn-span"><time></time><span class="turn-until"></span></span></header><div class="turn-takes"></div></div></article>
     </template>
     <template id="take-template">
-      <div class="take"><span class="take-n"></span><p></p><span class="take-meta"><time></time><code></code></span></div>
+      <div class="take"><span class="take-n"></span><div class="take-text"></div><span class="take-meta"><time></time><code></code></span></div>
     </template>
     <template id="person-template">
       <article class="person"><div class="person-avatar"><span></span><i></i></div><div class="person-main"><strong></strong><span class="agent-empty" hidden>No attached agents observed</span><code></code><div class="badges"></div></div></article>
     </template>
     <div id="toast" class="toast" role="status" hidden></div>
+    <script src="/ui/vendor/marked.umd.js" defer></script>
+    <script src="/ui/vendor/purify.min.js" defer></script>
     <script src="/ui/app.js" defer></script>
   </body>
 </html>
