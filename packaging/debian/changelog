@@ -1,3 +1,12 @@
+conch (1.3.3) stable; urgency=medium
+
+  * The console no longer zooms out on phones: parked side rails are clipped
+    so they stop widening the page, and fields stay at 16px so iOS does not
+    zoom on focus. Phone widths get a denser layout: smaller type, tighter
+    chrome, full-width takes without hashes, compact banner and composer.
+
+ -- Conch packagers <conch@localhost>  Mon, 07 Sep 2026 15:00:00 -0400
+
 conch (1.3.2) stable; urgency=medium
 
   * The operator console trusts configured browser origins besides loopback
