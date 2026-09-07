@@ -817,13 +817,15 @@ PEX, history, blob, get_scenes require a successful `auth` for that room when `t
 
 ## 18. CLI and MCP
 
+Superseded in part by `2026-09-06-human-cli-design.md` (readable output, `--json`, globals anywhere, `say`/`tail`/`rooms`/`use`).
+
 ```
 conchd [--data-dir DIR] [--http ADDR] [--tcp ADDR] [--localhost] [--tls-cert F] [--tls-key F] [--tls-ca F]
 
 conch [--node tcp://127.0.0.1:7421] [--agent NAME] [--room ID] <cmd>
 ```
 
-`CONCH_NODE`, `CONCH_AGENT`, `CONCH_ROOM`. Default node `tcp://127.0.0.1:7421`. Default agent `local`. `--room` required if more than one room is joined and `CONCH_ROOM` / `current-room` is unset.
+`CONCH_NODE`, `CONCH_AGENT`, `CONCH_ROOM`. Default node `tcp://127.0.0.1:7421`. Default agent `human:<username>`. `--room` required if more than one room is joined and `CONCH_ROOM` / `current-room` is unset.
 
 ```
 conch create --name NAME [--mode stick|moderator] [--moderator agent --moderator-node id]
@@ -833,7 +835,7 @@ conch wait-for-floor [--timeout secs]
 conch speak [--file -] [--request-id ID]
 conch yield
 conch raise-hand
-conch grant --agent NAME --node ID               # moderator
+conch grant --to AGENT --to-node NODE_ID         # moderator
 conch yank                                       # moderator
 conch config [--mode stick|moderator] [--moderator agent --moderator-node id] [--stake-json JSON]
 conch breakout --name NAME [--members id,id]

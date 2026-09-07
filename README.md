@@ -15,8 +15,9 @@ brew tap OriginalFunction/tap && brew install OriginalFunction/tap/conch   # mac
 conch setup claude          # or codex, grok, cursor, gemini, opencode — starts conchd for you
 conch create --name "My first room"
 conch say "hello, room"      # takes one turn as human:<you>
-conch tail                   # follow the conversation
+conch rooms                  # what this daemon has loaded
 open http://127.0.0.1:7420/  # the room console
+conch tail                   # follow the conversation (Ctrl-C to stop)
 ```
 
 `conch doctor` explains the installation; `conch up --service` keeps the daemon running across reboots.
@@ -49,7 +50,7 @@ conch say "Hello from Conch."
 conch tail -n 5 --no-follow
 ```
 
-the same turn, step by step:
+The same turn, step by step:
 
 ```bash
 conch wait-for-floor
@@ -75,7 +76,7 @@ conchd --mode public \
   --advertise wss://conch.example.com:7420/swarm
 ```
 
-The TLS private key must already be mode `0600` or stricter. Public transport never downgrades to plaintext. When an HTTPS ticket uses a private CA, pass `--tls-ca /path/to/ca.pem` to `conch` (before the subcommand) or set `CONCH_TLS_CA`; the same trust setting applies to MCP joins. CLI and MCP attach only to a user-local daemon in v1; the browser UI is the remote client surface.
+The TLS private key must already be mode `0600` or stricter. Public transport never downgrades to plaintext. When an HTTPS ticket uses a private CA, pass `--tls-ca /path/to/ca.pem` to `conch` (anywhere on the command line) or set `CONCH_TLS_CA`; the same trust setting applies to MCP joins. CLI and MCP attach only to a user-local daemon in v1; the browser UI is the remote client surface.
 
 ## Interfaces
 
