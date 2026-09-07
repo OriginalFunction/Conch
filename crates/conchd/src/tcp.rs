@@ -419,6 +419,21 @@ impl Drop for RunningServer {
     }
 }
 
+fn sort_room_summaries(summaries: &mut [Value]) {
+    summaries.sort_by(|left, right| {
+        right["last_activity"]
+            .as_u64()
+            .unwrap_or(0)
+            .cmp(&left["last_activity"].as_u64().unwrap_or(0))
+            .then_with(|| {
+                left["id"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(right["id"].as_str().unwrap_or(""))
+            })
+    });
+}
+
 impl Daemon {
     pub fn open(data_dir: impl Into<PathBuf>) -> Result<Self, DaemonError> {
         let data_dir = data_dir.into();
@@ -4914,18 +4929,7 @@ impl Daemon {
                     })
             })
             .collect::<Vec<_>>();
-        summaries.sort_by(|left, right| {
-            right["last_activity"]
-                .as_u64()
-                .unwrap_or(0)
-                .cmp(&left["last_activity"].as_u64().unwrap_or(0))
-                .then_with(|| {
-                    left["id"]
-                        .as_str()
-                        .unwrap_or("")
-                        .cmp(right["id"].as_str().unwrap_or(""))
-                })
-        });
+        sort_room_summaries(&mut summaries);
         Ok(json!({ "node": self.node_id(), "rooms": summaries }))
     }
 
@@ -8751,5 +8755,51 @@ mod tests {
                 fs::copy(entry.path(), target).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn sort_room_summaries_orders_by_last_activity_then_id() {
+        // Test that the sort function orders by last_activity descending, then id ascending.
+        // Create three summaries: two with the same last_activity (out of order by id),
+        // one with an older last_activity.
+        let mut summaries = vec![
+            json!({
+                "id": "zzz_room_3",
+                "name": "Room3",
+                "head_n": 0,
+                "holder": Value::Null,
+                "last_activity": 1000,
+                "role": "observe",
+            }),
+            json!({
+                "id": "aaa_room_1",
+                "name": "Room1",
+                "head_n": 1,
+                "holder": json!({"agent": "agent:test", "node": "node1"}),
+                "last_activity": 2000,
+                "role": "stake",
+            }),
+            json!({
+                "id": "zzz_room_2",
+                "name": "Room2",
+                "head_n": 0,
+                "holder": Value::Null,
+                "last_activity": 2000,
+                "role": "observe",
+            }),
+        ];
+
+        sort_room_summaries(&mut summaries);
+
+        // After sorting:
+        // - Index 0 and 1 should be the rooms with last_activity=2000 (tied for most recent)
+        // - Index 2 should be the room with last_activity=1000 (oldest)
+        // - Within the tied rooms, they should be sorted by id ascending: aaa_room_1 < zzz_room_2
+        assert_eq!(summaries[0]["id"], "aaa_room_1");
+        assert_eq!(summaries[0]["last_activity"], 2000);
+        assert_eq!(summaries[1]["id"], "zzz_room_2");
+        assert_eq!(summaries[1]["last_activity"], 2000);
+        assert_eq!(summaries[2]["id"], "zzz_room_3");
+        assert_eq!(summaries[2]["last_activity"], 1000);
     }
 }

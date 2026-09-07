@@ -484,8 +484,6 @@ async fn status_without_a_room_lists_room_summaries() {
             conch_core::types::FloorConfig::stick(300),
         )
         .unwrap();
-    // Sleep to ensure different timestamp for the second and third rooms.
-    tokio::time::sleep(Duration::from_secs(2)).await;
     let second = daemon
         .create_ticket(
             "Second",
