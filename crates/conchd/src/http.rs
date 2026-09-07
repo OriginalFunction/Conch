@@ -415,9 +415,11 @@ async fn create_operator_session(
     headers: HeaderMap,
 ) -> Result<Response<Body>, HttpError> {
     require_operator_endpoint(&state, peer)?;
-    let origin = operator_origin(&headers, true)?;
+    let origin = operator_origin(&state, &headers, true)?;
+    let secure = operator_cookie_secure(&origin);
     let raw = state.daemon.create_operator_session(origin);
-    let cookie = format!("conch_operator={raw}; Path=/; HttpOnly; SameSite=Strict; Max-Age=900");
+    let cookie =
+        format!("conch_operator={raw}; Path=/; HttpOnly; SameSite=Strict{secure}; Max-Age=900");
     let mut response = (StatusCode::CREATED, Json(json!({ "ok": true }))).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
@@ -432,12 +434,14 @@ async fn delete_operator_session(
     headers: HeaderMap,
 ) -> Result<Response<Body>, HttpError> {
     require_operator_endpoint(&state, peer)?;
-    let raw = authorize_operator(&state, &headers, true)?;
+    let (raw, origin) = authorize_operator(&state, &headers, true)?;
     state.daemon.revoke_operator_session(raw);
+    let secure = operator_cookie_secure(&origin);
+    let cookie = format!("conch_operator=; Path=/; HttpOnly; SameSite=Strict{secure}; Max-Age=0");
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        HeaderValue::from_static("conch_operator=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"),
+        HeaderValue::from_str(&cookie).map_err(|_| HttpError::BadRequest("invalid cookie"))?,
     );
     Ok(operator_no_store(response))
 }
@@ -625,31 +629,86 @@ fn authorize_operator<'a>(
     state: &HttpState,
     headers: &'a HeaderMap,
     require_origin: bool,
-) -> Result<&'a str, HttpError> {
-    let origin = operator_origin(headers, require_origin)?;
+) -> Result<(&'a str, String), HttpError> {
+    let origin = operator_origin(state, headers, require_origin)?;
     let raw = named_cookie(headers, "conch_operator").ok_or(HttpError::Forbidden)?;
     if state.daemon.validate_operator_session(raw, &origin) {
-        Ok(raw)
+        Ok((raw, origin))
     } else {
         Err(HttpError::Forbidden)
     }
 }
 
-fn operator_origin(headers: &HeaderMap, require_origin: bool) -> Result<String, HttpError> {
-    let origin = if require_origin {
-        canonical_origin(headers, false).map_err(|_| HttpError::Forbidden)?
-    } else {
-        request_origin(headers, false)?
-    };
-    let url = Url::parse(&origin).map_err(|_| HttpError::Forbidden)?;
-    let literal_loopback = match url.host() {
-        Some(Host::Ipv4(address)) => address.is_loopback(),
-        Some(Host::Ipv6(address)) => address.is_loopback(),
-        Some(Host::Domain(_)) | None => false,
-    };
-    literal_loopback
-        .then_some(origin)
+/// The origin an operator request is acting for: a literal loopback origin over
+/// plain http, or one of the daemon's configured trusted origins (a reverse proxy on
+/// this machine forwarding a browser's Host and Origin). State-changing requests
+/// must carry an Origin header agreeing with Host; reads are judged by Host alone,
+/// which a browser never lets a foreign page choose.
+fn operator_origin(
+    state: &HttpState,
+    headers: &HeaderMap,
+    require_origin: bool,
+) -> Result<String, HttpError> {
+    let trusted = state.daemon.operator_origins();
+    if require_origin {
+        let origin = canonical_origin_any_scheme(headers).map_err(|_| HttpError::Forbidden)?;
+        return operator_origin_allowed(&origin, &trusted)
+            .then_some(origin)
+            .ok_or(HttpError::Forbidden);
+    }
+    [false, true]
+        .into_iter()
+        .filter_map(|secure| request_origin(headers, secure).ok())
+        .find(|origin| operator_origin_allowed(origin, &trusted))
         .ok_or(HttpError::Forbidden)
+}
+
+fn operator_origin_allowed(origin: &str, trusted: &[String]) -> bool {
+    if trusted.iter().any(|candidate| candidate == origin) {
+        return true;
+    }
+    let Ok(url) = Url::parse(origin) else {
+        return false;
+    };
+    url.scheme() == "http"
+        && match url.host() {
+            Some(Host::Ipv4(address)) => address.is_loopback(),
+            Some(Host::Ipv6(address)) => address.is_loopback(),
+            Some(Host::Domain(_)) | None => false,
+        }
+}
+
+fn operator_cookie_secure(origin: &str) -> &'static str {
+    if origin.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    }
+}
+
+/// Canonicalise a configured trusted operator origin: a bare `http(s)://host[:port]`
+/// with nothing else, lowered and given its port.
+pub fn trusted_origin(raw: &str) -> Result<String, String> {
+    let reject = || format!("{raw:?}: expected http://host[:port] or https://host[:port]");
+    let raw = raw.trim().trim_end_matches('/');
+    let authority = raw
+        .split_once("://")
+        .map(|(_, authority)| authority)
+        .ok_or_else(reject)?;
+    if authority.is_empty() || authority.contains(['/', '?', '#', '@', ',']) {
+        return Err(reject());
+    }
+    let url = Url::parse(raw).map_err(|_| reject())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        return Err(reject());
+    }
+    origin_tuple(&url).map_err(|_| reject())
 }
 
 fn request_origin(headers: &HeaderMap, secure: bool) -> Result<String, HttpError> {
@@ -937,6 +996,19 @@ fn session_cookie(headers: &HeaderMap, secure: bool) -> Option<&str> {
 }
 
 fn canonical_origin(headers: &HeaderMap, secure: bool) -> Result<String, HttpError> {
+    canonical_origin_with(headers, Some(if secure { "https" } else { "http" }))
+}
+
+/// `canonical_origin` for either scheme: the Origin header's own scheme is used to
+/// check it against Host.
+fn canonical_origin_any_scheme(headers: &HeaderMap) -> Result<String, HttpError> {
+    canonical_origin_with(headers, None)
+}
+
+fn canonical_origin_with(
+    headers: &HeaderMap,
+    expected_scheme: Option<&str>,
+) -> Result<String, HttpError> {
     let origins = headers.get_all(header::ORIGIN).iter().collect::<Vec<_>>();
     if origins.len() != 1 {
         return Err(HttpError::Unauthorized);
@@ -961,10 +1033,11 @@ fn canonical_origin(headers: &HeaderMap, secure: bool) -> Result<String, HttpErr
     {
         return Err(HttpError::Unauthorized);
     }
-    let expected_scheme = if secure { "https" } else { "http" };
-    if origin.scheme() != expected_scheme {
-        return Err(HttpError::Unauthorized);
-    }
+    let expected_scheme = match expected_scheme {
+        Some(expected) if origin.scheme() == expected => expected,
+        None if matches!(origin.scheme(), "http" | "https") => origin.scheme(),
+        _ => return Err(HttpError::Unauthorized),
+    };
     let hosts = headers.get_all(header::HOST).iter().collect::<Vec<_>>();
     if hosts.len() != 1 {
         return Err(HttpError::Unauthorized);

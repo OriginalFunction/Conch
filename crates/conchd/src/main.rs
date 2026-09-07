@@ -7,7 +7,10 @@ use std::{
     sync::Arc,
 };
 
-use conchd::tcp::{Daemon, TransportMode};
+use conchd::{
+    config::DaemonConfig,
+    tcp::{Daemon, TransportMode},
+};
 use tokio_rustls::rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
     version::TLS13,
@@ -32,6 +35,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut tls_key = None;
     let mut tls_ca = None;
     let mut advertised = Vec::new();
+    let mut operator_origins = Vec::new();
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -84,6 +88,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--advertise" => {
                 advertised.push(arguments.next().ok_or("--advertise requires an endpoint")?)
             }
+            "--operator-origin" => operator_origins.push(
+                arguments
+                    .next()
+                    .ok_or("--operator-origin requires an origin")?,
+            ),
             "--version" | "-V" => {
                 println!("conchd {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
@@ -106,7 +115,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--tls-cert and --tls-key require --mode public".into());
     }
 
+    let config = DaemonConfig::load(&data_dir)?;
+    operator_origins.extend(config.operator_origins);
+
     let daemon = Daemon::open(data_dir.clone())?;
+    daemon.configure_operator_origins(&operator_origins)?;
     let client = load_client_tls(tls_ca.as_deref())?;
 
     // Bind before claiming the pid file. A second daemon aimed at the same data
@@ -197,6 +210,9 @@ fn print_help() {
            --tls-key PATH        Public-mode TLS private key (mode 0600)\n\
            --tls-ca PATH         CA bundle for outbound public-mode peers\n\
            --advertise URL       Advertise an allowed tcp(s) or ws(s) endpoint\n\
+           --operator-origin URL Trust a browser origin for the operator console,\n\
+                                 besides loopback (also [operator] origins in\n\
+                                 <data-dir>/conchd.toml)\n\
            -V, --version         Print version\n\
            -h, --help            Print help",
         env!("CARGO_PKG_VERSION")

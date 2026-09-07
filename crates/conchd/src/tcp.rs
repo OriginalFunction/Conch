@@ -94,6 +94,8 @@ pub enum DaemonError {
     UnknownRoom(RoomId),
     #[error("peer protocol violation: {0}")]
     Protocol(&'static str),
+    #[error("invalid operator origin {0}")]
+    OperatorOrigin(String),
     #[error("room synchronization timed out")]
     SyncTimeout,
     #[error("bad ticket: {0}")]
@@ -138,6 +140,7 @@ struct Inner {
     intent_forwards: Mutex<BTreeMap<RoomId, IntentForwardState>>,
     syncing: RwLock<BTreeSet<RoomId>>,
     transport: RwLock<TransportConfig>,
+    operator_origins: RwLock<Vec<String>>,
     browser_sessions: Mutex<Vec<BrowserSession>>,
     operator_sessions: Mutex<Vec<OperatorSession>>,
     connection_slots: Arc<Semaphore>,
@@ -524,6 +527,7 @@ impl Daemon {
                     mode: TransportMode::Local,
                     tls_client: None,
                 }),
+                operator_origins: RwLock::new(Vec::new()),
                 browser_sessions: Mutex::new(Vec::new()),
                 operator_sessions: Mutex::new(Vec::new()),
                 connection_slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
@@ -587,6 +591,31 @@ impl Daemon {
             .transport
             .write()
             .expect("transport lock is not poisoned") = TransportConfig { mode, tls_client };
+    }
+
+    /// Trust these browser origins for the operator console, in addition to the
+    /// loopback literals. Each is canonicalised to `scheme://host:port`; anything that
+    /// is not a bare http(s) origin is refused with its text in the error.
+    pub fn configure_operator_origins(&self, origins: &[String]) -> Result<(), DaemonError> {
+        let canonical = origins
+            .iter()
+            .map(|origin| crate::http::trusted_origin(origin))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DaemonError::OperatorOrigin)?;
+        *self
+            .inner
+            .operator_origins
+            .write()
+            .expect("operator origin lock is not poisoned") = canonical;
+        Ok(())
+    }
+
+    pub fn operator_origins(&self) -> Vec<String> {
+        self.inner
+            .operator_origins
+            .read()
+            .expect("operator origin lock is not poisoned")
+            .clone()
     }
 
     pub(crate) fn transport_mode(&self) -> TransportMode {

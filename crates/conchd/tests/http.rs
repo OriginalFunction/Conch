@@ -1060,6 +1060,179 @@ async fn operator_websocket_is_bound_to_its_path_room() {
     assert!(connect_async(open_request).await.is_err());
 }
 
+#[tokio::test]
+async fn a_trusted_operator_origin_admits_a_proxied_https_console() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    daemon
+        .configure_operator_origins(&["https://Console.Example".to_owned()])
+        .unwrap();
+    let room = daemon
+        .create_ticket_with_token(
+            "trusted origin",
+            StakePolicy::default(),
+            FloorConfig::stick(30),
+            Some(Hash32::from_bytes([74; 32])),
+        )
+        .unwrap()
+        .id;
+    let server = daemon.start_http(loopback()).await.unwrap();
+
+    // A reverse proxy on this machine (Tailscale Serve, say) connects from loopback
+    // but forwards the browser's own Host and Origin headers untouched.
+    let (status, cookie, _) = http_operator_request_via(
+        server.addr(),
+        "console.example",
+        "POST",
+        "/operator/session",
+        Some("https://console.example"),
+        None,
+        b"",
+    )
+    .await;
+    assert_eq!(status, 201);
+    let cookie = cookie.expect("trusted origin bootstrap sets a cookie");
+    assert!(
+        cookie.contains("; Secure"),
+        "a cookie minted for an https origin must be Secure: {cookie}"
+    );
+    let cookie_pair = cookie.split(';').next().unwrap().to_owned();
+
+    let (status, _, _) = http_operator_request_via(
+        server.addr(),
+        "console.example",
+        "GET",
+        "/operator/rooms",
+        None,
+        Some(&cookie_pair),
+        b"",
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // The session stays bound to the origin that minted it.
+    let (status, _, _) = http_operator_request(
+        server.addr(),
+        "GET",
+        "/operator/rooms",
+        None,
+        Some(&cookie_pair),
+        b"",
+    )
+    .await;
+    assert_eq!(status, 403);
+
+    // The operator websocket accepts the same proxied origin.
+    let mut request = format!("ws://{}/operator/client/{room}", server.addr())
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("Host", HeaderValue::from_static("console.example"));
+    request.headers_mut().insert(
+        "Origin",
+        HeaderValue::from_static("https://console.example"),
+    );
+    request
+        .headers_mut()
+        .insert("Cookie", HeaderValue::from_str(&cookie_pair).unwrap());
+    let mut socket = connect_async(request).await.unwrap().0;
+    socket
+        .send(json_message(&ClientRequest::Attach {
+            agent: AgentId::new("agent:operator-browser").unwrap(),
+        }))
+        .await
+        .unwrap();
+    assert!(next_reply(&mut socket).await.ok);
+
+    // An origin that is not on the list is refused, and so is a trusted Origin
+    // arriving under a different Host.
+    for (host, origin) in [
+        ("other.example", "https://other.example"),
+        ("other.example", "https://console.example"),
+        ("console.example", "http://console.example"),
+    ] {
+        let (status, _, _) = http_operator_request_via(
+            server.addr(),
+            host,
+            "POST",
+            "/operator/session",
+            Some(origin),
+            None,
+            b"",
+        )
+        .await;
+        assert_eq!(
+            status, 403,
+            "{origin} under Host {host} must not mint a session"
+        );
+    }
+
+    // Loopback keeps working alongside, without the Secure attribute.
+    let origin = format!("http://{}", server.addr());
+    let (status, cookie, _) = http_operator_request(
+        server.addr(),
+        "POST",
+        "/operator/session",
+        Some(&origin),
+        None,
+        b"",
+    )
+    .await;
+    assert_eq!(status, 201);
+    assert!(!cookie.unwrap().contains("Secure"));
+
+    // Signing out clears the secure cookie the same way.
+    let (status, cleared, _) = http_operator_request_via(
+        server.addr(),
+        "console.example",
+        "DELETE",
+        "/operator/session",
+        Some("https://console.example"),
+        Some(&cookie_pair),
+        b"",
+    )
+    .await;
+    assert_eq!(status, 204);
+    let cleared = cleared.unwrap();
+    assert!(cleared.contains("Max-Age=0") && cleared.contains("; Secure"));
+}
+
+#[test]
+fn operator_origins_are_canonicalised_and_validated() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    daemon
+        .configure_operator_origins(&[
+            "https://Console.Example".to_owned(),
+            "http://console.example:8080/".to_owned(),
+        ])
+        .unwrap();
+    assert_eq!(
+        daemon.operator_origins(),
+        vec![
+            "https://console.example:443".to_owned(),
+            "http://console.example:8080".to_owned()
+        ]
+    );
+    for bad in [
+        "console.example",
+        "ftp://console.example",
+        "https://console.example/console",
+        "https://console.example?x=1",
+        "https://user@console.example",
+        "https://",
+        "null",
+    ] {
+        assert!(
+            daemon
+                .configure_operator_origins(&[bad.to_owned()])
+                .is_err(),
+            "{bad} is not an origin"
+        );
+    }
+}
+
 async fn tcp_request(addr: SocketAddr, request: ClientRequest) -> ClientReply {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     write_frame(
@@ -1216,6 +1389,19 @@ async fn http_operator_request(
     cookie: Option<&str>,
     body: &[u8],
 ) -> (u16, Option<String>, Vec<u8>) {
+    http_operator_request_via(addr, &addr.to_string(), method, path, origin, cookie, body).await
+}
+
+/// Like `http_operator_request`, but with the Host header a proxy would forward.
+async fn http_operator_request_via(
+    addr: SocketAddr,
+    host: &str,
+    method: &str,
+    path: &str,
+    origin: Option<&str>,
+    cookie: Option<&str>,
+    body: &[u8],
+) -> (u16, Option<String>, Vec<u8>) {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let origin = origin
         .map(|value| format!("Origin: {value}\r\n"))
@@ -1229,7 +1415,7 @@ async fn http_operator_request(
         "Content-Type: application/json\r\n"
     };
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{origin}{cookie_header}{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\n{origin}{cookie_header}{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(request.as_bytes()).await.unwrap();

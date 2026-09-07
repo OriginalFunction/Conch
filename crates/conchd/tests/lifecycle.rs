@@ -186,6 +186,92 @@ async fn a_daemon_that_cannot_bind_leaves_the_running_daemon_alone() {
     assert_eq!(reply.data.unwrap()["version"], env!("CARGO_PKG_VERSION"));
 }
 
+#[tokio::test]
+async fn conchd_toml_operator_origins_reach_the_console_through_a_local_proxy() {
+    let data = TempDir::new().unwrap();
+    let _guard = DaemonGuard::new(data.path());
+    std::fs::write(
+        data.path().join("conchd.toml"),
+        "[operator]\norigins = [\"https://console.example\"]\n",
+    )
+    .unwrap();
+    let (_, http) = with_daemon_ports(|tcp, http| {
+        spawn_detached(&SpawnOptions {
+            conchd: PathBuf::from(env!("CARGO_BIN_EXE_conchd")),
+            data_dir: data.path().to_path_buf(),
+            tcp,
+            http,
+        })
+        .is_ok()
+    });
+    let response = raw_http(
+        http,
+        "POST /operator/session HTTP/1.1\r\nHost: console.example\r\nOrigin: https://console.example\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(
+        response.starts_with("HTTP/1.1 201"),
+        "a trusted origin from conchd.toml mints an operator session: {response}"
+    );
+    assert!(response.contains("conch_operator=") && response.contains("; Secure"));
+}
+
+#[test]
+fn conchd_refuses_a_malformed_operator_origin_before_binding() {
+    let (tcp, http, reserved) = reserve_ports();
+    drop(reserved);
+    let data = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_conchd"))
+        .arg("--localhost")
+        .arg("--data-dir")
+        .arg(data.path())
+        .arg("--tcp")
+        .arg(tcp.to_string())
+        .arg("--http")
+        .arg(http.to_string())
+        .arg("--operator-origin")
+        .arg("console.example")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("operator origin") && stderr.contains("console.example"),
+        "{stderr}"
+    );
+    assert!(PidFile::read(data.path()).is_none());
+
+    std::fs::write(
+        data.path().join("conchd.toml"),
+        "[operator]\norigins = \"https://console.example\"\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_conchd"))
+        .arg("--localhost")
+        .arg("--data-dir")
+        .arg(data.path())
+        .arg("--tcp")
+        .arg(tcp.to_string())
+        .arg("--http")
+        .arg(http.to_string())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("conchd.toml") && stderr.contains("operator.origins"),
+        "{stderr}"
+    );
+}
+
+async fn raw_http(addr: SocketAddr, request: &str) -> String {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    String::from_utf8_lossy(&response).into_owned()
+}
+
 #[test]
 fn a_daemon_rebinds_its_port_straight_after_a_restart() {
     // What `conch down && conch up` does. A client connection leaves a socket in
