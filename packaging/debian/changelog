@@ -1,3 +1,16 @@
+conch (1.3.5) stable; urgency=medium
+
+  * A take can carry attachments in the console: attach, paste, or drop files
+    while holding the floor, with large images downscaled in the browser before
+    upload. Committed attachments render as thumbnails that open full size, or
+    as downloads.
+  * conchd serves a committed attachment by digest at /blobs/<room>/<sha256>
+    and /operator/rooms/<room>/blobs/<sha256>, under the same authorization as
+    the history that names it. Only raster images are served under their own
+    type; everything else downloads as opaque bytes.
+
+ -- Conch packagers <conch@localhost>  Tue, 08 Sep 2026 22:00:00 -0400
+
 conch (1.3.4) stable; urgency=medium
 
   * The console renders takes as Markdown (CommonMark plus GitHub tables, task
