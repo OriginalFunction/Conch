@@ -25,6 +25,7 @@ const state = {
   retryAt: 0,
   retryDelay: RETRY_INITIAL_MS,
   composerBusy: false,
+  staged: [],
   floorHolderKey: null,
   queuedIntent: null,
   seenHeads: new Map(),
@@ -41,6 +42,7 @@ const el = Object.fromEntries([
   "create-dialog", "create-form", "create-name", "create-timeout", "create-error", "join-dialog", "join-form",
   "ticket-source", "join-error", "ticket-dialog", "download-ticket", "copy-magnet", "finish-ticket", "toast",
   "room-state", "room-state-title", "room-state-copy", "reauthorize-room", "room-state-back",
+  "staged-files", "attach-input", "attach-button", "image-dialog", "image-full", "image-name", "image-download",
 ].map((id) => [camel(id), document.getElementById(id)]));
 
 class RoomHttpError extends Error {
@@ -409,6 +411,7 @@ function placeScene(record, hash) {
     row.dataset.n = String(scene.n);
     take.querySelector(".take-n").textContent = scene.n;
     renderTakeText(take.querySelector(".take-text"), body.text || "Empty take");
+    renderAttachments(take.querySelector(".take-files"), body.blobs);
     const time = take.querySelector("time");
     time.dateTime = new Date(scene.ts * 1000).toISOString();
     time.textContent = formatClock(scene.ts);
@@ -564,7 +567,8 @@ function updateFloor() {
   el.takeButton.textContent = queued ? `Hand raised${queued.position ? ` · #${queued.position}` : ""}` : "Raise hand";
   el.takeButton.disabled = state.composerBusy || state.readOnly || state.roomStatus !== "ok" || !state.room || mine || Boolean(queued);
   el.speech.disabled = state.composerBusy || !mine;
-  el.wrapButton.disabled = state.composerBusy || !mine || !el.speech.value.trim();
+  el.attachButton.disabled = state.composerBusy || !mine;
+  el.wrapButton.disabled = state.composerBusy || !mine || (!el.speech.value.trim() && !state.staged.length);
   el.yieldButton.disabled = state.composerBusy || !mine;
   el.composeHint.textContent = state.readOnly
     ? state.detail?.room?.browser_mutable === false ? "This tokenless room is available as verified read-only history." : "The committed history is available; live room mutations are reconnecting."
@@ -587,9 +591,18 @@ async function takeFloor() {
 
 async function wrapAndYield() {
   const text = el.speech.value;
-  if (!text.trim()) return;
+  if (!text.trim() && !state.staged.length) return;
   setComposerBusy(true);
   try {
+    // Attachments go up first: a failed upload leaves the grant open and
+    // nothing committed, so the operator can retry the same take.
+    for (const file of state.staged) {
+      try {
+        await putBlob(file.name, file.bytes);
+      } catch (error) {
+        throw new Error(`${file.name} was not attached: ${error.message}`);
+      }
+    }
     await rpc({ typ: "speak", room: state.room, text, request_id: requestId() });
     await rpc({ typ: "yield", room: state.room });
     el.speech.value = "";
@@ -762,6 +775,42 @@ function bindEvents() {
   el.takeButton.addEventListener("click", takeFloor);
   el.wrapButton.addEventListener("click", wrapAndYield);
   el.yieldButton.addEventListener("click", yieldFloor);
+  el.attachButton.addEventListener("click", () => el.attachInput.click());
+  el.attachInput.addEventListener("change", () => {
+    stageFiles(el.attachInput.files);
+    el.attachInput.value = "";
+  });
+  el.stagedFiles.addEventListener("click", (event) => {
+    const remove = event.target.closest("[data-remove]");
+    if (!remove) return;
+    state.staged.splice(Number(remove.dataset.remove), 1);
+    renderStaged();
+  });
+  el.speech.addEventListener("paste", (event) => {
+    const files = [...(event.clipboardData?.files || [])];
+    if (!files.length) return;
+    event.preventDefault();
+    stageFiles(files);
+  });
+  for (const name of ["dragover", "drop"]) {
+    el.speech.addEventListener(name, (event) => {
+      if (!event.dataTransfer?.types?.includes("Files")) return;
+      event.preventDefault();
+      if (name === "drop") stageFiles(event.dataTransfer.files);
+    });
+  }
+  el.sceneList.addEventListener("click", (event) => {
+    const thumb = event.target.closest("[data-blob]");
+    if (!thumb) return;
+    event.preventDefault();
+    el.imageFull.src = thumb.dataset.blob;
+    el.imageFull.alt = thumb.dataset.name;
+    el.imageName.textContent = thumb.dataset.name;
+    el.imageDownload.href = thumb.dataset.blob;
+    el.imageDownload.setAttribute("download", thumb.dataset.name);
+    el.imageDialog.showModal();
+  });
+  el.imageDialog.addEventListener("close", () => { el.imageFull.removeAttribute("src"); });
   el.speech.addEventListener("input", () => {
     el.draftText.textContent = el.speech.value;
     el.draftPreview.hidden = !el.speech.value;
@@ -903,6 +952,155 @@ function showRemoteDraft(message) {
 function hideDraft() {
   el.draftPreview.hidden = true;
   el.draftText.textContent = "";
+  clearStaged();
+}
+
+const MAX_BLOB_BYTES = 32 * 1024 * 1024;
+const MAX_IMAGE_EDGE = 2048;
+const IMAGE_NAME = /\.(png|jpe?g|gif|webp)$/i;
+
+/// The console reads a blob through whichever session it holds: the operator
+/// console has its own cookie, a ticket holder has a room session.
+function blobUrl(sha256) {
+  return state.operator ? operatorUrl(`/rooms/${state.room}/blobs/${sha256}`) : `/blobs/${state.room}/${sha256}`;
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function fileChip(blob, url) {
+  const link = document.createElement("a");
+  link.className = "file-chip";
+  link.href = url;
+  link.setAttribute("download", blob.name);
+  link.textContent = `${blob.name} · ${formatBytes(blob.bytes)}`;
+  return link;
+}
+
+/// The attachments a committed take carries. Images become thumbnails; anything
+/// else becomes a download. The daemon serves only raster images under their own
+/// type, so a file whose name lies about its bytes fails to render and falls
+/// back to a download here.
+function renderAttachments(container, blobs) {
+  container.textContent = "";
+  const list = Array.isArray(blobs) ? blobs : [];
+  container.hidden = !list.length;
+  for (const blob of list) {
+    const url = blobUrl(blob.sha256);
+    if (!IMAGE_NAME.test(blob.name)) {
+      container.append(fileChip(blob, url));
+      continue;
+    }
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "thumb";
+    button.dataset.blob = url;
+    button.dataset.name = blob.name;
+    button.title = `${blob.name} · ${formatBytes(blob.bytes)}`;
+    const image = document.createElement("img");
+    image.src = url;
+    image.alt = blob.name;
+    image.loading = "lazy";
+    image.addEventListener("error", () => button.replaceWith(fileChip(blob, url)), { once: true });
+    button.append(image);
+    container.append(button);
+  }
+}
+
+/// Read a chosen file, downscaling a large image so every replica does not have
+/// to store a full-resolution phone photo. Screenshots small enough to stay
+/// sharp are left exactly as they are.
+async function prepareFile(file) {
+  const raw = async () => ({ name: file.name, bytes: new Uint8Array(await file.arrayBuffer()), original: file.size });
+  if (!file.type.startsWith("image/")) return raw();
+  const bitmap = await createImageBitmap(file).catch(() => null);
+  if (!bitmap) return raw();
+  const scale = Math.min(1, MAX_IMAGE_EDGE / Math.max(bitmap.width, bitmap.height));
+  if (scale === 1) {
+    bitmap.close();
+    return raw();
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(bitmap.width * scale);
+  canvas.height = Math.round(bitmap.height * scale);
+  canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close();
+  const resized = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.85));
+  // Re-encoding a flat or already-compressed image can cost more than it saves.
+  // Replicas store whatever is smaller.
+  if (!resized || resized.size >= file.size) return raw();
+  return {
+    name: file.name.replace(/\.[^.]+$/, "") + ".jpg",
+    bytes: new Uint8Array(await resized.arrayBuffer()),
+    original: file.size,
+  };
+}
+
+async function stageFiles(files) {
+  for (const file of [...files]) {
+    try {
+      const prepared = await prepareFile(file);
+      if (prepared.bytes.length > MAX_BLOB_BYTES) {
+        showToast(`${file.name} is larger than 32 MB.`);
+        continue;
+      }
+      prepared.preview = IMAGE_NAME.test(prepared.name) ? URL.createObjectURL(new Blob([prepared.bytes])) : null;
+      state.staged.push(prepared);
+    } catch (error) {
+      showToast(`${file.name} could not be read: ${error.message}`);
+    }
+  }
+  renderStaged();
+}
+
+function renderStaged() {
+  el.stagedFiles.textContent = "";
+  el.stagedFiles.hidden = !state.staged.length;
+  state.staged.forEach((file, index) => {
+    const row = document.createElement("span");
+    row.className = "staged-file";
+    if (file.preview) {
+      const image = document.createElement("img");
+      image.src = file.preview;
+      image.alt = "";
+      row.append(image);
+    }
+    const label = document.createElement("span");
+    const resized = file.original !== file.bytes.length ? ` (was ${formatBytes(file.original)})` : "";
+    label.textContent = `${file.name} · ${formatBytes(file.bytes.length)}${resized}`;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "chip-remove";
+    remove.dataset.remove = String(index);
+    remove.textContent = "Remove";
+    row.append(label, remove);
+    el.stagedFiles.append(row);
+  });
+  updateFloor();
+}
+
+function clearStaged() {
+  for (const file of state.staged) if (file.preview) URL.revokeObjectURL(file.preview);
+  state.staged = [];
+  renderStaged();
+}
+
+/// Attach one file to the open take, using the daemon's put-blob handshake: the
+/// request frame, then one binary message holding a big-endian length and the
+/// bytes.
+function putBlob(name, bytes) {
+  return new Promise((resolve, reject) => {
+    if (!state.socket || state.socket.readyState !== WebSocket.OPEN) return reject(new Error("Live connection is unavailable."));
+    const frame = new Uint8Array(4 + bytes.length);
+    new DataView(frame.buffer).setUint32(0, bytes.length, false);
+    frame.set(bytes, 4);
+    state.pending.push({ resolve, reject });
+    state.socket.send(JSON.stringify({ typ: "put_blob", room: state.room, name, bytes: bytes.length }));
+    state.socket.send(frame);
+  });
 }
 
 function setConnection(mode, label) {

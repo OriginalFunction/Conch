@@ -129,9 +129,12 @@
           <section class="composer" aria-label="Speak while holding Conch" data-room-content>
             <label for="speech">Your take</label>
             <textarea id="speech" rows="3" disabled placeholder="You can write when human:operator holds the floor."></textarea>
+            <div id="staged-files" class="staged-files" hidden aria-label="Files staged for this take"></div>
+            <input id="attach-input" type="file" accept="image/*,application/pdf,text/plain" multiple hidden>
             <div class="composer-actions">
               <p id="compose-hint">The committed grant controls this composer.</p>
               <div>
+                <button id="attach-button" type="button" class="secondary" disabled>Attach</button>
                 <button id="yield-button" class="secondary" disabled>Yield empty</button>
                 <button id="wrap-button" disabled>Wrap &amp; yield</button>
               </div>
@@ -196,11 +199,16 @@
       <article class="turn"><div class="turn-avatar"><span></span></div><div class="turn-body"><header><div><strong></strong><span class="turn-grants" hidden><i>floor</i></span></div><span class="turn-span"><time></time><span class="turn-until"></span></span></header><div class="turn-takes"></div></div></article>
     </template>
     <template id="take-template">
-      <div class="take"><span class="take-n"></span><div class="take-text"></div><span class="take-meta"><time></time><code></code></span></div>
+      <div class="take"><span class="take-n"></span><div class="take-text"></div><span class="take-meta"><time></time><code></code></span><div class="take-files" hidden></div></div>
     </template>
     <template id="person-template">
       <article class="person"><div class="person-avatar"><span></span><i></i></div><div class="person-main"><strong></strong><span class="agent-empty" hidden>No attached agents observed</span><code></code><div class="badges"></div></div></article>
     </template>
+    <dialog id="image-dialog" class="image-dialog">
+      <div class="dialog-heading"><p id="image-name" class="eyebrow"></p><button type="button" class="close-button" data-close aria-label="Close">×</button></div>
+      <img id="image-full" alt="">
+      <a id="image-download" download>Download original</a>
+    </dialog>
     <div id="toast" class="toast" role="status" hidden></div>
     <script src="/ui/vendor/marked.umd.js" defer></script>
     <script src="/ui/vendor/purify.min.js" defer></script>

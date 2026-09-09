@@ -842,7 +842,11 @@ async fn ui_html_is_embedded_and_served_at_root_and_ui() {
     let script = String::from_utf8(script.1).unwrap();
     assert!(script.contains("BOTTOM_THRESHOLD_PX = 48"));
     assert!(script.contains("renderTakeText"));
+    assert!(script.contains("renderAttachments"));
     assert!(html.contains("class=\"take-text\""));
+    assert!(html.contains("class=\"take-files\""));
+    assert!(html.contains("id=\"attach-input\""));
+    assert!(html.contains("id=\"image-dialog\""));
     for (path, marker) in [
         ("/ui/vendor/marked.umd.js", "marked v18.0.11"),
         ("/ui/vendor/purify.min.js", "DOMPurify"),

@@ -183,6 +183,20 @@ input, textarea { width: 100%; border: 1px solid var(--line-dark); border-radius
 .take-text hr { margin: .7rem 0; border: 0; border-top: 1px solid var(--line); }
 .take-meta { display: flex; gap: .5rem; color: var(--muted); font: .62rem ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .take-meta code { cursor: help; }
+.take-files { grid-column: 2; display: flex; flex-wrap: wrap; align-items: flex-start; gap: .4rem; margin-top: .1rem; }
+.take-files .thumb { min-height: 0; padding: 0; border: 1px solid var(--line-dark); border-radius: 9px; background: var(--paper-deep); overflow: hidden; line-height: 0; cursor: zoom-in; }
+.take-files .thumb img { display: block; width: auto; max-width: 190px; height: 118px; object-fit: contain; }
+.file-chip { display: inline-flex; align-items: center; gap: .4rem; padding: .3rem .7rem; border: 1px solid var(--line-dark); border-radius: 999px; color: var(--deep); background: var(--paper-deep); font-size: .74rem; text-decoration: none; }
+.file-chip:hover { border-color: var(--sea); }
+.staged-files { display: flex; flex-direction: column; gap: .3rem; margin-top: .45rem; }
+.staged-file { display: flex; align-items: center; gap: .5rem; padding: .3rem .35rem .3rem .3rem; border: 1px dashed var(--line-dark); border-radius: 9px; font-size: .72rem; }
+.staged-file img { width: 42px; height: 32px; border-radius: 5px; object-fit: cover; }
+.staged-file > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip-remove { min-height: 26px; padding: .15rem .55rem; color: var(--coral-dark); background: transparent; box-shadow: inset 0 0 0 1px var(--line-dark); font-size: .68rem; font-weight: 700; }
+.image-dialog { width: min(920px, calc(100vw - 2rem)); padding: 1rem; }
+.image-dialog .dialog-heading { margin-bottom: .6rem; align-items: center; }
+.image-dialog img { display: block; width: 100%; max-height: min(72vh, 720px); object-fit: contain; border-radius: 10px; background: var(--paper-deep); }
+.image-dialog a { display: inline-block; margin-top: .7rem; color: var(--sea); font-size: .78rem; }
 .empty-state { padding: 4rem 1rem; color: var(--muted); text-align: center; }
 .empty-state span { color: var(--coral); font: 2.8rem Georgia, serif; }
 .empty-state h3 { margin: .4rem 0; color: var(--ink); font: 700 1.4rem Georgia, serif; }
@@ -347,6 +361,10 @@ fieldset legend { margin-bottom: .35rem; font-size: .76rem; font-weight: 800; }
   .take-text h2 { font-size: 1.02rem; }
   .take-text h3, .take-text h4, .take-text h5, .take-text h6 { font-size: .92rem; }
   .take-meta { display: none; }
+  .take-files { gap: .3rem; }
+  .take-files .thumb img { max-width: 140px; height: 88px; }
+  .file-chip { padding: .25rem .55rem; font-size: .68rem; }
+  .staged-file { font-size: .68rem; }
   .new-messages { bottom: .5rem; min-height: 30px; padding: .3rem .7rem; }
   .draft-preview { margin: .2rem .6rem .4rem; padding: .45rem .6rem; }
   .composer { margin: .4rem .6rem .5rem; padding: .5rem .55rem; border-radius: 10px; box-shadow: none; }
