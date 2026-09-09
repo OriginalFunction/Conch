@@ -349,6 +349,7 @@ fn router(daemon: Daemon, secure: bool, operator: bool) -> Router {
     Router::new()
         .route("/ticket/{id}", get(get_ticket))
         .route("/history/{id}", get(get_history))
+        .route("/blobs/{id}/{sha256}", get(get_blob))
         .route("/room/{id}", get(get_room_detail))
         .route("/swarm", get(ws_swarm))
         .route("/client", get(ws_client))
@@ -364,6 +365,10 @@ fn router(daemon: Daemon, secure: bool, operator: bool) -> Router {
         .route("/operator/rooms/join", post(operator_join_room))
         .route("/operator/rooms/{id}", get(operator_room))
         .route("/operator/rooms/{id}/history", get(operator_room_history))
+        .route(
+            "/operator/rooms/{id}/blobs/{sha256}",
+            get(operator_room_blob),
+        )
         .route("/operator/client/{id}", get(ws_operator_client))
         .route("/", get(index))
         .route("/rooms/{id}", get(index))
@@ -589,6 +594,139 @@ async fn operator_room_history(
     Ok(operator_no_store(
         Json(state.daemon.history_page_from(room, query.from)?).into_response(),
     ))
+}
+
+/// A committed attachment, for the console's own origin. Authorized like the
+/// operator history it is rendered beside.
+async fn operator_room_blob(
+    State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<HttpPeer>,
+    Path((id, sha256)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, HttpError> {
+    require_operator_endpoint(&state, peer)?;
+    authorize_operator(&state, &headers, false)?;
+    blob_response(&state, parse_room(&id)?, &sha256)
+}
+
+/// A committed attachment, for a ticket holder or a browser session. Authorized
+/// like the history that names it.
+async fn get_blob(
+    State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<HttpPeer>,
+    Path((id, sha256)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, HttpError> {
+    if !state.daemon.auth_allowed(peer.ip()) {
+        return Err(HttpError::Unauthorized);
+    }
+    let room = parse_room(&id)?;
+    if let Err(error) = authorize_read(&state, room, &headers) {
+        state.daemon.record_auth_failure(peer.ip());
+        return Err(error);
+    }
+    blob_response(&state, room, &sha256)
+}
+
+/// Serve one committed blob. Only a digest a committed scene attaches is
+/// servable: the file name lives on that reference, and an unreferenced file on
+/// disk is not part of the room's history.
+fn blob_response(
+    state: &HttpState,
+    room: RoomId,
+    sha256: &str,
+) -> Result<Response<Body>, HttpError> {
+    let digest = Hash32::from_str(sha256).map_err(|_| HttpError::BadRequest("invalid digest"))?;
+    let blob = state
+        .daemon
+        .blob_ref(room, digest)?
+        .ok_or(HttpError::NotFound)?;
+    let bytes = state
+        .daemon
+        .read_blob(room, digest)
+        .map_err(|_| HttpError::NotFound)?;
+    if bytes.len() as u64 != blob.bytes {
+        return Err(HttpError::NotFound);
+    }
+    // Only raster images are served under their own type: they cannot run
+    // script. Everything else, SVG included, downloads as opaque bytes so a
+    // document can never execute on the console's origin.
+    let inline = sniff_image(&bytes);
+    let content_type = inline.unwrap_or("application/octet-stream");
+    let mut response = Response::new(Body::from(bytes));
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&content_disposition(inline.is_some(), &blob.name))
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+    );
+    headers.insert(
+        header::HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    // Blobs are content addressed, so the bytes behind a URL never change.
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=31536000, immutable"),
+    );
+    Ok(response)
+}
+
+/// The media type of a raster image, from its magic bytes. A file's name never
+/// decides how it is served.
+fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if bytes.starts_with(PNG) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
+}
+
+/// A Content-Disposition naming the blob. Names come from other nodes, so the
+/// quoted form keeps ASCII that cannot break the header and `filename*` carries
+/// the original.
+fn content_disposition(inline: bool, name: &str) -> String {
+    let disposition = if inline { "inline" } else { "attachment" };
+    let ascii: String = name
+        .chars()
+        .filter(|c| c.is_ascii() && !c.is_ascii_control() && !matches!(c, '"' | '\\' | '/' | ';'))
+        .collect();
+    let ascii = ascii.trim();
+    let (stem, extension) = match ascii.rsplit_once('.') {
+        Some((stem, extension)) => (stem, format!(".{extension}")),
+        None => (ascii, String::new()),
+    };
+    // A name whose stem keeps no ASCII letter or digit (an all-CJK name, say)
+    // would download as a hidden, nameless file. Name those "attachment" and
+    // let `filename*` carry the name the speaker gave.
+    let fallback = if stem.chars().any(|c| c.is_ascii_alphanumeric()) {
+        ascii.to_owned()
+    } else {
+        format!("attachment{extension}")
+    };
+    let mut encoded = String::new();
+    for byte in name.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(*byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    format!("{disposition}; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
 }
 
 async fn ws_operator_client(
@@ -1629,5 +1767,47 @@ mod tests {
         assert!(!try_queue(&sender, &queued, (), 1));
         assert!(!try_queue(&sender, &queued, (), MAX_QUEUE_BYTES + 1));
         assert_eq!(queued.load(Ordering::Acquire), MAX_QUEUE_BYTES);
+    }
+
+    #[test]
+    fn only_raster_magic_bytes_are_served_under_their_own_type() {
+        assert_eq!(sniff_image(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
+        assert_eq!(sniff_image(b"\xff\xd8\xff\xe0rest"), Some("image/jpeg"));
+        assert_eq!(sniff_image(b"GIF89a...."), Some("image/gif"));
+        assert_eq!(
+            sniff_image(b"RIFF\x24\x00\x00\x00WEBPVP8 "),
+            Some("image/webp")
+        );
+        // A truncated header, a RIFF container that is not WebP, and a document
+        // that can run script all download as opaque bytes instead.
+        assert_eq!(sniff_image(b"\x89PN"), None);
+        assert_eq!(sniff_image(b"RIFF\x24\x00\x00\x00WAVEfmt "), None);
+        assert_eq!(
+            sniff_image(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"),
+            None
+        );
+        assert_eq!(sniff_image(b""), None);
+    }
+
+    #[test]
+    fn a_blob_name_cannot_break_out_of_its_content_disposition() {
+        assert_eq!(
+            content_disposition(true, "shot.png"),
+            "inline; filename=\"shot.png\"; filename*=UTF-8''shot.png"
+        );
+        assert_eq!(
+            content_disposition(false, "notes.txt"),
+            "attachment; filename=\"notes.txt\"; filename*=UTF-8''notes.txt"
+        );
+        // Quotes, separators, and control characters leave the quoted form;
+        // filename* still carries the name the speaker gave.
+        assert_eq!(
+            content_disposition(false, "ev\"il\r\n; /etc/passwd"),
+            "attachment; filename=\"evil etcpasswd\"; filename*=UTF-8''ev%22il%0D%0A%3B%20%2Fetc%2Fpasswd"
+        );
+        assert_eq!(
+            content_disposition(true, "\u{753b}\u{50cf}.png"),
+            "inline; filename=\"attachment.png\"; filename*=UTF-8''%E7%94%BB%E5%83%8F.png"
+        );
     }
 }

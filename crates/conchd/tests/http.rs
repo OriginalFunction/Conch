@@ -557,6 +557,233 @@ async fn ws_client_accepts_blob_raw_frame_as_binary() {
 }
 
 #[tokio::test]
+async fn a_committed_attachment_is_served_by_digest_under_a_safe_content_type() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let token = Hash32::from_bytes([61; 32]);
+    let room = daemon
+        .create_ticket_with_token(
+            "attachments",
+            StakePolicy::default(),
+            FloorConfig::stick(30),
+            Some(token),
+        )
+        .unwrap()
+        .id;
+    let http = daemon.start_http(loopback()).await.unwrap();
+    let mut socket = session_socket(http.addr(), room, token).await;
+    socket
+        .send(json_message(&ClientRequest::Attach {
+            agent: AgentId::new("agent:browser").unwrap(),
+        }))
+        .await
+        .unwrap();
+    assert!(next_reply(&mut socket).await.ok);
+    socket
+        .send(json_message(&ClientRequest::RaiseHand { room }))
+        .await
+        .unwrap();
+    assert!(next_reply(&mut socket).await.ok);
+
+    let png = b"\x89PNG\r\n\x1a\nnot really an image, but the header is what decides".to_vec();
+    let notes = b"plain notes, whatever the name claims".to_vec();
+    let png_ref = put_blob_over(&mut socket, room, "before-390.png", &png).await;
+    // A file whose name promises an image but whose bytes are text must not be
+    // served as one.
+    let notes_ref = put_blob_over(&mut socket, room, "notes.png", &notes).await;
+    socket
+        .send(json_message(&ClientRequest::Speak {
+            room,
+            text: "here is the layout".into(),
+            request_id: "a1".repeat(16),
+        }))
+        .await
+        .unwrap();
+    let spoke = next_reply(&mut socket).await;
+    assert!(spoke.ok, "{spoke:?}");
+    socket
+        .send(json_message(&ClientRequest::Yield { room }))
+        .await
+        .unwrap();
+    assert!(next_reply(&mut socket).await.ok);
+
+    let bearer = format!("Bearer {token}");
+    let (status, body, headers) = http_get(
+        http.addr(),
+        &format!("/blobs/{room}/{}", png_ref.sha256),
+        Some(&bearer),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, png);
+    let lowered = headers.to_lowercase();
+    assert!(lowered.contains("content-type: image/png"), "{headers}");
+    assert!(
+        lowered.contains("content-disposition: inline; filename=\"before-390.png\""),
+        "{headers}"
+    );
+    assert!(
+        lowered.contains("x-content-type-options: nosniff"),
+        "{headers}"
+    );
+    assert!(lowered.contains("immutable"), "{headers}");
+
+    let (status, body, headers) = http_get(
+        http.addr(),
+        &format!("/blobs/{room}/{}", notes_ref.sha256),
+        Some(&bearer),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, notes);
+    let lowered = headers.to_lowercase();
+    assert!(
+        lowered.contains("content-type: application/octet-stream"),
+        "{headers}"
+    );
+    assert!(
+        lowered.contains("content-disposition: attachment"),
+        "{headers}"
+    );
+
+    // The room's own authorization guards the bytes, and a digest no committed
+    // scene attaches is not part of the history.
+    assert_eq!(
+        http_get(
+            http.addr(),
+            &format!("/blobs/{room}/{}", png_ref.sha256),
+            None
+        )
+        .await
+        .0,
+        401
+    );
+    assert_eq!(
+        http_get(
+            http.addr(),
+            &format!("/blobs/{room}/{}", Hash32::from_bytes([9; 32])),
+            Some(&bearer)
+        )
+        .await
+        .0,
+        404
+    );
+    assert_eq!(
+        http_get(
+            http.addr(),
+            &format!("/blobs/{room}/nonsense"),
+            Some(&bearer)
+        )
+        .await
+        .0,
+        400
+    );
+}
+
+#[tokio::test]
+async fn the_console_reads_an_attachment_through_its_own_operator_session() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    daemon
+        .configure_operator_origins(&["https://console.example".to_owned()])
+        .unwrap();
+    let token = Hash32::from_bytes([62; 32]);
+    let room = daemon
+        .create_ticket_with_token(
+            "console attachments",
+            StakePolicy::default(),
+            FloorConfig::stick(30),
+            Some(token),
+        )
+        .unwrap()
+        .id;
+    let http = daemon.start_http(loopback()).await.unwrap();
+    let mut socket = session_socket(http.addr(), room, token).await;
+    socket
+        .send(json_message(&ClientRequest::Attach {
+            agent: AgentId::new("agent:browser").unwrap(),
+        }))
+        .await
+        .unwrap();
+    assert!(next_reply(&mut socket).await.ok);
+    socket
+        .send(json_message(&ClientRequest::RaiseHand { room }))
+        .await
+        .unwrap();
+    assert!(next_reply(&mut socket).await.ok);
+    let gif = b"GIF89a\x01\x00\x01\x00\x00\x00\x00;".to_vec();
+    let blob = put_blob_over(&mut socket, room, "wave.gif", &gif).await;
+    socket
+        .send(json_message(&ClientRequest::Speak {
+            room,
+            text: "one frame".into(),
+            request_id: "b2".repeat(16),
+        }))
+        .await
+        .unwrap();
+    assert!(next_reply(&mut socket).await.ok);
+    socket
+        .send(json_message(&ClientRequest::Yield { room }))
+        .await
+        .unwrap();
+    assert!(next_reply(&mut socket).await.ok);
+
+    let path = format!("/operator/rooms/{room}/blobs/{}", blob.sha256);
+    // No operator cookie, no bytes.
+    let (status, _, _) = http_operator_request(http.addr(), "GET", &path, None, None, b"").await;
+    assert_eq!(status, 403);
+
+    let (status, cookie, _) = http_operator_request_via(
+        http.addr(),
+        "console.example",
+        "POST",
+        "/operator/session",
+        Some("https://console.example"),
+        None,
+        b"",
+    )
+    .await;
+    assert_eq!(status, 201);
+    let cookie_pair = cookie.unwrap().split(';').next().unwrap().to_owned();
+    let (status, _, body) = http_operator_request_via(
+        http.addr(),
+        "console.example",
+        "GET",
+        &path,
+        None,
+        Some(&cookie_pair),
+        b"",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, gif);
+}
+
+/// Attach one blob to the take this socket is holding open.
+async fn put_blob_over(
+    socket: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+    room: conch_core::types::RoomId,
+    name: &str,
+    bytes: &[u8],
+) -> conch_core::types::BlobRef {
+    socket
+        .send(json_message(&ClientRequest::PutBlob {
+            room,
+            name: name.to_owned(),
+            bytes: bytes.len() as u64,
+        }))
+        .await
+        .unwrap();
+    let mut frame = Vec::with_capacity(4 + bytes.len());
+    frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    frame.extend_from_slice(bytes);
+    socket.send(Message::Binary(frame.into())).await.unwrap();
+    let reply = next_reply(socket).await;
+    assert!(reply.ok, "{reply:?}");
+    serde_json::from_value(reply.data.unwrap()).unwrap()
+}
+
+#[tokio::test]
 async fn browser_session_room_scope_applies_to_binary_client_frames() {
     let data = TempDir::new().unwrap();
     let daemon = Daemon::open(data.path()).unwrap();

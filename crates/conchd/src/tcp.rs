@@ -6204,6 +6204,25 @@ impl Daemon {
             .collect())
     }
 
+    /// The committed `BlobRef` for a digest, or `None` when no committed scene
+    /// in the room attaches it. The file name lives on the ref, so a blob on
+    /// disk that nothing references is not servable.
+    pub fn blob_ref(&self, room: RoomId, sha256: Hash32) -> Result<Option<BlobRef>, DaemonError> {
+        self.with_replay(room, |replay| {
+            replay.history.iter().rev().find_map(|record| {
+                let Body::Speech { blobs, .. } = &record.scene.body else {
+                    return None;
+                };
+                blobs.iter().find(|blob| blob.sha256 == sha256).cloned()
+            })
+        })
+    }
+
+    /// The bytes of a blob this node has materialized for a room.
+    pub fn read_blob(&self, room: RoomId, sha256: Hash32) -> Result<Vec<u8>, DaemonError> {
+        Ok(self.store(room)?.read_blob(sha256)?)
+    }
+
     pub(crate) fn history_page_from(
         &self,
         room: RoomId,
