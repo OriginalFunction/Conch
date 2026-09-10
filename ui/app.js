@@ -921,6 +921,10 @@ function renderTakeText(container, text) {
   container.innerHTML = DOMPurify.sanitize(html, {
     USE_PROFILES: { html: true },
     FORBID_TAGS: ["style", "form", "button", "select", "textarea", "iframe", "object", "embed", "svg", "math"],
+    // A take never carries its own class, id, or style: those would let an
+    // author's markup impersonate console chrome, collide with the selectors
+    // that build a turn, or paint over the page.
+    FORBID_ATTR: ["class", "id", "style"],
     ADD_ATTR: ["target", "loading", "referrerpolicy"],
   });
 }
