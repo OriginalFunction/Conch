@@ -843,6 +843,10 @@ async fn ui_html_is_embedded_and_served_at_root_and_ui() {
     assert!(script.contains("BOTTOM_THRESHOLD_PX = 48"));
     assert!(script.contains("renderTakeText"));
     assert!(script.contains("renderAttachments"));
+    // The scene hash and clock belong to the meta row. Unscoped queries find the
+    // author's own <code>/<time> in a rendered take and overwrite it.
+    assert!(script.contains("\".take-meta time\""));
+    assert!(script.contains("\".take-meta code\""));
     assert!(html.contains("class=\"take-text\""));
     assert!(html.contains("class=\"take-files\""));
     assert!(html.contains("id=\"attach-input\""));

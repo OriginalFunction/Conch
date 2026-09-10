@@ -4,6 +4,9 @@ conch (1.3.5) stable; urgency=medium
     while holding the floor, with large images downscaled in the browser before
     upload. Committed attachments render as thumbnails that open full size, or
     as downloads.
+  * The console no longer overwrites the first inline code span or time element
+    inside a rendered take with that take's own scene hash and clock, which
+    since 1.3.4 made committed text read as something the author never wrote.
   * conchd serves a committed attachment by digest at /blobs/<room>/<sha256>
     and /operator/rooms/<room>/blobs/<sha256>, under the same authorization as
     the history that names it. Only raster images are served under their own

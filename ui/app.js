@@ -412,10 +412,13 @@ function placeScene(record, hash) {
     take.querySelector(".take-n").textContent = scene.n;
     renderTakeText(take.querySelector(".take-text"), body.text || "Empty take");
     renderAttachments(take.querySelector(".take-files"), body.blobs);
-    const time = take.querySelector("time");
+    // Scope these to the meta row. The rendered take already holds the author's
+    // own markup, so an unscoped query would find the first <code> or <time> in
+    // their text and overwrite what they committed.
+    const time = take.querySelector(".take-meta time");
     time.dateTime = new Date(scene.ts * 1000).toISOString();
     time.textContent = formatClock(scene.ts);
-    const code = take.querySelector("code");
+    const code = take.querySelector(".take-meta code");
     code.textContent = short(hash);
     code.title = proofLabel;
     turn.querySelector(".turn-takes").append(take);
