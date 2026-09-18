@@ -4878,7 +4878,10 @@ impl Daemon {
             .expect("floor lock is not poisoned")
             .intents()
             .filter(|intent| {
-                replay.chain.roster.contains(&intent.node)
+                // A tombstone is a withdrawal, not a queued hand: it must not
+                // appear to anyone reading the queue.
+                intent.kind != IntentKind::Drop
+                    && replay.chain.roster.contains(&intent.node)
                     && !replay.chain.consumed_intents.contains(&intent.id)
                     && now < intent.exp
             })

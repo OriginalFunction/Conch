@@ -1754,6 +1754,13 @@ async fn a_withdrawn_hand_does_not_take_the_floor() {
         serde_json::json!(true)
     );
 
+    // A withdrawn hand leaves the queue everyone reads, not just the grant path.
+    let status = request(&mut first, ClientRequest::Status { room: Some(room) }).await;
+    assert!(status.ok, "{status:?}");
+    let queue = status.data.unwrap()["queue"].to_string();
+    assert!(!queue.contains("agent:first"), "{queue}");
+    assert!(queue.contains("agent:second"), "{queue}");
+
     // The floor skips the withdrawn hand and reaches the mouth still queued.
     assert!(request(&mut holder, ClientRequest::Yield { room }).await.ok);
     let granted = request(
