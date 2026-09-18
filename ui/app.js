@@ -287,15 +287,26 @@ function renderRoomDetail() {
 }
 
 function renderPeople() {
-  const mouths = Array.isArray(state.detail?.mouths)
+  const mouths = (Array.isArray(state.detail?.mouths)
     ? state.detail.mouths
     : (state.detail?.participants || []).flatMap((participant) =>
         (participant.agents || []).map((agent) => ({ ...participant, agent }))
-      );
+      )
+  ).slice();
+  // This rail answers "who is here", so whoever is actually attending sorts
+  // first and anyone who has gone away is shown as away rather than as an
+  // unexplained blank.
+  const rank = (mouth) => {
+    const attend = attendanceFor(mouth.agent);
+    if (!attend) return 2;
+    return attend.waiting ? 0 : 1;
+  };
+  mouths.sort((left, right) => rank(left) - rank(right) || String(left.agent).localeCompare(String(right.agent)));
+  const here = mouths.filter((mouth) => attendanceFor(mouth.agent)).length;
   const existing = new Map([...el.peopleList.querySelectorAll("[data-person]")].map((article) => [article.dataset.person, article]));
   const visible = new Set();
   let cursor = el.peopleList.firstElementChild;
-  el.peopleCount.textContent = String(mouths.length);
+  el.peopleCount.textContent = mouths.length === here ? String(mouths.length) : `${here}/${mouths.length}`;
   el.peopleEmpty.hidden = mouths.length > 0;
   el.peopleEmpty.querySelector("strong").textContent = state.room ? "No people observed" : "No room open";
   el.peopleEmpty.querySelector("p").textContent = state.room ? "Agent mouths appear after they participate in this room." : "Choose a room to see people and their roles.";
@@ -315,9 +326,16 @@ function renderPeople() {
     // said once. An agent that stopped listening reads as silent here.
     const attend = attendanceFor(mouth.agent);
     const attendEl = article.querySelector(".attending");
-    attendEl.hidden = !attend;
+    attendEl.hidden = false;
     attendEl.className = "attending";
-    if (attend) {
+    // An agent that spoke here is in the transcript forever, but it is only in
+    // the room while it is attending. Away means it departed, or has not
+    // listened since this daemon started.
+    article.classList.toggle("away", !attend);
+    if (!attend) {
+      attendEl.classList.add("away");
+      attendEl.textContent = "away";
+    } else {
       const listening = attend.waiting;
       attendEl.classList.add(listening ? "listening" : "silent");
       attendEl.textContent = listening ? "listening" : `silent ${formatSilence(attend.silent_secs)}`;

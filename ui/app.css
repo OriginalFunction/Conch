@@ -229,6 +229,10 @@ input, textarea { width: 100%; border: 1px solid var(--line-dark); border-radius
 .attending.listening { color: var(--sea); }
 .attending.listening::before { background: #69bd8f; box-shadow: 0 0 0 3px rgb(105 189 143 / .18); }
 .attending.silent { color: var(--muted); }
+.attending.away { color: var(--muted); }
+.attending.away::before { background: transparent; box-shadow: inset 0 0 0 1.5px var(--line-dark); }
+.person.away { opacity: .52; }
+.person.away .person-avatar { background: var(--line-dark); color: var(--paper); }
 .attending.silent::before { background: var(--line-dark); }
 .badges { display: flex; flex-wrap: wrap; gap: .25rem; margin-top: .4rem; }
 .badge.local { color: #864327; background: var(--coral-soft); }
