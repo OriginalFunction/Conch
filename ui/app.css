@@ -229,6 +229,12 @@ input, textarea { width: 100%; border: 1px solid var(--line-dark); border-radius
 .attending.listening { color: var(--sea); }
 .attending.listening::before { background: #69bd8f; box-shadow: 0 0 0 3px rgb(105 189 143 / .18); }
 .attending.silent { color: var(--muted); }
+.danger-button { min-height: 30px; padding: .3rem .7rem; border-radius: 999px; color: white; background: var(--coral-dark); font-size: .68rem; font-weight: 800; letter-spacing: .04em; }
+.danger-button:hover:not(:disabled) { filter: brightness(1.08); }
+.dialog-note { color: var(--muted); font-size: .8rem; }
+#delete-dialog .ticket-success { text-align: left; }
+#delete-dialog h2 { margin-bottom: .6rem; }
+#delete-dialog p { margin: 0 0 .7rem; }
 .away-group { margin: .1rem .35rem .4rem; }
 .away-group summary { list-style: none; cursor: pointer; padding: .4rem .3rem; color: var(--muted); font-size: .68rem; font-weight: 700; letter-spacing: .09em; text-transform: uppercase; }
 .away-group summary::-webkit-details-marker { display: none; }

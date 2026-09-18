@@ -44,6 +44,7 @@ const el = Object.fromEntries([
   "room-state", "room-state-title", "room-state-copy", "reauthorize-room", "room-state-back",
   "staged-files", "attach-input", "attach-button", "image-dialog", "image-full", "image-name", "image-download",
   "people-away", "away-count", "away-list",
+  "delete-room-button", "delete-dialog", "delete-room-name", "delete-room-scale", "delete-room-replicas", "delete-error", "confirm-delete",
 ].map((id) => [camel(id), document.getElementById(id)]));
 
 class RoomHttpError extends Error {
@@ -268,6 +269,9 @@ function renderRoomDetail() {
   el.roomRole.textContent = room.role;
   el.roomRole.className = `role-badge ${room.role}`;
   el.headNumber.textContent = room.head_n ?? "—";
+  // Only the local operator console can delete a replica; a ticket holder
+  // reaching this room over a browser session cannot.
+  el.deleteRoomButton.hidden = !state.operator;
   el.floorMode.textContent = state.detail.floor?.mode || "—";
   el.localNode.textContent = short(state.node);
   const previousHolder = state.floorHolderKey;
@@ -692,6 +696,47 @@ async function yieldFloor() {
   }
 }
 
+/// Deleting is only ever this node's copy, so the dialog says how many other
+/// nodes keep one rather than implying the room is gone everywhere.
+function openDeleteDialog() {
+  if (!state.room || !state.operator) return;
+  const detail = state.detail?.room;
+  const roster = Number(detail?.roster_size ?? 1);
+  const head = detail?.head_n;
+  el.deleteError.textContent = "";
+  el.deleteRoomName.textContent = detail?.name || short(state.room);
+  const scenes = head === null || head === undefined ? null : Number(head) + 1;
+  el.deleteRoomScale.textContent =
+    scenes === null ? "" : `${scenes} committed ${scenes === 1 ? "scene" : "scenes"} will be erased from this node.`;
+  el.deleteRoomReplicas.textContent = roster > 1
+    ? `${roster - 1} other staking ${roster - 1 === 1 ? "node keeps its own full replica" : "nodes keep their own full replicas"}, so the room survives there and can be rejoined with its ticket.`
+    : "No other node has joined, so this deletes the room outright.";
+  el.deleteDialog.showModal();
+}
+
+async function deleteRoom() {
+  if (!state.room) return;
+  const room = state.room;
+  el.confirmDelete.disabled = true;
+  el.deleteError.textContent = "";
+  try {
+    const response = await operatorFetch(`/rooms/${room}`, { method: "DELETE" });
+    if (!response.ok) {
+      const result = await responseJson(response);
+      throw new Error(result.error || `Delete failed (${response.status}).`);
+    }
+    el.deleteDialog.close();
+    state.detail = null;
+    await loadCatalog();
+    showHome();
+    showToast("Room deleted.");
+  } catch (error) {
+    el.deleteError.textContent = error.message;
+  } finally {
+    el.confirmDelete.disabled = false;
+  }
+}
+
 async function createRoom(event) {
   event.preventDefault();
   if (!state.operator) return;
@@ -838,6 +883,8 @@ function bindEvents() {
   el.takeButton.addEventListener("click", takeFloor);
   el.wrapButton.addEventListener("click", wrapAndYield);
   el.yieldButton.addEventListener("click", yieldFloor);
+  el.deleteRoomButton.addEventListener("click", openDeleteDialog);
+  el.confirmDelete.addEventListener("click", deleteRoom);
   el.attachButton.addEventListener("click", () => el.attachInput.click());
   el.attachInput.addEventListener("change", () => {
     stageFiles(el.attachInput.files);

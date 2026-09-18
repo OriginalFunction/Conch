@@ -3374,6 +3374,7 @@ impl Daemon {
             ClientRequest::RaiseHand { room } => self.client_raise_hand(agent, room).await,
             ClientRequest::Withdraw { room } => self.client_withdraw(agent, room).await,
             ClientRequest::Depart { room } => self.client_depart(agent, room).await,
+            ClientRequest::DeleteRoom { room } => self.client_delete_room(room).await,
             ClientRequest::Grant { room, to } => self.client_grant(agent, room, to).await,
             ClientRequest::Yank { room } => self.client_yank(agent, room).await,
             ClientRequest::Breakout {
@@ -4265,6 +4266,94 @@ impl Daemon {
             "departed": listed,
             "withdrew_hand": withdrawn["withdrawn"],
         }))
+    }
+
+    /// Delete this node's replica of a room. Public so the operator console can
+    /// call it; deliberately absent from the MCP surface, which agents drive.
+    pub async fn delete_room(&self, room: RoomId) -> Result<Value, DaemonError> {
+        self.client_delete_room(room).await
+    }
+
+    /// Drop this node's replica of a room: its chain, its attachments, and
+    /// everything this daemon remembers about it. Every staking node keeps a
+    /// full replica, so this deletes the room outright only when no other node
+    /// joined it; elsewhere it is this node forgetting its own copy.
+    async fn client_delete_room(&self, room: RoomId) -> Result<Value, DaemonError> {
+        let replay = self.replay(room)?;
+        if replay.chain.live_grant.is_some() {
+            return Err(DaemonError::FloorHeld);
+        }
+        let name = self
+            .replay(room)?
+            .history
+            .first()
+            .and_then(|record| match &record.scene.body {
+                Body::Genesis { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let path = self.room_path(room);
+        // Stop serving the room before its bytes go, so nothing can reopen it
+        // from a registry entry while the directory is being removed.
+        self.inner
+            .rooms
+            .write()
+            .expect("room registry lock is not poisoned")
+            .remove(&room);
+        self.inner
+            .replays
+            .write()
+            .expect("replay registry lock is not poisoned")
+            .remove(&room);
+        self.inner
+            .floors
+            .write()
+            .expect("floor registry lock is not poisoned")
+            .remove(&room);
+        self.inner
+            .joins
+            .write()
+            .expect("join registry lock is not poisoned")
+            .remove(&room);
+        self.inner
+            .room_agents
+            .write()
+            .expect("room-agent registry lock is not poisoned")
+            .remove(&room);
+        self.inner
+            .attendance
+            .write()
+            .expect("attendance registry lock is not poisoned")
+            .retain(|(listening_room, _), _| *listening_room != room);
+        self.inner
+            .peers
+            .write()
+            .expect("peer registry lock is not poisoned")
+            .remove(&room);
+        self.inner
+            .last_seen
+            .write()
+            .expect("last-seen registry lock is not poisoned")
+            .remove(&room);
+        self.inner
+            .declarations
+            .write()
+            .expect("declaration registry lock is not poisoned")
+            .remove(&room);
+        self.inner
+            .syncing
+            .write()
+            .expect("sync registry lock is not poisoned")
+            .remove(&room);
+        task::spawn_blocking(move || {
+            if path.exists() {
+                fs::remove_dir_all(&path)
+            } else {
+                Ok(())
+            }
+        })
+        .await??;
+        Ok(json!({ "deleted": true, "room": room, "name": name }))
     }
 
     async fn client_leave(
@@ -6991,6 +7080,7 @@ fn request_room(request: &ClientRequest) -> Option<RoomId> {
         | ClientRequest::RaiseHand { room }
         | ClientRequest::Withdraw { room }
         | ClientRequest::Depart { room }
+        | ClientRequest::DeleteRoom { room }
         | ClientRequest::Grant { room, .. }
         | ClientRequest::Yank { room }
         | ClientRequest::Breakout { room, .. }

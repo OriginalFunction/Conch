@@ -1931,3 +1931,69 @@ async fn attendance_shows_who_is_listening_and_who_only_spoke() {
     let status = request(&mut probe, ClientRequest::Status { room: Some(room) }).await;
     assert!(attending(&status).is_empty(), "{:?}", attending(&status));
 }
+
+#[tokio::test]
+async fn deleting_a_room_removes_its_replica_from_this_node() {
+    let _network_test = network_test_guard().await;
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let ticket = daemon
+        .create_ticket("disposable", StakePolicy::default(), FloorConfig::stick(30))
+        .unwrap();
+    let room = ticket.id;
+    let server = daemon.start(loopback()).await.unwrap();
+    let room_dir = data.path().join("rooms").join(room.to_string());
+    assert!(room_dir.is_dir());
+
+    // A room nobody is speaking in deletes, chain and attachments together.
+    let mut client = attach(server.addr(), "human:operator").await;
+    let deleted = request(&mut client, ClientRequest::DeleteRoom { room }).await;
+    assert!(deleted.ok, "{deleted:?}");
+    let data_reply = deleted.data.unwrap();
+    assert_eq!(data_reply["deleted"], serde_json::json!(true));
+    assert_eq!(data_reply["name"], serde_json::json!("disposable"));
+    assert!(!room_dir.exists(), "the replica's bytes are gone");
+
+    // The daemon stops serving it entirely.
+    let gone = request(&mut client, ClientRequest::Status { room: Some(room) }).await;
+    assert!(!gone.ok, "{gone:?}");
+    assert_eq!(gone.error.unwrap().code, "unknown_room");
+}
+
+#[tokio::test]
+async fn a_room_cannot_be_deleted_while_someone_holds_its_floor() {
+    let _network_test = network_test_guard().await;
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let ticket = daemon
+        .create_ticket("in use", StakePolicy::default(), FloorConfig::stick(30))
+        .unwrap();
+    let room = ticket.id;
+    let server = daemon.start(loopback()).await.unwrap();
+
+    let mut holder = attach(server.addr(), "agent:holder").await;
+    assert!(
+        request(&mut holder, ClientRequest::RaiseHand { room })
+            .await
+            .ok
+    );
+    let held = request(
+        &mut holder,
+        ClientRequest::WaitForFloor {
+            room,
+            timeout_secs: Some(10),
+        },
+    )
+    .await;
+    assert!(held.ok, "{held:?}");
+
+    let refused = request(&mut holder, ClientRequest::DeleteRoom { room }).await;
+    assert!(!refused.ok, "{refused:?}");
+    assert_eq!(refused.error.unwrap().code, "floor_held");
+    assert!(data.path().join("rooms").join(room.to_string()).is_dir());
+
+    // Once the floor is free it deletes.
+    assert!(request(&mut holder, ClientRequest::Yield { room }).await.ok);
+    let deleted = request(&mut holder, ClientRequest::DeleteRoom { room }).await;
+    assert!(deleted.ok, "{deleted:?}");
+}

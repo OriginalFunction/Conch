@@ -46,6 +46,9 @@ pub enum ClientRequest {
     Depart {
         room: RoomId,
     },
+    DeleteRoom {
+        room: RoomId,
+    },
     Grant {
         room: RoomId,
         to: Mouth,

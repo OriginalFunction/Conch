@@ -363,7 +363,10 @@ fn router(daemon: Daemon, secure: bool, operator: bool) -> Router {
             get(operator_rooms).post(operator_create_room),
         )
         .route("/operator/rooms/join", post(operator_join_room))
-        .route("/operator/rooms/{id}", get(operator_room))
+        .route(
+            "/operator/rooms/{id}",
+            get(operator_room).delete(operator_delete_room),
+        )
         .route("/operator/rooms/{id}/history", get(operator_room_history))
         .route(
             "/operator/rooms/{id}/blobs/{sha256}",
@@ -594,6 +597,21 @@ async fn operator_room_history(
     Ok(operator_no_store(
         Json(state.daemon.history_page_from(room, query.from)?).into_response(),
     ))
+}
+
+/// Delete this node's replica of a room. State changing, so the Origin must
+/// agree with Host, exactly as minting a session does.
+async fn operator_delete_room(
+    State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<HttpPeer>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, HttpError> {
+    require_operator_endpoint(&state, peer)?;
+    authorize_operator(&state, &headers, true)?;
+    let room = parse_room(&id)?;
+    let deleted = state.daemon.delete_room(room).await?;
+    Ok(operator_no_store(Json(deleted).into_response()))
 }
 
 /// A committed attachment, for the console's own origin. Authorized like the

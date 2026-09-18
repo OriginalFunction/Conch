@@ -90,6 +90,7 @@
               <div><span>Wrapped head</span><strong id="head-number">—</strong></div>
               <div><span>Floor mode</span><strong id="floor-mode">—</strong></div>
               <div><span>Floor</span><strong id="floor-holder">—</strong></div>
+              <button id="delete-room-button" class="danger-button" type="button" hidden>Delete room</button>
             </div>
           </header>
 
@@ -208,6 +209,15 @@
     <template id="person-template">
       <article class="person"><div class="person-avatar"><span></span><i></i></div><div class="person-main"><strong></strong><span class="agent-empty" hidden>No attached agents observed</span><code></code><span class="attending" hidden></span><div class="badges"></div></div></article>
     </template>
+    <dialog id="delete-dialog">
+      <div class="ticket-success">
+        <p class="eyebrow">This cannot be undone</p><h2>Delete <span id="delete-room-name"></span>?</h2>
+        <p>This removes this node's copy of the room: every committed take, its attachments, and the ticket it was joined with. <strong id="delete-room-scale"></strong></p>
+        <p id="delete-room-replicas" class="dialog-note"></p>
+        <p id="delete-error" class="error" role="alert"></p>
+        <div class="ticket-actions"><button id="confirm-delete" class="danger-button">Delete room</button><button type="button" class="secondary" data-close>Cancel</button></div>
+      </div>
+    </dialog>
     <dialog id="image-dialog" class="image-dialog">
       <div class="dialog-heading"><p id="image-name" class="eyebrow"></p><button type="button" class="close-button" data-close aria-label="Close">×</button></div>
       <img id="image-full" alt="">
