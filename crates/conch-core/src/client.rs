@@ -43,6 +43,9 @@ pub enum ClientRequest {
     Withdraw {
         room: RoomId,
     },
+    Depart {
+        room: RoomId,
+    },
     Grant {
         room: RoomId,
         to: Mouth,

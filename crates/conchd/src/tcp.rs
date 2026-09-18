@@ -104,6 +104,12 @@ pub enum DaemonError {
     JoinUnavailable,
     #[error("room mutation requires an available local leader")]
     MutationUnavailable,
+    #[error("the last staking node cannot leave; a room must keep at least one staker")]
+    LastStaker,
+    #[error("the floor is held; yield it first, or pass --vacate when the take is yours")]
+    FloorHeld,
+    #[error("yield the floor before departing")]
+    DepartWhileHolding,
     #[error("WebSocket transport failed: {0}")]
     WebSocket(String),
     #[error("request did not come from the configured moderator mouth")]
@@ -3346,6 +3352,7 @@ impl Daemon {
             ClientRequest::Yield { room } => self.client_yield(agent, room).await,
             ClientRequest::RaiseHand { room } => self.client_raise_hand(agent, room).await,
             ClientRequest::Withdraw { room } => self.client_withdraw(agent, room).await,
+            ClientRequest::Depart { room } => self.client_depart(agent, room).await,
             ClientRequest::Grant { room, to } => self.client_grant(agent, room, to).await,
             ClientRequest::Yank { room } => self.client_yank(agent, room).await,
             ClientRequest::Breakout {
@@ -4199,6 +4206,40 @@ impl Daemon {
         Ok(serde_json::to_value(blob)?)
     }
 
+    /// Drop this mouth from the room's participant list. Unlike `leave` this
+    /// touches no roster and no chain: an agent that is finished stops being
+    /// listed without evicting the node it shares with every other agent.
+    async fn client_depart(&self, agent: AgentId, room: RoomId) -> Result<Value, DaemonError> {
+        let node = self.node_id();
+        let replay = self.replay(room)?;
+        let mouth = Mouth {
+            agent: agent.clone(),
+            node,
+        };
+        if replay
+            .chain
+            .live_grant
+            .as_ref()
+            .is_some_and(|grant| grant.to == mouth)
+        {
+            return Err(DaemonError::DepartWhileHolding);
+        }
+        // A departing mouth must not leave a hand up behind it.
+        let withdrawn = self.client_withdraw(agent.clone(), room).await?;
+        let mut registry = self
+            .inner
+            .room_agents
+            .write()
+            .expect("room-agent registry lock is not poisoned");
+        let listed = registry
+            .get_mut(&room)
+            .is_some_and(|agents| agents.remove(&agent));
+        Ok(json!({
+            "departed": listed,
+            "withdrew_hand": withdrawn["withdrawn"],
+        }))
+    }
+
     async fn client_leave(
         &self,
         agent: AgentId,
@@ -4246,7 +4287,7 @@ impl Daemon {
             if let Some(grant) = replay.chain.live_grant.clone() {
                 let mouth = Mouth { agent, node };
                 if !vacate || grant.to != mouth {
-                    return Err(DaemonError::MutationUnavailable);
+                    return Err(DaemonError::FloorHeld);
                 }
                 let (frozen, take) = {
                     let mut engine = floor.engine.lock().expect("floor lock is not poisoned");
@@ -4270,8 +4311,12 @@ impl Daemon {
             }
             let mut next_roster = replay.chain.roster.clone();
             next_roster.retain(|member| *member != node);
+            // `leave` removes this node from the roster, evicting every mouth on
+            // it. The last staker cannot go: a room with no stakers can never
+            // certify another scene. A single agent that is merely done should
+            // `depart` instead, which touches no roster.
             if next_roster.is_empty() {
-                return Err(DaemonError::MutationUnavailable);
+                return Err(DaemonError::LastStaker);
             }
             let record = self
                 .commit_singleton_body(
@@ -6840,6 +6885,10 @@ fn client_error_reply(error: DaemonError) -> ClientReply {
         | DaemonError::MutationUnavailable) => {
             ClientReply::failure("unavailable", error.to_string())
         }
+        error @ DaemonError::LastStaker => ClientReply::failure("last_staker", error.to_string()),
+        error @ (DaemonError::FloorHeld | DaemonError::DepartWhileHolding) => {
+            ClientReply::failure("floor_held", error.to_string())
+        }
         error @ DaemonError::Store(StoreError::SickHole(_)) => {
             ClientReply::failure("sick", error.to_string())
         }
@@ -6861,6 +6910,7 @@ fn request_room(request: &ClientRequest) -> Option<RoomId> {
         | ClientRequest::Yield { room }
         | ClientRequest::RaiseHand { room }
         | ClientRequest::Withdraw { room }
+        | ClientRequest::Depart { room }
         | ClientRequest::Grant { room, .. }
         | ClientRequest::Yank { room }
         | ClientRequest::Breakout { room, .. }

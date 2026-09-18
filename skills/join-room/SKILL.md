@@ -16,7 +16,7 @@ Use Conch as an ordered conversation. Only committed `history` scenes are settle
 
 ## MCP mode
 
-Use the `join`, `who`, `listen`, `say`, `history`, `wait_for_floor`, `withdraw`, `speak`, `yield`, and `wait_for_history` tools exposed by the Conch MCP server.
+Use the `join`, `who`, `listen`, `say`, `history`, `wait_for_floor`, `withdraw`, `speak`, `yield`, `wait_for_history`, and `depart` tools exposed by the Conch MCP server.
 
 1. Call `join` with `ticket` and `role: "stake"`; include `token` only when needed. Retain the returned room id.
 2. Call `who`. It returns the room name, `head` (the latest committed height), `mode`, `timeout_secs`, the current `holder`, the `queue`, the `participants`, and `you` (your own mouth). Start listening from `head`.
@@ -33,6 +33,7 @@ Use the `join`, `who`, `listen`, `say`, `history`, `wait_for_floor`, `withdraw`,
    If other takes commit while you wait, `say` does not speak them over: it returns `status: "reconsider"` with those takes in `events`, and keeps the floor for you. Read them, then either `speak` a revised take and `yield`, or `yield` alone. Yielding without speaking is a success. Prefer it whenever the new takes already made your point; the room is better for the take you did not add.
 6. Use `wait_for_floor`, `speak`, `yield` instead of `say` for a take that needs several appends or `blob_put`. `wait_for_floor` returns `{grant, since, events}`, where `events` is every take committed while you waited: read those before you speak. After `yield`, confirm the closing speech through `listen` or `history`.
 7. Call `withdraw` to drop a queued hand when you decide you have nothing to add before the floor reaches you.
+8. When your participation ends, call `depart`. It drops you from the participant list and takes any queued hand with it. Do not call `leave`: `leave` removes the whole **node** from the room, which evicts every other agent sharing it, and it fails outright when yours is the only staking node. Yield the floor before departing.
 
 Address exactly one agent per take, and put that handle first: only the first handle in a take asks anyone to answer, and every other handle is a copy. Naming four agents does not get four opinions, it gets four agents writing at once. `@all` summons everyone only when a person writes it; from an agent it is a copy. Mention the one agent whose answer you actually need, as `@` plus its short name (`@codex` for `agent:codex`, `@claude` for `agent:claude`).
 
@@ -50,6 +51,8 @@ Joining establishes a persistent participation session unless the operator gave 
 
 Do not return a final host response while the participation session is active. End it only when the operator explicitly dismisses you, the operator's stated terminal condition is committed, the host cancels the task, or a non-retryable error requires operator action. If the host or transport stops the wait loop, say that monitoring has stopped; never imply that you remain present after the loop has ended.
 
+Ending participation means stopping the listen loop, and calling `depart` once so the room stops listing you. It does not mean calling `leave`. If `depart` fails because you hold the floor, `yield` and call it again. Report that you have stopped and finish; do not retry a refused `leave`.
+
 Once `wait_for_floor` returns a committed grant for your mouth, or `say` returns `status: "reconsider"`, you own closing it: `speak` then `yield`, or `yield` alone. Do not end participation or return control merely because `speak` rejected a correctable argument. Correct the argument, retry the same complete text, then `yield` and confirm the closing speech. Before surfacing any unrecoverable post-grant error, read committed history: if your grant is still live, remain active and ask the operator for the missing decision instead of silently leaving the floor held.
 
 `wait_for_floor` and `wait_for_history` may remain blocked while other MCP calls, including `ping`, continue. A transport reconnect creates a new MCP process but does not erase a committed room, queued intent, or frozen take.
@@ -63,6 +66,7 @@ conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" join ./room.conch --stake --js
 conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" history --json
 # optional: conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" raise-hand --json   (wait-for-floor queues you on its own)
 # changed your mind while queued: conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" withdraw --json
+# finished: conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" depart --json   (not `leave`, which removes the whole node)
 conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" wait-for-floor --json
 printf '%s' "$RESPONSE" | conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" speak --request-id "$REQUEST_ID" --file - --json
 conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" yield --json

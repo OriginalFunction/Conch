@@ -367,6 +367,7 @@ impl Server {
                 )
             }
             "withdraw" => (ClientRequest::Withdraw { room: room()? }, None),
+            "depart" => (ClientRequest::Depart { room: room()? }, None),
             "leave" => (
                 ClientRequest::Leave {
                     room: room()?,
@@ -1127,6 +1128,11 @@ fn tool_definitions() -> Vec<Value> {
             ),
         ),
         tool(
+            "depart",
+            "Leave the participant list when your work in the room is done. Use this, not leave: leave removes this whole node and fails when it is the only staker",
+            object_schema(room_properties(json!({})), &[]),
+        ),
+        tool(
             "withdraw",
             "Drop this agent's queued hand; use it when another take already said what you were going to say",
             object_schema(room_properties(json!({})), &[]),
@@ -1143,7 +1149,7 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "leave",
-            "Leave a room",
+            "Remove this NODE from a room, evicting every mouth on it; an agent that is merely finished wants depart instead",
             object_schema(
                 room_properties(json!({
                     "vacate": { "type": "boolean" }

@@ -1790,3 +1790,84 @@ async fn a_withdrawn_hand_does_not_take_the_floor() {
     assert_eq!(racing.data.unwrap()["withdrawn"], serde_json::json!(false));
     assert!(request(&mut second, ClientRequest::Yield { room }).await.ok);
 }
+
+#[tokio::test]
+async fn an_agent_departs_without_evicting_the_node_it_shares() {
+    let _network_test = network_test_guard().await;
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let ticket = daemon
+        .create_ticket("departures", StakePolicy::default(), FloorConfig::stick(30))
+        .unwrap();
+    let room = ticket.id;
+    let server = daemon.start(loopback()).await.unwrap();
+
+    let mut leaver = attach(server.addr(), "agent:leaver").await;
+    let mut stayer = attach(server.addr(), "agent:stayer").await;
+    assert!(
+        request(&mut stayer, ClientRequest::Status { room: Some(room) })
+            .await
+            .ok
+    );
+
+    // `leave` would take the whole node with it, and this is the only staker.
+    // The refusal has to say that, not blame leader election.
+    let refused = request(
+        &mut leaver,
+        ClientRequest::Leave {
+            room,
+            vacate: false,
+        },
+    )
+    .await;
+    assert!(!refused.ok, "{refused:?}");
+    let error = refused.error.unwrap();
+    assert_eq!(error.code, "last_staker");
+    assert!(error.message.contains("last staking node"), "{error:?}");
+
+    // Departing drops just this mouth, and the room keeps working for the rest.
+    let departed = request(&mut leaver, ClientRequest::Depart { room }).await;
+    assert!(departed.ok, "{departed:?}");
+    assert_eq!(departed.data.unwrap()["departed"], serde_json::json!(true));
+
+    let status = request(&mut stayer, ClientRequest::Status { room: Some(room) }).await;
+    assert!(status.ok, "{status:?}");
+    let participants = status.data.unwrap()["participants"].to_string();
+    assert!(!participants.contains("agent:leaver"), "{participants}");
+    assert!(participants.contains("agent:stayer"), "{participants}");
+
+    // With the floor taken by someone else, a second hand really queues, and a
+    // departing mouth takes that hand with it.
+    assert!(
+        request(&mut stayer, ClientRequest::RaiseHand { room })
+            .await
+            .ok
+    );
+    let held = request(
+        &mut stayer,
+        ClientRequest::WaitForFloor {
+            room,
+            timeout_secs: Some(10),
+        },
+    )
+    .await;
+    assert!(held.ok, "{held:?}");
+    assert!(
+        request(&mut leaver, ClientRequest::RaiseHand { room })
+            .await
+            .ok
+    );
+    let again = request(&mut leaver, ClientRequest::Depart { room }).await;
+    assert!(again.ok, "{again:?}");
+    assert_eq!(
+        again.data.unwrap()["withdrew_hand"],
+        serde_json::json!(true)
+    );
+
+    // Holding the floor is the one time departing is refused, and it says so.
+    let holding = request(&mut stayer, ClientRequest::Depart { room }).await;
+    assert!(!holding.ok, "{holding:?}");
+    let error = holding.error.unwrap();
+    assert_eq!(error.code, "floor_held");
+    assert!(error.message.contains("yield the floor"), "{error:?}");
+}

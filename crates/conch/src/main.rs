@@ -1396,6 +1396,9 @@ impl Arguments {
             "withdraw" => ready(ClientRequest::Withdraw {
                 room: resolve_room()?,
             }),
+            "depart" => ready(ClientRequest::Depart {
+                room: resolve_room()?,
+            }),
             "grant" => {
                 let mut to_agent = None;
                 let mut to_node = None;
@@ -1726,7 +1729,7 @@ fn print_help() {
            -h, --help            Print help\n\n\
          Commands:\n\
            say, tail, rooms, use, create, join, status, history\n\
-           wait-for-floor, speak, yield, raise-hand, withdraw, grant, yank, config, breakout, blob, leave\n\
+           wait-for-floor, speak, yield, raise-hand, withdraw, grant, yank, config, breakout, blob, depart, leave\n\
            mcp, setup, up, down, doctor\n\n\
          Run `conch help <command>` for command-specific usage.",
         env!("CARGO_PKG_VERSION")
@@ -1762,6 +1765,9 @@ fn command_usage(command: &str) -> Option<&'static str> {
              ROOM is a room id, a unique id prefix, or an exact name. Sets the current room.",
         "raise-hand" => "conch raise-hand",
         "withdraw" => "conch withdraw",
+        "depart" => "conch depart\n\
+             Drops this mouth from the room's participant list. Unlike leave it does not\n\
+             remove this node from the roster, so other agents on it stay in the room.",
         "wait-for-floor" => "conch wait-for-floor [--timeout SECONDS]",
         "say" => "conch say TEXT | conch say --file PATH [--timeout SECS]\n\
              Takes one turn: waits for the floor (default 300 s), speaks, yields, and prints the committed scene.",
@@ -2293,6 +2299,7 @@ mod tests {
         "use",
         "raise-hand",
         "withdraw",
+        "depart",
         "wait-for-floor",
         "say",
         "speak",
