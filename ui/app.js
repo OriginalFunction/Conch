@@ -43,6 +43,7 @@ const el = Object.fromEntries([
   "ticket-source", "join-error", "ticket-dialog", "download-ticket", "copy-magnet", "finish-ticket", "toast",
   "room-state", "room-state-title", "room-state-copy", "reauthorize-room", "room-state-back",
   "staged-files", "attach-input", "attach-button", "image-dialog", "image-full", "image-name", "image-download",
+  "people-away", "away-count", "away-list",
 ].map((id) => [camel(id), document.getElementById(id)]));
 
 class RoomHttpError extends Error {
@@ -302,7 +303,12 @@ function renderPeople() {
     return attend.waiting ? 0 : 1;
   };
   mouths.sort((left, right) => rank(left) - rank(right) || String(left.agent).localeCompare(String(right.agent)));
-  const here = mouths.filter((mouth) => attendanceFor(mouth.agent)).length;
+  // Anyone who has gone stays on the record but collapses out of the way, so
+  // the rail reads as the people you can actually reach.
+  const away = mouths.filter((mouth) => !attendanceFor(mouth.agent));
+  renderAway(away);
+  const attending = mouths.filter((mouth) => attendanceFor(mouth.agent));
+  const here = attending.length;
   const existing = new Map([...el.peopleList.querySelectorAll("[data-person]")].map((article) => [article.dataset.person, article]));
   const visible = new Set();
   let cursor = el.peopleList.firstElementChild;
@@ -310,7 +316,7 @@ function renderPeople() {
   el.peopleEmpty.hidden = mouths.length > 0;
   el.peopleEmpty.querySelector("strong").textContent = state.room ? "No people observed" : "No room open";
   el.peopleEmpty.querySelector("p").textContent = state.room ? "Agent mouths appear after they participate in this room." : "Choose a room to see people and their roles.";
-  for (const mouth of mouths) {
+  for (const mouth of attending) {
     const key = `${mouth.node}:${mouth.agent}`;
     visible.add(key);
     let article = existing.get(key);
@@ -331,15 +337,9 @@ function renderPeople() {
     // An agent that spoke here is in the transcript forever, but it is only in
     // the room while it is attending. Away means it departed, or has not
     // listened since this daemon started.
-    article.classList.toggle("away", !attend);
-    if (!attend) {
-      attendEl.classList.add("away");
-      attendEl.textContent = "away";
-    } else {
-      const listening = attend.waiting;
-      attendEl.classList.add(listening ? "listening" : "silent");
-      attendEl.textContent = listening ? "listening" : `silent ${formatSilence(attend.silent_secs)}`;
-    }
+    const listening = attend.waiting;
+    attendEl.classList.add(listening ? "listening" : "silent");
+    attendEl.textContent = listening ? "listening" : `silent ${formatSilence(attend.silent_secs)}`;
     const badges = article.querySelector(".badges");
     badges.replaceChildren();
     badges.append(badge(mouth.role, mouth.role));
@@ -351,6 +351,25 @@ function renderPeople() {
     cursor = article.nextElementSibling;
   }
   for (const [key, article] of existing) if (!visible.has(key)) article.remove();
+}
+
+/// People who are no longer attending: one compact line each, folded away
+/// behind a count so they do not read as presence.
+function renderAway(away) {
+  el.peopleAway.hidden = away.length === 0;
+  el.awayCount.textContent = `${away.length} away`;
+  el.awayList.replaceChildren();
+  for (const mouth of away) {
+    const row = document.createElement("span");
+    row.className = "away-person";
+    const mark = document.createElement("i");
+    mark.textContent = initials(mouth.agent);
+    const name = document.createElement("strong");
+    name.textContent = mouth.agent;
+    row.append(mark, name);
+    row.title = `${mouth.agent} on ${mouth.node}`;
+    el.awayList.append(row);
+  }
 }
 
 function attendanceFor(agent) {

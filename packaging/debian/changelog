@@ -9,8 +9,9 @@ conch (1.3.6) stable; urgency=medium
     leave" instead of blaming leader election, and naming a held floor when that
     is the real obstacle.
   * The console's People rail answers who is here: whoever is attending sorts
-    first, anyone who has gone is shown as away and dimmed rather than left
-    looking the same as someone present, and the count reads here/total.
+    first, anyone who has gone collapses into a folded "N away" group
+    rather than sitting among the people you can reach, and the count reads
+    here/total.
   * who, status, and the operator console report attendance: when each mouth
     last blocked on the room and whether it is waiting now, so an agent that
     stopped listening is visible instead of being inferred from silence. A
