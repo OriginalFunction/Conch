@@ -369,3 +369,23 @@ async fn tool_errors_keep_the_daemon_code_in_structured_content() {
     assert_eq!(response["result"]["isError"], true);
     assert_eq!(response["result"]["structuredContent"]["code"], "no_grant");
 }
+
+#[tokio::test]
+async fn withdraw_is_offered_as_a_tool() {
+    let server = Server::new(
+        "tcp://127.0.0.1:1".into(),
+        AgentId::new("agent:test").unwrap(),
+        None,
+    );
+    let listed = server
+        .handle_message(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+        .await
+        .unwrap();
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"withdraw"), "{names:?}");
+}

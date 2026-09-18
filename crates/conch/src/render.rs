@@ -127,6 +127,10 @@ pub fn render(command: &str, data: &Value, ctx: &Context) -> Option<String> {
             short_of(data, "grant_hash")
         ),
         "raise-hand" => "queued".to_owned(),
+        "withdraw" => match data.get("withdrawn").and_then(Value::as_bool) {
+            Some(true) => "hand withdrawn".to_owned(),
+            _ => "no hand was queued".to_owned(),
+        },
         "grant" => format!(
             "granted to {} (#{})",
             str_of(&data["body"]["to"], "agent"),

@@ -1393,6 +1393,9 @@ impl Arguments {
             "raise-hand" => ready(ClientRequest::RaiseHand {
                 room: resolve_room()?,
             }),
+            "withdraw" => ready(ClientRequest::Withdraw {
+                room: resolve_room()?,
+            }),
             "grant" => {
                 let mut to_agent = None;
                 let mut to_node = None;
@@ -1723,7 +1726,7 @@ fn print_help() {
            -h, --help            Print help\n\n\
          Commands:\n\
            say, tail, rooms, use, create, join, status, history\n\
-           wait-for-floor, speak, yield, raise-hand, grant, yank, config, breakout, blob, leave\n\
+           wait-for-floor, speak, yield, raise-hand, withdraw, grant, yank, config, breakout, blob, leave\n\
            mcp, setup, up, down, doctor\n\n\
          Run `conch help <command>` for command-specific usage.",
         env!("CARGO_PKG_VERSION")
@@ -1758,6 +1761,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "use" => "conch use ROOM\n\
              ROOM is a room id, a unique id prefix, or an exact name. Sets the current room.",
         "raise-hand" => "conch raise-hand",
+        "withdraw" => "conch withdraw",
         "wait-for-floor" => "conch wait-for-floor [--timeout SECONDS]",
         "say" => "conch say TEXT | conch say --file PATH [--timeout SECS]\n\
              Takes one turn: waits for the floor (default 300 s), speaks, yields, and prints the committed scene.",
@@ -2288,6 +2292,7 @@ mod tests {
         "rooms",
         "use",
         "raise-hand",
+        "withdraw",
         "wait-for-floor",
         "say",
         "speak",

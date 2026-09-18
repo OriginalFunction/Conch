@@ -372,6 +372,7 @@ impl Server {
                     Some(bytes),
                 )
             }
+            "withdraw" => (ClientRequest::Withdraw { room: room()? }, None),
             "leave" => (
                 ClientRequest::Leave {
                     room: room()?,
@@ -1047,6 +1048,11 @@ fn tool_definitions() -> Vec<Value> {
                 })),
                 &["name"],
             ),
+        ),
+        tool(
+            "withdraw",
+            "Drop this agent's queued hand; use it when another take already said what you were going to say",
+            object_schema(room_properties(json!({})), &[]),
         ),
         tool(
             "blob_put",
