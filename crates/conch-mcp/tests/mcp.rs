@@ -448,6 +448,130 @@ async fn wait_for_floor_reports_the_takes_it_waited_through() {
 }
 
 #[tokio::test]
+async fn say_declines_to_speak_a_stale_answer_and_keeps_the_floor() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let ticket = daemon
+        .create_ticket("stale", StakePolicy::default(), FloorConfig::stick(30))
+        .unwrap();
+    let daemon_server = daemon.start(loopback()).await.unwrap();
+    let node = format!("tcp://{}", daemon_server.addr());
+    let talker = Server::new(
+        node.clone(),
+        AgentId::new("agent:talker").unwrap(),
+        Some(ticket.id),
+    );
+    let answerer = Arc::new(Server::new(
+        node,
+        AgentId::new("agent:answerer").unwrap(),
+        Some(ticket.id),
+    ));
+
+    // The talker holds the floor while the answerer's say queues behind it.
+    assert_eq!(
+        call(&talker, "wait_for_floor", json!({ "timeout": 5 })).await["result"]["isError"],
+        false
+    );
+    let saying = {
+        let answerer = Arc::clone(&answerer);
+        tokio::spawn(async move {
+            call(
+                &answerer,
+                "say",
+                json!({ "text": "the answer is 41", "timeout": 20 }),
+            )
+            .await
+        })
+    };
+    wait_until_queued(&talker, "agent:answerer").await;
+
+    // This commits while the answer sits in the queue.
+    call(&talker, "speak", json!({ "text": "the answer is 42" })).await;
+    call(&talker, "yield", json!({})).await;
+
+    let reconsidered = saying.await.unwrap();
+    assert_eq!(reconsidered["result"]["isError"], false, "{reconsidered:?}");
+    let result = &reconsidered["result"]["structuredContent"];
+    assert_eq!(result["status"], json!("reconsider"));
+    assert!(result["grant_hash"].as_str().is_some(), "{result:?}");
+    let events = result["events"].as_array().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event["text"] == json!("the answer is 42")),
+        "{events:?}"
+    );
+
+    // The floor is still the answerer's, and yielding without speaking succeeds.
+    let yielded = call(&answerer, "yield", json!({})).await;
+    assert_eq!(yielded["result"]["isError"], false, "{yielded:?}");
+
+    // The stale answer never reached the chain.
+    let history = call(&answerer, "history", json!({})).await;
+    assert!(
+        !history["result"]["structuredContent"]
+            .to_string()
+            .contains("the answer is 41"),
+        "a stale answer must never commit"
+    );
+}
+
+#[tokio::test]
+async fn say_with_on_change_speak_commits_anyway_and_a_bad_value_is_refused() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let ticket = daemon
+        .create_ticket("override", StakePolicy::default(), FloorConfig::stick(30))
+        .unwrap();
+    let daemon_server = daemon.start(loopback()).await.unwrap();
+    let node = format!("tcp://{}", daemon_server.addr());
+    let talker = Server::new(
+        node.clone(),
+        AgentId::new("agent:talker").unwrap(),
+        Some(ticket.id),
+    );
+    let answerer = Arc::new(Server::new(
+        node,
+        AgentId::new("agent:answerer").unwrap(),
+        Some(ticket.id),
+    ));
+
+    let refused = call(
+        &answerer,
+        "say",
+        json!({ "text": "hello", "on_change": "shout" }),
+    )
+    .await;
+    assert_eq!(refused["result"]["isError"], true, "{refused:?}");
+
+    assert_eq!(
+        call(&talker, "wait_for_floor", json!({ "timeout": 5 })).await["result"]["isError"],
+        false
+    );
+    let saying = {
+        let answerer = Arc::clone(&answerer);
+        tokio::spawn(async move {
+            call(
+                &answerer,
+                "say",
+                json!({ "text": "said anyway", "timeout": 20, "on_change": "speak" }),
+            )
+            .await
+        })
+    };
+    wait_until_queued(&talker, "agent:answerer").await;
+    call(&talker, "speak", json!({ "text": "meanwhile" })).await;
+    call(&talker, "yield", json!({})).await;
+
+    // The caller opted out of reconsidering, so the take commits as written.
+    let spoke = saying.await.unwrap();
+    assert_eq!(spoke["result"]["isError"], false, "{spoke:?}");
+    let result = &spoke["result"]["structuredContent"];
+    assert!(result["status"].is_null(), "{result:?}");
+    assert!(result["n"].as_u64().is_some(), "{result:?}");
+}
+
+#[tokio::test]
 async fn withdraw_is_offered_as_a_tool() {
     let server = Server::new(
         "tcp://127.0.0.1:1".into(),

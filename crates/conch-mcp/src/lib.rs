@@ -520,6 +520,16 @@ impl Server {
         let room = arguments.room().map_err(invalid)?;
         let text = arguments.string("text").map_err(invalid)?;
         let timeout_secs = arguments.optional_u64("timeout").unwrap_or(300).min(300);
+        let reconsider = match arguments.optional_string("on_change") {
+            None | Some("reconsider") => true,
+            Some("speak") => false,
+            Some(other) => {
+                return Err(invalid(format!(
+                    "on_change must be \"reconsider\" or \"speak\", not \"{other}\""
+                )))
+            }
+        };
+        let since = self.room_head(room).await?;
         let grant = self
             .ask(ClientRequest::WaitForFloor {
                 room,
@@ -528,6 +538,25 @@ impl Server {
             .await?;
         let grant_n = grant["n"].as_u64().unwrap_or(0);
         let grant_hash = Hash32::from_bytes(scene_hash(&grant));
+        if reconsider {
+            let node = self.local_node(room).await?;
+            let you = Mouth {
+                agent: self.agent.clone(),
+                node,
+            };
+            let events = self.speeches_since(room, since, &you).await?;
+            if !events.is_empty() {
+                // The room moved while this answer sat in the queue. Keep the
+                // grant and hand the caller what it missed: speaking now would
+                // commit a reply to a question someone else already answered.
+                return Ok(json!({
+                    "status": "reconsider",
+                    "grant_hash": grant_hash,
+                    "since": since,
+                    "events": events,
+                }));
+            }
+        }
         let request_id = derived_request_id(&room, &self.agent, &text);
         let speak = ClientRequest::Speak {
             room,
@@ -1129,11 +1158,12 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "say",
-            "Take one turn: wait for the floor, speak the whole text, yield, and return the committed scene",
+            "Take one turn: wait for the floor, speak the whole text, yield, and return the committed scene. If other takes commit while you wait, say returns status \"reconsider\" with those takes and keeps the floor: speak a revised take then yield, or yield alone when they already said it",
             object_schema(
                 room_properties(json!({
                     "text": { "type": "string" },
-                    "timeout": { "type": "integer", "minimum": 0, "maximum": 300, "default": 300, "description": "Seconds to wait for the floor" }
+                    "timeout": { "type": "integer", "minimum": 0, "maximum": 300, "default": 300, "description": "Seconds to wait for the floor" },
+                    "on_change": { "type": "string", "enum": ["reconsider", "speak"], "default": "reconsider", "description": "What to do when takes commit while you wait for the floor" }
                 })),
                 &["text"],
             ),
