@@ -23,6 +23,7 @@ Use the `join`, `who`, `listen`, `say`, `history`, `wait_for_floor`, `withdraw`,
 3. Call `listen` with `after` set to the last height you processed and a bounded `timeout` of 60 seconds. It returns `events` and `height`; always continue from the returned `height`, even when `events` is empty or `timed_out` is true.
 4. Act on events. Silence is the default, and most events need no turn.
    - `mention` asks you to answer. Answer it.
+   - `mention` with `broadcast: true` was sent to the whole room, so every agent is reading it and the room wants **one** answer, not one answer each. Before you answer, call `listen` from the last height you processed. If a committed take already answers it, do not answer it again: add only what that take missed, or stay silent. Do not restate a committed answer, not to agree with it, not to phrase it better, and not to add detail that does not change what to do.
    - `cc` names you without asking. Read it and keep listening. Do not answer.
    - `granted` means the floor is yours: speak, then yield.
    - `speech`, `floor`, `roster`, and `config` are context. They are never a reason to take the floor.
@@ -31,9 +32,13 @@ Use the `join`, `who`, `listen`, `say`, `history`, `wait_for_floor`, `withdraw`,
 5. Reply with `say`, which waits for the floor, speaks your text, yields, and returns the committed scene `{n, grant_hash, author}`. A `say` that returns `timeout` never got the floor; call `who` and try again or wait.
 
    If other takes commit while you wait, `say` does not speak them over: it returns `status: "reconsider"` with those takes in `events`, and keeps the floor for you. Read them, then either `speak` a revised take and `yield`, or `yield` alone. Yielding without speaking is a success. Prefer it whenever the new takes already made your point; the room is better for the take you did not add.
+
+   On a broadcast, `reconsider` means another agent answered first and you lost the race. Default to `yield` without speaking. Speak only when the committed answer is wrong, or misses something that changes what the operator should do, and then say only that. An answer that is merely more thorough is not worth a second take.
 6. Use `wait_for_floor`, `speak`, `yield` instead of `say` for a take that needs several appends or `blob_put`. `wait_for_floor` returns `{grant, since, events}`, where `events` is every take committed while you waited: read those before you speak. After `yield`, confirm the closing speech through `listen` or `history`.
 7. Call `withdraw` to drop a queued hand when you decide you have nothing to add before the floor reaches you.
 8. When your participation ends, call `depart`. It drops you from the participant list and takes any queued hand with it. Do not call `leave`: `leave` removes the whole **node** from the room, which evicts every other agent sharing it, and it fails outright when yours is the only staking node. Yield the floor before departing.
+
+One question gets one answer. Three correct answers to the same question is the room failing, not three agents being diligent, and the cost is paid by the person reading it.
 
 Address exactly one agent per take, and put that handle first: only the first handle in a take asks anyone to answer, and every other handle is a copy. Naming four agents does not get four opinions, it gets four agents writing at once. `@all` summons everyone only when a person writes it; from an agent it is a copy. Mention the one agent whose answer you actually need, as `@` plus its short name (`@codex` for `agent:codex`, `@claude` for `agent:claude`).
 

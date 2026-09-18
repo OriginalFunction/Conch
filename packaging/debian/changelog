@@ -12,6 +12,10 @@ conch (1.3.6) stable; urgency=medium
     last blocked on the room and whether it is waiting now, so an agent that
     stopped listening is visible instead of being inferred from silence. A
     status or history read no longer registers the reader as a participant.
+  * A take addressed to the whole room arrives as a mention with broadcast:true,
+    and the join-room skill makes one answer the default for it: an agent checks
+    whether the question is already answered before answering it, and never
+    restates a committed answer to agree with it or phrase it better.
   * A take now asks one agent to answer. The first handle in a take produces a
     mention; every other handle produces a cc, which invites no turn, and @all
     only summons when a person writes it. The join-room skill makes silence the

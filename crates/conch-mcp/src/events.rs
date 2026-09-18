@@ -10,8 +10,11 @@ use serde_json::{json, Value};
 /// How a take addresses one agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Address {
-    /// This take asks this agent to answer.
+    /// This take asks this agent, by name, to answer.
     Mention,
+    /// A person addressed the whole room. Every agent sees it, but the room
+    /// wants one answer, not one answer each.
+    Broadcast,
     /// This take names this agent without asking it to answer.
     Cc,
     /// This take does not name this agent.
@@ -53,7 +56,7 @@ pub fn address(text: &str, agent: &AgentId, author_is_human: bool) -> Address {
     let is_broadcast = |handle: &String| handle == "all" || handle == "everyone";
     let handles = mentioned_handles(text);
     if author_is_human && handles.iter().any(is_broadcast) {
-        return Address::Mention;
+        return Address::Broadcast;
     }
     // A broadcast reaches Mention only through the check above, so `@all` from
     // an agent is a copy however early it appears.
@@ -119,13 +122,18 @@ pub fn flatten(records: &[Value], you: &Mouth) -> Vec<Value> {
                         address(&text, &you.agent, author_is_human)
                     };
                     let mut event = base(match addressed {
-                        Address::Mention => "mention",
+                        Address::Mention | Address::Broadcast => "mention",
                         Address::Cc => "cc",
                         Address::None => "speech",
                     });
+                    if addressed == Address::Broadcast {
+                        // Everyone was asked. Whoever reaches the floor first
+                        // answers it; the rest add only what that answer missed.
+                        event["broadcast"] = json!(true);
+                    }
                     event["author"] = author.clone().unwrap_or(Value::Null);
                     event["text"] = json!(text);
-                    if addressed == Address::Mention {
+                    if matches!(addressed, Address::Mention | Address::Broadcast) {
                         event["grant_hash"] = body["closes_grant"].clone();
                     } else {
                         event["empty"] = json!(
@@ -224,17 +232,43 @@ mod tests {
         let codex = agent("agent:codex");
         assert_eq!(
             address("@all status please", &codex, true),
-            Address::Mention
+            Address::Broadcast
         );
         assert_eq!(address("@all status please", &codex, false), Address::Cc);
         assert_eq!(
             address("@claude and @all should see this", &codex, true),
-            Address::Mention
+            Address::Broadcast
         );
         assert_eq!(
             address("@claude and @all should see this", &codex, false),
             Address::Cc
         );
+    }
+
+    #[test]
+    fn a_broadcast_take_is_flagged_so_one_agent_can_own_the_answer() {
+        let you = Mouth {
+            agent: AgentId::new("agent:codex").unwrap(),
+            node: node(1),
+        };
+        let records = vec![record(
+            2,
+            json!({ "type": "speech", "closes_grant": "aa", "text": "@all what is the bug?" }),
+            Some(("human:operator", 2)),
+        )];
+        let events = flatten(&records, &you);
+        assert_eq!(events[0]["kind"], json!("mention"));
+        assert_eq!(events[0]["broadcast"], json!(true));
+
+        // A take that names one agent is not a broadcast.
+        let records = vec![record(
+            4,
+            json!({ "type": "speech", "closes_grant": "bb", "text": "@codex what breaks?" }),
+            Some(("human:operator", 2)),
+        )];
+        let events = flatten(&records, &you);
+        assert_eq!(events[0]["kind"], json!("mention"));
+        assert!(events[0]["broadcast"].is_null(), "{:?}", events[0]);
     }
 
     #[test]
