@@ -125,6 +125,7 @@ impl Server {
         let arguments = Arguments::new(arguments, self.room)?;
         let composite = match name {
             "say" => Some(self.say(&arguments).await),
+            "wait_for_floor" => Some(self.wait_for_floor(&arguments).await),
             "listen" => Some(self.listen(&arguments).await),
             "who" => Some(self.who(&arguments).await),
             _ => None,
@@ -254,13 +255,6 @@ impl Server {
                     None,
                 )
             }
-            "wait_for_floor" => (
-                ClientRequest::WaitForFloor {
-                    room: room()?,
-                    timeout_secs: arguments.optional_u64("timeout"),
-                },
-                None,
-            ),
             "speak" => {
                 let room = room()?;
                 let text = arguments.string("text")?;
@@ -465,6 +459,60 @@ impl Server {
                 format!("status omitted node: {error}"),
             )
         })
+    }
+
+    /// The room's committed head height, or 0 when nothing has committed.
+    async fn room_head(&self, room: RoomId) -> Result<u64, (String, String)> {
+        let status = self.ask(ClientRequest::Status { room: Some(room) }).await?;
+        Ok(status["head_n"].as_u64().unwrap_or(0))
+    }
+
+    /// Committed takes above `after_n` that this mouth did not author, in the
+    /// same event shape `listen` returns.
+    async fn speeches_since(
+        &self,
+        room: RoomId,
+        after_n: u64,
+        you: &Mouth,
+    ) -> Result<Vec<Value>, (String, String)> {
+        let page = self
+            .ask(ClientRequest::History {
+                room,
+                from_n: after_n.saturating_add(1),
+                follow: false,
+            })
+            .await?;
+        let records = page["scenes"].as_array().cloned().unwrap_or_default();
+        let mine = serde_json::to_value(you).expect("mouth is serializable");
+        let speeches: Vec<Value> = records
+            .into_iter()
+            .filter(|record| {
+                record["scene"]["body"]["type"] == json!("speech")
+                    && record.get("author").is_some_and(|author| *author != mine)
+            })
+            .collect();
+        Ok(events::flatten(&speeches, you))
+    }
+
+    /// Wait for the floor and report every take committed while waiting, so an
+    /// agent never composes over an answer it has not read.
+    async fn wait_for_floor(&self, arguments: &Arguments) -> Result<Value, (String, String)> {
+        let invalid = |message: String| ("invalid".to_owned(), message);
+        let room = arguments.room().map_err(invalid)?;
+        let since = self.room_head(room).await?;
+        let grant = self
+            .ask(ClientRequest::WaitForFloor {
+                room,
+                timeout_secs: arguments.optional_u64("timeout"),
+            })
+            .await?;
+        let node = self.local_node(room).await?;
+        let you = Mouth {
+            agent: self.agent.clone(),
+            node,
+        };
+        let events = self.speeches_since(room, since, &you).await?;
+        Ok(json!({ "grant": grant, "since": since, "events": events }))
     }
 
     async fn say(&self, arguments: &Arguments) -> Result<Value, (String, String)> {
@@ -983,7 +1031,7 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "wait_for_floor",
-            "Wait until this agent holds an OPEN grant",
+            "Wait until this agent holds an OPEN grant; returns the grant and every take committed while you waited",
             object_schema(
                 room_properties(json!({
                     "timeout": { "type": "integer", "minimum": 0 }

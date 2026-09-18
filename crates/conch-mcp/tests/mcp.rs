@@ -370,6 +370,83 @@ async fn tool_errors_keep_the_daemon_code_in_structured_content() {
     assert_eq!(response["result"]["structuredContent"]["code"], "no_grant");
 }
 
+async fn call(server: &Server, name: &str, arguments: Value) -> Value {
+    server
+        .handle_message(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        }))
+        .await
+        .unwrap()
+}
+
+/// Block until `agent` is queued, so the test can commit a take while another
+/// mouth is provably waiting for the floor rather than racing a sleep.
+async fn wait_until_queued(server: &Server, agent: &str) {
+    for _ in 0..200 {
+        let who = call(server, "who", json!({})).await;
+        if who["result"]["structuredContent"]["queue"]
+            .to_string()
+            .contains(agent)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{agent} never appeared in the queue");
+}
+
+#[tokio::test]
+async fn wait_for_floor_reports_the_takes_it_waited_through() {
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let ticket = daemon
+        .create_ticket("waiting", StakePolicy::default(), FloorConfig::stick(30))
+        .unwrap();
+    let daemon_server = daemon.start(loopback()).await.unwrap();
+    let node = format!("tcp://{}", daemon_server.addr());
+    let talker = Server::new(
+        node.clone(),
+        AgentId::new("agent:talker").unwrap(),
+        Some(ticket.id),
+    );
+    let waiter = Arc::new(Server::new(
+        node,
+        AgentId::new("agent:waiter").unwrap(),
+        Some(ticket.id),
+    ));
+
+    // The talker holds the floor, so the waiter has to queue behind it.
+    assert_eq!(
+        call(&talker, "wait_for_floor", json!({ "timeout": 5 })).await["result"]["isError"],
+        false
+    );
+    let waiting = {
+        let waiter = Arc::clone(&waiter);
+        tokio::spawn(async move { call(&waiter, "wait_for_floor", json!({ "timeout": 20 })).await })
+    };
+    wait_until_queued(&talker, "agent:waiter").await;
+
+    call(&talker, "speak", json!({ "text": "the answer is 42" })).await;
+    call(&talker, "yield", json!({})).await;
+
+    let granted = waiting.await.unwrap();
+    assert_eq!(granted["result"]["isError"], false, "{granted:?}");
+    let result = &granted["result"]["structuredContent"];
+    assert_eq!(
+        result["grant"]["body"]["to"]["agent"],
+        json!("agent:waiter")
+    );
+    assert!(result["since"].as_u64().is_some(), "{result:?}");
+    let events = result["events"].as_array().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event["text"] == json!("the answer is 42")),
+        "{events:?}"
+    );
+}
+
 #[tokio::test]
 async fn withdraw_is_offered_as_a_tool() {
     let server = Server::new(
