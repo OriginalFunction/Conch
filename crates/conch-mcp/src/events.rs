@@ -7,35 +7,66 @@ use conch_core::{
 };
 use serde_json::{json, Value};
 
-/// Does `text` address `agent`? `@` plus the full id, its short name after the
-/// first colon, or `all`/`everyone`; case-insensitive; the `@` starts the text or
-/// follows whitespace or punctuation; the name is not followed by an id character.
-pub fn mentions(text: &str, agent: &AgentId) -> bool {
-    let full = agent.as_str().to_ascii_lowercase();
-    let short = full.split_once(':').map(|(_, short)| short.to_owned());
+/// How a take addresses one agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Address {
+    /// This take asks this agent to answer.
+    Mention,
+    /// This take names this agent without asking it to answer.
+    Cc,
+    /// This take does not name this agent.
+    None,
+}
+
+/// Every `@handle` in the order it appears, lowercased and without the `@`. A
+/// handle starts the text or follows whitespace or punctuation, so an email
+/// address is not a handle.
+pub fn mentioned_handles(text: &str) -> Vec<String> {
     let lower = text.to_ascii_lowercase();
-    let mut names: Vec<&str> = vec![full.as_str(), "all", "everyone"];
-    if let Some(short) = short.as_deref() {
-        names.push(short);
-    }
     let bytes = lower.as_bytes();
+    let mut handles = Vec::new();
     for (at, _) in lower.match_indices('@') {
         let preceded_ok =
             at == 0 || bytes[at - 1].is_ascii_whitespace() || bytes[at - 1].is_ascii_punctuation();
         if !preceded_ok {
             continue;
         }
-        let rest = &lower[at + 1..];
-        for name in &names {
-            if let Some(after) = rest.strip_prefix(name) {
-                let boundary = after.chars().next().is_none_or(|c| !is_id_char(c));
-                if boundary {
-                    return true;
-                }
-            }
+        let handle: String = lower[at + 1..]
+            .chars()
+            .take_while(|c| is_id_char(*c))
+            .collect();
+        if !handle.is_empty() {
+            handles.push(handle);
         }
     }
-    false
+    handles
+}
+
+/// Only the first handle in a take is asked to answer. Everyone else it names
+/// is copied, so one question draws one answer instead of four. A broadcast
+/// stays a summons only when a person wrote it.
+pub fn address(text: &str, agent: &AgentId, author_is_human: bool) -> Address {
+    let full = agent.as_str().to_ascii_lowercase();
+    let short = full.split_once(':').map(|(_, short)| short.to_owned());
+    let is_me =
+        |handle: &String| *handle == full || short.as_deref().is_some_and(|short| handle == short);
+    let is_broadcast = |handle: &String| handle == "all" || handle == "everyone";
+    let handles = mentioned_handles(text);
+    if author_is_human && handles.iter().any(is_broadcast) {
+        return Address::Mention;
+    }
+    // A broadcast reaches Mention only through the check above, so `@all` from
+    // an agent is a copy however early it appears.
+    match handles.first() {
+        Some(first) if is_me(first) => Address::Mention,
+        _ if handles
+            .iter()
+            .any(|handle| is_me(handle) || is_broadcast(handle)) =>
+        {
+            Address::Cc
+        }
+        _ => Address::None,
+    }
 }
 
 fn is_id_char(c: char) -> bool {
@@ -78,11 +109,23 @@ pub fn flatten(records: &[Value], you: &Mouth) -> Vec<Value> {
                 "speech" => {
                     let text = body["text"].as_str().unwrap_or("").to_owned();
                     let mine = author.as_ref().is_some_and(|author| *author == you_json);
-                    let mentioned = !mine && mentions(&text, &you.agent);
-                    let mut event = base(if mentioned { "mention" } else { "speech" });
+                    let author_is_human = author
+                        .as_ref()
+                        .and_then(|author| author["agent"].as_str())
+                        .is_some_and(|agent| agent.starts_with("human:"));
+                    let addressed = if mine {
+                        Address::None
+                    } else {
+                        address(&text, &you.agent, author_is_human)
+                    };
+                    let mut event = base(match addressed {
+                        Address::Mention => "mention",
+                        Address::Cc => "cc",
+                        Address::None => "speech",
+                    });
                     event["author"] = author.clone().unwrap_or(Value::Null);
                     event["text"] = json!(text);
-                    if mentioned {
+                    if addressed == Address::Mention {
                         event["grant_hash"] = body["closes_grant"].clone();
                     } else {
                         event["empty"] = json!(
@@ -145,7 +188,7 @@ mod tests {
             "@everyone look",
             "line\n@claude",
         ] {
-            assert!(mentions(text, &me), "{text:?}");
+            assert_ne!(address(text, &me, true), Address::None, "{text:?}");
         }
         for text in [
             "email@claude.ai",
@@ -156,11 +199,52 @@ mod tests {
             "@agent:codex",
             "",
         ] {
-            assert!(!mentions(text, &me), "{text:?}");
+            assert_eq!(address(text, &me, true), Address::None, "{text:?}");
         }
         // An id without a colon has only its full form.
-        assert!(mentions("@local hi", &agent("local")));
-        assert!(!mentions("@loc hi", &agent("local")));
+        assert_eq!(
+            address("@local hi", &agent("local"), false),
+            Address::Mention
+        );
+        assert_eq!(address("@loc hi", &agent("local"), false), Address::None);
+    }
+
+    #[test]
+    fn only_the_first_handle_is_summoned() {
+        let codex = agent("agent:codex");
+        let claude = agent("agent:claude");
+        let text = "@codex please fold this in, @claude @grok review after";
+        assert_eq!(address(text, &codex, false), Address::Mention);
+        assert_eq!(address(text, &claude, false), Address::Cc);
+        assert_eq!(address("nobody named here", &codex, false), Address::None);
+    }
+
+    #[test]
+    fn a_broadcast_only_summons_when_a_person_writes_it() {
+        let codex = agent("agent:codex");
+        assert_eq!(
+            address("@all status please", &codex, true),
+            Address::Mention
+        );
+        assert_eq!(address("@all status please", &codex, false), Address::Cc);
+        assert_eq!(
+            address("@claude and @all should see this", &codex, true),
+            Address::Mention
+        );
+        assert_eq!(
+            address("@claude and @all should see this", &codex, false),
+            Address::Cc
+        );
+    }
+
+    #[test]
+    fn handles_are_returned_in_the_order_they_appear() {
+        assert_eq!(
+            mentioned_handles("hi @Codex and @claude, cc @all"),
+            vec!["codex".to_owned(), "claude".to_owned(), "all".to_owned()]
+        );
+        assert_eq!(mentioned_handles("no handles here"), Vec::<String>::new());
+        assert_eq!(mentioned_handles("email@example.com"), Vec::<String>::new());
     }
 
     fn node(byte: u8) -> NodeId {

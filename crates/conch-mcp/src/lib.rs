@@ -1170,7 +1170,7 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "listen",
-            "Wait for committed scenes after a height and return them as events: mention, speech, granted, floor, roster, config",
+            "Wait for committed scenes after a height and return them as events: mention (answer it), cc (named without being asked; do not answer), speech, granted, floor, roster, config",
             object_schema(
                 room_properties(json!({
                     "after": { "type": "integer", "minimum": 0, "description": "Last committed height already processed" },
