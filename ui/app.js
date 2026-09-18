@@ -311,6 +311,17 @@ function renderPeople() {
     article.querySelector(".person-main > strong").textContent = mouth.agent;
     article.querySelector(".agent-empty").hidden = true;
     article.querySelector("code").textContent = mouth.node;
+    // Presence is what a mouth is doing now, not what the chain remembers it
+    // said once. An agent that stopped listening reads as silent here.
+    const attend = attendanceFor(mouth.agent);
+    const attendEl = article.querySelector(".attending");
+    attendEl.hidden = !attend;
+    attendEl.className = "attending";
+    if (attend) {
+      const listening = attend.waiting;
+      attendEl.classList.add(listening ? "listening" : "silent");
+      attendEl.textContent = listening ? "listening" : `silent ${formatSilence(attend.silent_secs)}`;
+    }
     const badges = article.querySelector(".badges");
     badges.replaceChildren();
     badges.append(badge(mouth.role, mouth.role));
@@ -322,6 +333,18 @@ function renderPeople() {
     cursor = article.nextElementSibling;
   }
   for (const [key, article] of existing) if (!visible.has(key)) article.remove();
+}
+
+function attendanceFor(agent) {
+  const rows = state.detail?.attending;
+  return Array.isArray(rows) ? rows.find((row) => row.agent === agent) || null : null;
+}
+
+function formatSilence(seconds) {
+  if (!Number.isFinite(seconds)) return "";
+  if (seconds < 90) return `${Math.max(0, Math.round(seconds))}s`;
+  if (seconds < 5400) return `${Math.round(seconds / 60)}m`;
+  return `${Math.round(seconds / 3600)}h`;
 }
 
 function badge(kind, label) {

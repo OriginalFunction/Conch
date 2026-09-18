@@ -137,6 +137,10 @@ struct Inner {
     floors: RwLock<BTreeMap<RoomId, Arc<RoomFloor>>>,
     joins: RwLock<BTreeMap<RoomId, LocalJoin>>,
     room_agents: RwLock<BTreeMap<RoomId, BTreeSet<AgentId>>>,
+    /// When each mouth last blocked on the room, and whether it is blocked now.
+    /// Presence is something a mouth does, not something the chain records, so
+    /// this lives in memory and starts empty after a restart.
+    attendance: RwLock<BTreeMap<(RoomId, AgentId), Attendance>>,
     addrs: RwLock<Vec<String>>,
     trackers: RwLock<Vec<String>>,
     peers: RwLock<BTreeMap<RoomId, BTreeMap<NodeId, Vec<String>>>>,
@@ -335,6 +339,15 @@ pub struct RunningServer {
     floor_timeouts: Option<FloorTimeoutTicker>,
 }
 
+/// One mouth's attention: the last time it blocked waiting on a room, and
+/// whether it is blocked right now. An agent that has stopped listening goes
+/// stale here long before anyone notices its silence in the transcript.
+#[derive(Clone, Copy)]
+struct Attendance {
+    last_listen: u64,
+    waiting: bool,
+}
+
 /// A take this node leads that has outlived its room's `timeout_secs`.
 struct OverdueTake {
     grant: LiveGrant,
@@ -521,6 +534,7 @@ impl Daemon {
                 floors: RwLock::new(floors),
                 joins: RwLock::new(joins),
                 room_agents: RwLock::new(BTreeMap::new()),
+                attendance: RwLock::new(BTreeMap::new()),
                 addrs: RwLock::new(Vec::new()),
                 trackers: RwLock::new(Vec::new()),
                 peers: RwLock::new(peers),
@@ -3189,7 +3203,9 @@ impl Daemon {
                 .await?;
                 return Ok(());
             }
-            if let Some(room) = request_room(&request) {
+            // Reading a room is not joining it: a status probe or a history
+            // page must not add a phantom participant.
+            if let Some(room) = request_room(&request).filter(|_| participates(&request)) {
                 self.remember_room_agent(room, agent.clone());
             }
             if let ClientRequest::History {
@@ -3342,7 +3358,12 @@ impl Daemon {
                 Err(error) => Err(error.into()),
             },
             ClientRequest::WaitForFloor { room, timeout_secs } => {
-                self.client_wait_for_floor(agent, room, timeout_secs).await
+                self.mark_attending(room, &agent, true);
+                let waited = self
+                    .client_wait_for_floor(agent.clone(), room, timeout_secs)
+                    .await;
+                self.mark_attending(room, &agent, false);
+                waited
             }
             ClientRequest::Speak {
                 room,
@@ -3383,8 +3404,12 @@ impl Daemon {
                 after_n,
                 timeout_secs,
             } => {
-                self.client_wait_for_history(room, after_n, timeout_secs)
-                    .await
+                self.mark_attending(room, &agent, true);
+                let waited = self
+                    .client_wait_for_history(room, after_n, timeout_secs)
+                    .await;
+                self.mark_attending(room, &agent, false);
+                waited
             }
             ClientRequest::Status { room } => self.client_status(room),
             ClientRequest::Version => Ok(json!({ "version": env!("CARGO_PKG_VERSION") })),
@@ -4234,6 +4259,8 @@ impl Daemon {
         let listed = registry
             .get_mut(&room)
             .is_some_and(|agents| agents.remove(&agent));
+        drop(registry);
+        self.forget_attendance(room, &agent);
         Ok(json!({
             "departed": listed,
             "withdrew_hand": withdrawn["withdrawn"],
@@ -5001,6 +5028,7 @@ impl Daemon {
                 "holder": holder,
                 "queue": queue,
                 "participants": participants,
+                "attending": self.attending(room),
             }));
         }
         let rooms = self
@@ -5898,6 +5926,48 @@ impl Daemon {
             .insert(node, declaration.clone());
     }
 
+    /// Record that this mouth is blocking on the room, or has stopped blocking.
+    fn mark_attending(&self, room: RoomId, agent: &AgentId, waiting: bool) {
+        let entry = Attendance {
+            last_listen: unix_timestamp(),
+            waiting,
+        };
+        self.inner
+            .attendance
+            .write()
+            .expect("attendance registry lock is not poisoned")
+            .insert((room, agent.clone()), entry);
+    }
+
+    fn forget_attendance(&self, room: RoomId, agent: &AgentId) {
+        self.inner
+            .attendance
+            .write()
+            .expect("attendance registry lock is not poisoned")
+            .remove(&(room, agent.clone()));
+    }
+
+    /// Who is attending a room, newest silence last. A mouth that never blocked
+    /// on this room does not appear at all.
+    fn attending(&self, room: RoomId) -> Vec<Value> {
+        let now = unix_timestamp();
+        self.inner
+            .attendance
+            .read()
+            .expect("attendance registry lock is not poisoned")
+            .iter()
+            .filter(|((listening_room, _), _)| *listening_room == room)
+            .map(|((_, agent), entry)| {
+                json!({
+                    "agent": agent,
+                    "last_listen": entry.last_listen,
+                    "silent_secs": now.saturating_sub(entry.last_listen),
+                    "waiting": entry.waiting,
+                })
+            })
+            .collect()
+    }
+
     fn remember_room_agent(&self, room: RoomId, agent: AgentId) {
         self.inner
             .room_agents
@@ -6560,6 +6630,7 @@ impl Daemon {
             "room": summary,
             "node": local,
             "participants": participants,
+            "attending": self.attending(room),
             "mouths": mouths,
             "floor": {
                 "mode": replay.chain.floor_mode,
@@ -6861,6 +6932,15 @@ impl Daemon {
     fn room_path(&self, room: RoomId) -> PathBuf {
         self.inner.data_dir.join("rooms").join(room.to_string())
     }
+}
+
+/// Does issuing this request mean taking part in the room, rather than merely
+/// reading it? `conch doctor` and the console poll rooms they do not join.
+fn participates(request: &ClientRequest) -> bool {
+    !matches!(
+        request,
+        ClientRequest::Status { .. } | ClientRequest::History { .. } | ClientRequest::Version
+    )
 }
 
 fn client_error_reply(error: DaemonError) -> ClientReply {

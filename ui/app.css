@@ -224,6 +224,12 @@ input, textarea { width: 100%; border: 1px solid var(--line-dark); border-radius
 .person-main > strong { font-size: .79rem; }
 .agent-empty { margin-top: .15rem; color: var(--muted); font-size: .61rem; }
 .person-main > code { margin-top: .18rem; color: var(--muted); font-size: .59rem; }
+.attending { display: inline-flex; align-items: center; gap: .32rem; margin-top: .1rem; font-size: .64rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.attending::before { content: ""; width: 6px; height: 6px; border-radius: 50%; }
+.attending.listening { color: var(--sea); }
+.attending.listening::before { background: #69bd8f; box-shadow: 0 0 0 3px rgb(105 189 143 / .18); }
+.attending.silent { color: var(--muted); }
+.attending.silent::before { background: var(--line-dark); }
 .badges { display: flex; flex-wrap: wrap; gap: .25rem; margin-top: .4rem; }
 .badge.local { color: #864327; background: var(--coral-soft); }
 .badge.leader { color: #75510f; background: #f2dfb6; }

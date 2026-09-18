@@ -1804,12 +1804,6 @@ async fn an_agent_departs_without_evicting_the_node_it_shares() {
 
     let mut leaver = attach(server.addr(), "agent:leaver").await;
     let mut stayer = attach(server.addr(), "agent:stayer").await;
-    assert!(
-        request(&mut stayer, ClientRequest::Status { room: Some(room) })
-            .await
-            .ok
-    );
-
     // `leave` would take the whole node with it, and this is the only staker.
     // The refusal has to say that, not blame leader election.
     let refused = request(
@@ -1825,19 +1819,9 @@ async fn an_agent_departs_without_evicting_the_node_it_shares() {
     assert_eq!(error.code, "last_staker");
     assert!(error.message.contains("last staking node"), "{error:?}");
 
-    // Departing drops just this mouth, and the room keeps working for the rest.
-    let departed = request(&mut leaver, ClientRequest::Depart { room }).await;
-    assert!(departed.ok, "{departed:?}");
-    assert_eq!(departed.data.unwrap()["departed"], serde_json::json!(true));
-
-    let status = request(&mut stayer, ClientRequest::Status { room: Some(room) }).await;
-    assert!(status.ok, "{status:?}");
-    let participants = status.data.unwrap()["participants"].to_string();
-    assert!(!participants.contains("agent:leaver"), "{participants}");
-    assert!(participants.contains("agent:stayer"), "{participants}");
-
-    // With the floor taken by someone else, a second hand really queues, and a
-    // departing mouth takes that hand with it.
+    // The stayer takes the floor first: that makes this mouth a participant (a
+    // status read deliberately does not) and gives the leaver something to queue
+    // behind later.
     assert!(
         request(&mut stayer, ClientRequest::RaiseHand { room })
             .await
@@ -1852,6 +1836,20 @@ async fn an_agent_departs_without_evicting_the_node_it_shares() {
     )
     .await;
     assert!(held.ok, "{held:?}");
+
+    // Departing drops just this mouth, and the room keeps working for the rest.
+    let departed = request(&mut leaver, ClientRequest::Depart { room }).await;
+    assert!(departed.ok, "{departed:?}");
+    assert_eq!(departed.data.unwrap()["departed"], serde_json::json!(true));
+
+    let status = request(&mut stayer, ClientRequest::Status { room: Some(room) }).await;
+    assert!(status.ok, "{status:?}");
+    let participants = status.data.unwrap()["participants"].to_string();
+    assert!(!participants.contains("agent:leaver"), "{participants}");
+    assert!(participants.contains("agent:stayer"), "{participants}");
+
+    // The stayer still holds the floor, so a second hand really queues, and a
+    // departing mouth takes that hand with it.
     assert!(
         request(&mut leaver, ClientRequest::RaiseHand { room })
             .await
@@ -1870,4 +1868,66 @@ async fn an_agent_departs_without_evicting_the_node_it_shares() {
     let error = holding.error.unwrap();
     assert_eq!(error.code, "floor_held");
     assert!(error.message.contains("yield the floor"), "{error:?}");
+}
+
+#[tokio::test]
+async fn attendance_shows_who_is_listening_and_who_only_spoke() {
+    let _network_test = network_test_guard().await;
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let ticket = daemon
+        .create_ticket("attendance", StakePolicy::default(), FloorConfig::stick(30))
+        .unwrap();
+    let room = ticket.id;
+    let server = daemon.start(loopback()).await.unwrap();
+
+    let attending = |reply: &ClientReply| -> Vec<(String, bool)> {
+        reply.data.as_ref().unwrap()["attending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                (
+                    entry["agent"].as_str().unwrap().to_owned(),
+                    entry["waiting"].as_bool().unwrap(),
+                )
+            })
+            .collect()
+    };
+
+    // A pure reader is neither a participant nor an attendee.
+    let mut probe = attach(server.addr(), "agent:doctor").await;
+    let status = request(&mut probe, ClientRequest::Status { room: Some(room) }).await;
+    assert!(status.ok, "{status:?}");
+    assert!(attending(&status).is_empty(), "{:?}", attending(&status));
+    let participants = status.data.unwrap()["participants"].to_string();
+    assert!(!participants.contains("agent:doctor"), "{participants}");
+
+    // A mouth that blocked on the room is attending, and is not waiting once the
+    // call returns.
+    let mut listener = attach(server.addr(), "agent:listener").await;
+    let waited = request(
+        &mut listener,
+        ClientRequest::WaitForHistory {
+            room,
+            after_n: 0,
+            timeout_secs: Some(1),
+        },
+    )
+    .await;
+    assert!(waited.ok, "{waited:?}");
+    let status = request(&mut probe, ClientRequest::Status { room: Some(room) }).await;
+    assert_eq!(
+        attending(&status),
+        vec![("agent:listener".to_owned(), false)]
+    );
+
+    // Departing clears attendance, so a finished agent stops being shown as here.
+    assert!(
+        request(&mut listener, ClientRequest::Depart { room })
+            .await
+            .ok
+    );
+    let status = request(&mut probe, ClientRequest::Status { room: Some(room) }).await;
+    assert!(attending(&status).is_empty(), "{:?}", attending(&status));
 }

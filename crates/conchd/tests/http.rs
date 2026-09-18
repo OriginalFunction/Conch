@@ -851,6 +851,8 @@ async fn ui_html_is_embedded_and_served_at_root_and_ui() {
     assert!(html.contains("class=\"take-files\""));
     assert!(html.contains("id=\"attach-input\""));
     assert!(html.contains("id=\"image-dialog\""));
+    assert!(html.contains("class=\"attending\""));
+    assert!(script.contains("attendanceFor"));
     for (path, marker) in [
         ("/ui/vendor/marked.umd.js", "marked v18.0.11"),
         ("/ui/vendor/purify.min.js", "DOMPurify"),
