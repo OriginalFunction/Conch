@@ -282,6 +282,10 @@ pub enum GrantReason {
 pub enum IntentKind {
     Raise,
     Wait,
+    /// A tombstone: this mouth withdrew its hand. It supersedes the intent it
+    /// replaces and is never grantable, so a withdrawal travels the same
+    /// gossip and durability path as the hand it cancels.
+    Drop,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

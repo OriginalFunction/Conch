@@ -61,6 +61,55 @@ fn intent(key: &SigningKey, room: RoomId, agent: &str, id: u8, ts: u64) -> Inten
     intent
 }
 
+fn dropped(key: &SigningKey, room: RoomId, agent: &str, id: u8, ts: u64) -> Intent {
+    let mut intent = intent(key, room, agent, id, ts);
+    intent.kind = IntentKind::Drop;
+    intent.sig = SignatureBytes::from_bytes(sign(
+        key,
+        &signed_object_digest(&serde_json::to_value(&intent).unwrap()),
+    ));
+    intent
+}
+
+#[test]
+fn a_dropped_intent_supersedes_its_wait_and_leaves_the_queue_to_the_next_mouth() {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let node = NodeId::from_bytes(key.verifying_key().to_bytes());
+    let room = RoomId::from_bytes([3; 32]);
+    let state = state(room, vec![node], None);
+    let mut engine = FloorEngine::new(node);
+
+    assert!(engine
+        .upsert_intent(&state, intent(&key, room, "agent:first", 1, 100))
+        .unwrap());
+    assert!(engine
+        .upsert_intent(&state, intent(&key, room, "agent:second", 2, 200))
+        .unwrap());
+    assert_eq!(
+        engine.queue_head(&state, 300).unwrap().agent.as_str(),
+        "agent:first"
+    );
+
+    // The first mouth changes its mind. A later timestamp supersedes its own
+    // queued intent, and the tombstone is never grantable.
+    assert!(engine
+        .upsert_intent(&state, dropped(&key, room, "agent:first", 3, 250))
+        .unwrap());
+    assert_eq!(
+        engine.queue_head(&state, 300).unwrap().agent.as_str(),
+        "agent:second"
+    );
+
+    // Queueing again after a withdrawal works: a later timestamp wins.
+    assert!(engine
+        .upsert_intent(&state, intent(&key, room, "agent:first", 4, 400))
+        .unwrap());
+    assert_eq!(
+        engine.queue_head(&state, 500).unwrap().agent.as_str(),
+        "agent:second"
+    );
+}
+
 #[test]
 fn speak_without_grant_errors_no_grant() {
     let key = SigningKey::from_bytes(&[1; 32]);

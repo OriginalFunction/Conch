@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::{
     encoding::{signed_object_digest, verify},
-    types::{BlobRef, ChainState, Hash32, Intent, Mouth, NodeId, RoomId},
+    types::{BlobRef, ChainState, Hash32, Intent, IntentKind, Mouth, NodeId, RoomId},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,7 +149,8 @@ impl FloorEngine {
         self.intents
             .values()
             .filter(|intent| {
-                state.roster.contains(&intent.node)
+                intent.kind != IntentKind::Drop
+                    && state.roster.contains(&intent.node)
                     && state.room == Some(intent.room)
                     && !state.consumed_intents.contains(&intent.id)
                     && scene_ts < intent.exp
