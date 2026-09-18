@@ -40,6 +40,9 @@ pub enum ClientRequest {
     RaiseHand {
         room: RoomId,
     },
+    Withdraw {
+        room: RoomId,
+    },
     Grant {
         room: RoomId,
         to: Mouth,

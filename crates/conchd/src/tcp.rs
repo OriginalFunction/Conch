@@ -3345,6 +3345,7 @@ impl Daemon {
             } => self.client_speak(agent, room, text, request_id).await,
             ClientRequest::Yield { room } => self.client_yield(agent, room).await,
             ClientRequest::RaiseHand { room } => self.client_raise_hand(agent, room).await,
+            ClientRequest::Withdraw { room } => self.client_withdraw(agent, room).await,
             ClientRequest::Grant { room, to } => self.client_grant(agent, room, to).await,
             ClientRequest::Yank { room } => self.client_yank(agent, room).await,
             ClientRequest::Breakout {
@@ -3499,6 +3500,30 @@ impl Daemon {
             }
             changed.await;
         }
+    }
+
+    /// Cancel this mouth's queued hand by superseding it with a tombstone. The
+    /// tombstone gossips and persists exactly like the intent it replaces, so a
+    /// withdrawal survives a leader change instead of being re-advertised.
+    async fn client_withdraw(&self, agent: AgentId, room: RoomId) -> Result<Value, DaemonError> {
+        let node = self.node_id();
+        let floor = self.floor(room)?;
+        let replay = self.replay(room)?;
+        let queued = {
+            let engine = floor.engine.lock().expect("floor lock is not poisoned");
+            let queued = engine.intents().any(|intent| {
+                intent.agent == agent
+                    && intent.node == node
+                    && intent.kind != IntentKind::Drop
+                    && !replay.chain.consumed_intents.contains(&intent.id)
+            });
+            queued
+        };
+        if !queued {
+            return Ok(json!({ "withdrawn": false }));
+        }
+        self.queue_intent(room, agent, IntentKind::Drop).await?;
+        Ok(json!({ "withdrawn": true }))
     }
 
     async fn client_raise_hand(&self, agent: AgentId, room: RoomId) -> Result<Value, DaemonError> {
@@ -4350,6 +4375,13 @@ impl Daemon {
                     && !replay.chain.consumed_intents.contains(&intent.id)
             })
             .cloned();
+        // A withdrawal is a tombstone, so a new hand must mint a fresh intent
+        // with a later timestamp rather than inherit the one it cancels.
+        let superseded = existing
+            .as_ref()
+            .filter(|intent| intent.kind == IntentKind::Drop)
+            .map(|intent| intent.ts);
+        let existing = existing.filter(|intent| intent.kind != IntentKind::Drop);
         let accepted_intent =
             replay
                 .pending
@@ -4371,7 +4403,11 @@ impl Daemon {
                 now.max(intent.ts.saturating_add(1)),
                 kind,
             ),
-            _ => (Hash32::from_bytes(random::<[u8; 32]>()), now, kind),
+            _ => (
+                Hash32::from_bytes(random::<[u8; 32]>()),
+                superseded.map_or(now, |ts| now.max(ts.saturating_add(1))),
+                kind,
+            ),
         };
         let mut intent = Intent {
             v: 1,
@@ -6821,6 +6857,7 @@ fn request_room(request: &ClientRequest) -> Option<RoomId> {
         | ClientRequest::Speak { room, .. }
         | ClientRequest::Yield { room }
         | ClientRequest::RaiseHand { room }
+        | ClientRequest::Withdraw { room }
         | ClientRequest::Grant { room, .. }
         | ClientRequest::Yank { room }
         | ClientRequest::Breakout { room, .. }

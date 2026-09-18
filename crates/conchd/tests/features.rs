@@ -1701,3 +1701,85 @@ async fn a_mode_only_membership_keeps_the_committed_floor_timeout() {
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn a_withdrawn_hand_does_not_take_the_floor() {
+    let _network_test = network_test_guard().await;
+    let data = TempDir::new().unwrap();
+    let daemon = Daemon::open(data.path()).unwrap();
+    let ticket = daemon
+        .create_ticket(
+            "withdrawals",
+            StakePolicy::default(),
+            FloorConfig::stick(30),
+        )
+        .unwrap();
+    let room = ticket.id;
+    let server = daemon.start(loopback()).await.unwrap();
+
+    // Someone else holds the floor, so the next two hands have to queue.
+    let mut holder = attach(server.addr(), "agent:holder").await;
+    assert!(
+        request(&mut holder, ClientRequest::RaiseHand { room })
+            .await
+            .ok
+    );
+    let held = request(
+        &mut holder,
+        ClientRequest::WaitForFloor {
+            room,
+            timeout_secs: Some(10),
+        },
+    )
+    .await;
+    assert!(held.ok, "{held:?}");
+
+    let mut first = attach(server.addr(), "agent:first").await;
+    let mut second = attach(server.addr(), "agent:second").await;
+    assert!(
+        request(&mut first, ClientRequest::RaiseHand { room })
+            .await
+            .ok
+    );
+    assert!(
+        request(&mut second, ClientRequest::RaiseHand { room })
+            .await
+            .ok
+    );
+
+    let withdrawn = request(&mut first, ClientRequest::Withdraw { room }).await;
+    assert!(withdrawn.ok, "{withdrawn:?}");
+    assert_eq!(
+        withdrawn.data.unwrap()["withdrawn"],
+        serde_json::json!(true)
+    );
+
+    // The floor skips the withdrawn hand and reaches the mouth still queued.
+    assert!(request(&mut holder, ClientRequest::Yield { room }).await.ok);
+    let granted = request(
+        &mut second,
+        ClientRequest::WaitForFloor {
+            room,
+            timeout_secs: Some(10),
+        },
+    )
+    .await;
+    assert!(granted.ok, "{granted:?}");
+    assert_eq!(
+        granted.data.unwrap()["body"]["to"]["agent"],
+        serde_json::json!("agent:second")
+    );
+
+    // Withdrawing with nothing queued is a no-op, not an error.
+    let again = request(&mut first, ClientRequest::Withdraw { room }).await;
+    assert!(again.ok, "{again:?}");
+    assert_eq!(again.data.unwrap()["withdrawn"], serde_json::json!(false));
+
+    // A withdrawal loses to a grant that already committed: the intent is
+    // consumed, so there is nothing left to cancel and the mouth holds the
+    // floor until it yields.
+    let racing = request(&mut second, ClientRequest::Withdraw { room }).await;
+    assert!(racing.ok, "{racing:?}");
+    assert_eq!(racing.data.unwrap()["withdrawn"], serde_json::json!(false));
+    assert!(request(&mut second, ClientRequest::Yield { room }).await.ok);
+}
