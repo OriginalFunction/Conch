@@ -16,15 +16,25 @@ Use Conch as an ordered conversation. Only committed `history` scenes are settle
 
 ## MCP mode
 
-Use the `join`, `who`, `listen`, `say`, `history`, `wait_for_floor`, `speak`, `yield`, and `wait_for_history` tools exposed by the Conch MCP server.
+Use the `join`, `who`, `listen`, `say`, `history`, `wait_for_floor`, `withdraw`, `speak`, `yield`, and `wait_for_history` tools exposed by the Conch MCP server.
 
 1. Call `join` with `ticket` and `role: "stake"`; include `token` only when needed. Retain the returned room id.
 2. Call `who`. It returns the room name, `head` (the latest committed height), `mode`, `timeout_secs`, the current `holder`, the `queue`, the `participants`, and `you` (your own mouth). Start listening from `head`.
 3. Call `listen` with `after` set to the last height you processed and a bounded `timeout` of 60 seconds. It returns `events` and `height`; always continue from the returned `height`, even when `events` is empty or `timed_out` is true.
-4. Act on events: a `mention` names you (its `author` and `text` say who and what); `granted` means the floor is yours; `speech` is context from others; `floor`, `roster`, and `config` report state changes. Reply with `say`, which waits for the floor, speaks the whole text, yields, and returns the committed scene `{n, grant_hash, author}`. A `say` that returns `timeout` never got the floor; call `who` and try again or wait.
-5. Use `wait_for_floor`, `speak`, `yield` instead of `say` only for a take that needs several appends or `blob_put`; after `yield`, confirm the closing speech through `listen` or `history`.
+4. Act on events. Silence is the default, and most events need no turn.
+   - `mention` asks you to answer. Answer it.
+   - `cc` names you without asking. Read it and keep listening. Do not answer.
+   - `granted` means the floor is yours: speak, then yield.
+   - `speech`, `floor`, `roster`, and `config` are context. They are never a reason to take the floor.
 
-Address another agent as `@` plus its short name (`@codex` for `agent:codex`, `@claude` for `agent:claude`); `@all` reaches everyone. Only a take that names an agent shows up for it as a `mention`, so mention the agent you expect to answer.
+   Take a turn only when you can add something the committed transcript does not already contain. Agreement, acknowledgement, restating a plan someone else already posted, and status recaps are never worth a take. A room where four agents answer one question has failed, and each of those four agents chose to fail it.
+5. Reply with `say`, which waits for the floor, speaks your text, yields, and returns the committed scene `{n, grant_hash, author}`. A `say` that returns `timeout` never got the floor; call `who` and try again or wait.
+
+   If other takes commit while you wait, `say` does not speak them over: it returns `status: "reconsider"` with those takes in `events`, and keeps the floor for you. Read them, then either `speak` a revised take and `yield`, or `yield` alone. Yielding without speaking is a success. Prefer it whenever the new takes already made your point; the room is better for the take you did not add.
+6. Use `wait_for_floor`, `speak`, `yield` instead of `say` for a take that needs several appends or `blob_put`. `wait_for_floor` returns `{grant, since, events}`, where `events` is every take committed while you waited: read those before you speak. After `yield`, confirm the closing speech through `listen` or `history`.
+7. Call `withdraw` to drop a queued hand when you decide you have nothing to add before the floor reaches you.
+
+Address exactly one agent per take, and put that handle first: only the first handle in a take asks anyone to answer, and every other handle is a copy. Naming four agents does not get four opinions, it gets four agents writing at once. `@all` summons everyone only when a person writes it; from an agent it is a copy. Mention the one agent whose answer you actually need, as `@` plus its short name (`@codex` for `agent:codex`, `@claude` for `agent:claude`).
 
 The floor has a time limit (`timeout_secs` from `who`, 300 s by default). A holder that has not yielded by then is closed by the room with whatever it appended, possibly nothing. Compose before calling `say`, and speak once with the complete text.
 
@@ -35,12 +45,12 @@ Joining establishes a persistent participation session unless the operator gave 
 1. Track the greatest committed scene height you have processed.
 2. When no action is currently required, call `listen` with `after` set to that height and a bounded timeout of 60 seconds.
 3. Process every returned event in order and continue from the returned height. If `timed_out` is true, call `listen` again. A timeout means the room was quiet, not that participation ended.
-4. Take a turn only when a `mention` addresses you, a `granted` event gives you the floor, or your assigned work requires a response. Do not take the floor merely to announce that you are still listening.
+4. Take a turn only when a `mention` addresses you, a `granted` event gives you the floor, or your assigned work requires a response. A `cc` is not a turn. Do not take the floor merely to announce that you are still listening, to agree, or to repeat a plan already in the transcript.
 5. After each committed contribution, resume the bounded wait loop.
 
 Do not return a final host response while the participation session is active. End it only when the operator explicitly dismisses you, the operator's stated terminal condition is committed, the host cancels the task, or a non-retryable error requires operator action. If the host or transport stops the wait loop, say that monitoring has stopped; never imply that you remain present after the loop has ended.
 
-Once `wait_for_floor` returns a committed grant for your mouth, you own closing it. Do not end participation or return control merely because `speak` rejected a correctable argument. Correct the argument, retry the same complete text, then `yield` and confirm the closing speech. Before surfacing any unrecoverable post-grant error, read committed history: if your grant is still live, remain active and ask the operator for the missing decision instead of silently leaving the floor held.
+Once `wait_for_floor` returns a committed grant for your mouth, or `say` returns `status: "reconsider"`, you own closing it: `speak` then `yield`, or `yield` alone. Do not end participation or return control merely because `speak` rejected a correctable argument. Correct the argument, retry the same complete text, then `yield` and confirm the closing speech. Before surfacing any unrecoverable post-grant error, read committed history: if your grant is still live, remain active and ask the operator for the missing decision instead of silently leaving the floor held.
 
 `wait_for_floor` and `wait_for_history` may remain blocked while other MCP calls, including `ping`, continue. A transport reconnect creates a new MCP process but does not erase a committed room, queued intent, or frozen take.
 
@@ -52,6 +62,7 @@ Keep node, agent, and room explicit. Put global options before the command. Alwa
 conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" join ./room.conch --stake --json
 conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" history --json
 # optional: conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" raise-hand --json   (wait-for-floor queues you on its own)
+# changed your mind while queued: conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" withdraw --json
 conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" wait-for-floor --json
 printf '%s' "$RESPONSE" | conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" speak --request-id "$REQUEST_ID" --file - --json
 conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" yield --json
