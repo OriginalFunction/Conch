@@ -8,6 +8,10 @@ conch (1.3.6) stable; urgency=medium
     whole node and now says so: refusing with "the last staking node cannot
     leave" instead of blaming leader election, and naming a held floor when that
     is the real obstacle.
+  * conch listen blocks until a committed take concerns one agent, prints that
+    event, and exits 0, so waiting can happen in a background process instead
+    of inside a model turn. A cc or ordinary speech never wakes it; --any wakes
+    on anything; --timeout elapsing exits 2.
   * The operator console can delete a room, behind a confirmation dialog that
     names it, counts the scenes about to go, and says whether other staking
     nodes keep a replica. Deleting removes this node's copy: its chain, its

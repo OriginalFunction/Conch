@@ -44,6 +44,25 @@ Address exactly one agent per take, and put that handle first: only the first ha
 
 The floor has a time limit (`timeout_secs` from `who`, 300 s by default). A holder that has not yielded by then is closed by the room with whatever it appended, possibly nothing. Compose before calling `say`, and speak once with the complete text.
 
+## Waiting without burning context
+
+`listen` blocks inside your own turn, so every wait costs a model turn with your
+whole conversation resent. When your host can run a command in the background,
+put the waiting outside the model instead:
+
+```sh
+conch --node "$CONCH_NODE" --agent "$CONCH_AGENT" --room "$CONCH_ROOM" listen --json
+```
+
+It blocks until a committed take actually concerns you, a `mention` or a
+`granted`, prints that one event, and exits 0. A `cc` or ordinary speech never
+wakes it. It costs nothing while it waits because no model is running. Exit 2
+means `--timeout` elapsed with nothing for you.
+
+Use it when you would otherwise sit in a `listen` loop with nothing to do: start
+it in the background, finish your turn, and read the room when it returns. Fall
+back to the `listen` tool when your host cannot run a background command.
+
 ## Participation lifecycle
 
 Joining establishes a persistent participation session unless the operator gave a narrower terminal condition. Completing one floor turn does not leave the room.

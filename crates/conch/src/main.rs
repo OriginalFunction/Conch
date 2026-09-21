@@ -20,11 +20,16 @@ use conch_core::{
 };
 use rand::random;
 use serde::{de::DeserializeOwned, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    time::{Duration, Instant},
 };
+
+/// The daemon caps a history wait at 300 s, so a watcher renews its wait at
+/// that boundary rather than polling on a shorter clock.
+const MAX_LISTEN_WAIT_SECS: u64 = 300;
 
 #[tokio::main]
 async fn main() {
@@ -180,6 +185,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("the take was accepted but its closing speech has not committed within 60 s; check `conch history`".into());
             }
         }
+    }
+    if let ParsedRequest::Listen {
+        room,
+        after,
+        any,
+        timeout_secs,
+    } = request
+    {
+        return run_listen(
+            &node,
+            &agent,
+            node_is_default,
+            room,
+            after,
+            any,
+            timeout_secs,
+            json,
+        )
+        .await;
     }
     if let ParsedRequest::Tail {
         room,
@@ -366,6 +390,101 @@ fn print_reply(
 }
 
 /// Print a history page as one line per record (JSON record per line with --json).
+/// Block until a committed take concerns this agent, then exit. Nothing here
+/// runs a model, so a host can leave this in the background and pay only when
+/// the room actually needs its agent.
+#[allow(clippy::too_many_arguments)]
+async fn run_listen(
+    node: &str,
+    agent: &AgentId,
+    node_is_default: bool,
+    room: RoomId,
+    after: Option<u64>,
+    any: bool,
+    timeout_secs: Option<u64>,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let status = call(
+        node,
+        agent,
+        node_is_default,
+        "listen",
+        ClientRequest::Status { room: Some(room) },
+    )
+    .await?;
+    let you = Mouth {
+        agent: agent.clone(),
+        node: serde_json::from_value(status["node"].clone())?,
+    };
+    let mut last = after.unwrap_or_else(|| status["head_n"].as_u64().unwrap_or(0));
+    let deadline = timeout_secs.map(|secs| Instant::now() + Duration::from_secs(secs));
+    loop {
+        let remaining = match deadline {
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(Instant::now()).as_secs();
+                if left == 0 {
+                    if json {
+                        println!("{}", json!({ "woke": false, "height": last }));
+                    } else {
+                        eprintln!("conch: nothing for {} before the timeout", agent.as_str());
+                    }
+                    std::process::exit(2);
+                }
+                left.min(MAX_LISTEN_WAIT_SECS)
+            }
+            None => MAX_LISTEN_WAIT_SECS,
+        };
+        let page = tokio::select! {
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+            page = call(node, agent, node_is_default, "listen", ClientRequest::WaitForHistory {
+                room,
+                after_n: last,
+                timeout_secs: Some(remaining),
+            }) => page?,
+        };
+        let records = page["scenes"].as_array().cloned().unwrap_or_default();
+        let events = conch_mcp::events::flatten(&records, &you);
+        last = conch_mcp::events::last_height(&records).unwrap_or(last);
+        // A `cc` names this agent without asking it to answer, and plain speech
+        // is context. Neither is a reason to spend a turn.
+        let woke = events.iter().find(|event| {
+            let kind = event["kind"].as_str().unwrap_or("");
+            any || matches!(kind, "mention" | "granted")
+        });
+        if let Some(event) = woke {
+            if json {
+                println!("{event}");
+            } else {
+                println!("{}", describe_wake(event));
+            }
+            return Ok(());
+        }
+    }
+}
+
+/// One line a person or a shell script can read at a glance.
+fn describe_wake(event: &Value) -> String {
+    let kind = event["kind"].as_str().unwrap_or("event");
+    let n = event["n"].as_u64().unwrap_or(0);
+    let author = event["author"]["agent"].as_str().unwrap_or("someone");
+    let first = event["text"]
+        .as_str()
+        .unwrap_or("")
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    match kind {
+        "granted" => format!("granted #{n}: the floor is yours"),
+        "mention" if event["broadcast"] == json!(true) => {
+            format!("broadcast #{n} from {author}: {first}")
+        }
+        "mention" => format!("mention #{n} from {author}: {first}"),
+        other => format!("{other} #{n} from {author}: {first}"),
+    }
+}
+
 fn print_scenes(
     page: &Value,
     json: bool,
@@ -835,6 +954,12 @@ enum ParsedRequest {
         backlog: u64,
         follow: bool,
     },
+    Listen {
+        room: RoomId,
+        after: Option<u64>,
+        any: bool,
+        timeout_secs: Option<u64>,
+    },
     Local(LocalCommand),
 }
 
@@ -924,6 +1049,9 @@ impl ParsedRequest {
             }
             Self::Tail { .. } => {
                 unreachable!("tail is handled before client request resolution")
+            }
+            Self::Listen { .. } => {
+                unreachable!("listen is handled before client request resolution")
             }
             Self::Local(_) => {
                 unreachable!("local commands are handled before client request resolution")
@@ -1584,6 +1712,41 @@ impl Arguments {
                     follow,
                 }
             }),
+            "listen" => {
+                let mut after = None;
+                let mut any = false;
+                let mut timeout_secs = None;
+                while let Some(arg) = arguments.next() {
+                    match arg.as_str() {
+                        "--after" => {
+                            after = Some(
+                                arguments
+                                    .next()
+                                    .ok_or("--after requires a height")?
+                                    .parse()
+                                    .map_err(|_| "invalid height")?,
+                            )
+                        }
+                        "--timeout" => {
+                            timeout_secs = Some(
+                                arguments
+                                    .next()
+                                    .ok_or("--timeout requires seconds")?
+                                    .parse()
+                                    .map_err(|_| "invalid timeout")?,
+                            )
+                        }
+                        "--any" => any = true,
+                        other => return Err(format!("unknown listen argument: {other}")),
+                    }
+                }
+                ParsedRequest::Listen {
+                    room: resolve_room()?,
+                    after,
+                    any,
+                    timeout_secs,
+                }
+            }
             "tail" => {
                 let mut backlog = 20_u64;
                 let mut follow = true;
@@ -1728,7 +1891,7 @@ fn print_help() {
            -V, --version         Print version\n\
            -h, --help            Print help\n\n\
          Commands:\n\
-           say, tail, rooms, use, create, join, status, history\n\
+           say, tail, listen, rooms, use, create, join, status, history\n\
            wait-for-floor, speak, yield, raise-hand, withdraw, grant, yank, config, breakout, blob, depart, leave\n\
            mcp, setup, up, down, doctor\n\n\
          Run `conch help <command>` for command-specific usage.",
@@ -1754,6 +1917,11 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "status" => "conch status",
         "history" => "conch history [--from N] [--follow] [--oneline]\n\
              --oneline keeps the first line of each take, cut at the terminal width (or $COLUMNS, else 120 columns).",
+        "listen" => "conch listen [--after N] [--any] [--timeout SECS]\n\
+             Blocks until a committed take concerns this agent, prints it, and exits 0.\n\
+             Costs nothing while it waits, so a host can run it in the background and\n\
+             wake the agent only when the room needs it. --any wakes on any new scene.\n\
+             Exits 2 when --timeout elapses first.",
         "tail" => "conch tail [-n N] [--no-follow] [--oneline]\n\
              Prints the last N takes (default 20), then streams new ones until Ctrl-C.\n\
              --oneline keeps the first line of each take, cut at the terminal width (or $COLUMNS, else 120 columns).\n\
@@ -2295,6 +2463,7 @@ mod tests {
         "status",
         "history",
         "tail",
+        "listen",
         "rooms",
         "use",
         "raise-hand",
