@@ -1944,6 +1944,8 @@ async fn deleting_a_room_removes_its_replica_from_this_node() {
     let server = daemon.start(loopback()).await.unwrap();
     let room_dir = data.path().join("rooms").join(room.to_string());
     assert!(room_dir.is_dir());
+    // Creating a room makes it current; the delete below has to clear that.
+    assert!(data.path().join("current-room").exists());
 
     // A room nobody is speaking in deletes, chain and attachments together.
     let mut client = attach(server.addr(), "human:operator").await;
@@ -1958,6 +1960,13 @@ async fn deleting_a_room_removes_its_replica_from_this_node() {
     let gone = request(&mut client, ClientRequest::Status { room: Some(room) }).await;
     assert!(!gone.ok, "{gone:?}");
     assert_eq!(gone.error.unwrap().code, "unknown_room");
+
+    // Creating a room makes it current, so deleting it must not leave the
+    // marker pointing at a room that no longer exists.
+    assert!(
+        !data.path().join("current-room").exists(),
+        "a deleted room must not stay the current room"
+    );
 }
 
 #[tokio::test]

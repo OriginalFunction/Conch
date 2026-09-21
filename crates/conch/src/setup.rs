@@ -48,6 +48,11 @@ pub struct SetupReport {
     pub next_step: &'static str,
 }
 
+/// Is the installed skill at `path` exactly what this build would write?
+pub fn skill_is_current(path: &Path, version: &str) -> bool {
+    fs::read_to_string(path).ok().as_deref() == Some(skill_text(version).as_str())
+}
+
 /// Embedded skill with a version comment placed right after the YAML frontmatter.
 pub fn skill_text(version: &str) -> String {
     let end = SKILL_SOURCE
@@ -185,10 +190,11 @@ pub fn run(options: &SetupOptions) -> Result<SetupReport, SetupError> {
 
     let skill_path = host.skill_dir(&options.home).join("SKILL.md");
     let wanted_skill = skill_text(&options.version);
-    let skill_changed = fs::read_to_string(&skill_path)
-        .ok()
-        .and_then(|t| skill_version(&t))
-        != Some(options.version.clone());
+    // Compare what the file says, not just the version stamped in it. A release
+    // can change the protocol without changing the version, and an installed
+    // copy that merely matches the marker is still the wrong instructions.
+    let skill_changed =
+        fs::read_to_string(&skill_path).ok().as_deref() != Some(wanted_skill.as_str());
 
     // Host configs hold credentials. Whatever mode the file already had is the mode
     // it keeps, in the rewrite and in the backup beside it.
@@ -396,6 +402,32 @@ mod tests {
             ),
             Some(exe)
         );
+    }
+
+    #[test]
+    fn a_skill_whose_text_drifted_inside_a_version_is_not_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("SKILL.md");
+        // Exactly what this build writes is current.
+        fs::write(&path, skill_text("9.9.9")).unwrap();
+        assert!(skill_is_current(&path, "9.9.9"));
+
+        // The marker still says 9.9.9, but the instructions are not ours. A
+        // release can change the protocol without changing the version, so the
+        // marker alone must not be trusted.
+        let drifted = skill_text("9.9.9").replace("Silence is the default", "Answer everything");
+        fs::write(&path, drifted).unwrap();
+        assert_eq!(
+            skill_version(&fs::read_to_string(&path).unwrap()).as_deref(),
+            Some("9.9.9")
+        );
+        assert!(!skill_is_current(&path, "9.9.9"));
+
+        // A different version is not current either, and neither is a missing file.
+        fs::write(&path, skill_text("9.9.8")).unwrap();
+        assert!(!skill_is_current(&path, "9.9.9"));
+        fs::remove_file(&path).unwrap();
+        assert!(!skill_is_current(&path, "9.9.9"));
     }
 
     #[test]

@@ -328,11 +328,17 @@ fn host_check(host: Host, home: &Path, cli_version: &str) -> Check {
             Some(format!("run `conch setup {}`", host.name())),
         );
     }
-    let skill = fs::read_to_string(host.skill_dir(home).join("SKILL.md")).ok();
+    let skill_path = host.skill_dir(home).join("SKILL.md");
+    let skill = fs::read_to_string(&skill_path).ok();
+    if setup::skill_is_current(&skill_path, cli_version) {
+        return check(Level::Ok, host.name(), agent, None);
+    }
     let detail = match skill.as_deref() {
         None => format!("{agent}, skill missing"),
         Some(text) => match setup::skill_version(text) {
-            Some(v) if v == cli_version => return check(Level::Ok, host.name(), agent, None),
+            // The marker matches but the text does not: the protocol changed
+            // inside a version, so setup still has work to do.
+            Some(v) if v == cli_version => format!("{agent}, skill {v} differs from this build"),
             Some(v) => format!("{agent}, skill {v} is stale"),
             // A copy is there, it just predates the version marker.
             None => format!("{agent}, skill unversioned (pre-1.3)"),

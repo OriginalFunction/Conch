@@ -2251,6 +2251,22 @@ impl Daemon {
         write_json_atomic(&self.inner.data_dir.join("current-room"), &room)
     }
 
+    /// Forget the current-room marker when it names `room`.
+    fn clear_current_room_if(&self, room: RoomId) -> Result<(), DaemonError> {
+        let path = self.inner.data_dir.join("current-room");
+        let current: Option<RoomId> = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        if current == Some(room) {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
     async fn serve_listener(self, listener: TcpListener) -> Result<(), DaemonError> {
         let listener_addr = listener.local_addr()?;
         let mut connections = JoinSet::new();
@@ -4353,6 +4369,9 @@ impl Daemon {
             }
         })
         .await??;
+        // A pointer at a room that no longer exists makes every later command
+        // resolve to nothing; clear it rather than leave it dangling.
+        self.clear_current_room_if(room)?;
         Ok(json!({ "deleted": true, "room": room, "name": name }))
     }
 
