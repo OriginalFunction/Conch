@@ -1793,11 +1793,11 @@ impl Arguments {
             },
             "setup" => {
                 let host_name = arguments.next().ok_or(
-                    "setup requires a host: claude, codex, grok, cursor, gemini, opencode, antigravity",
+                    "setup requires a host: claude, codex, grok, cursor, gemini, opencode, antigravity, kimi",
                 )?;
                 let host = conch::hosts::Host::parse(&host_name).ok_or_else(|| {
                     format!(
-                        "unknown host {host_name}; expected one of claude, codex, grok, cursor, gemini, opencode, antigravity"
+                        "unknown host {host_name}; expected one of claude, codex, grok, cursor, gemini, opencode, antigravity, kimi"
                     )
                 })?;
                 let mut agent_override = None;
@@ -1952,7 +1952,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "mcp" => "conch mcp\n\
              Runs the stdio MCP server; use an explicit identity (the setup command records one).",
         "setup" => {
-            "conch setup <claude|codex|grok|cursor|gemini|opencode|antigravity> [--agent ID] [--scope user|project] [--env K=V ...] [--dry-run]\n\
+            "conch setup <claude|codex|grok|cursor|gemini|opencode|antigravity|kimi> [--agent ID] [--scope user|project] [--env K=V ...] [--dry-run]\n\
              Example: conch setup claude"
         }
         "up" => {

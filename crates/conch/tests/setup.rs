@@ -90,6 +90,7 @@ fn conch(home: &Path, cwd: &Path, args: &[&str]) -> std::process::Output {
         .env_remove("CODEX_HOME")
         .env_remove("GROK_HOME")
         .env_remove("OPENCODE_CONFIG")
+        .env_remove("KIMI_CODE_HOME")
         .current_dir(cwd)
         .output()
         .unwrap()
@@ -274,6 +275,7 @@ fn dry_run_writes_nothing_and_shows_a_diff() {
         .env_remove("CODEX_HOME")
         .env_remove("GROK_HOME")
         .env_remove("OPENCODE_CONFIG")
+        .env_remove("KIMI_CODE_HOME")
         .current_dir(home.path())
         .output()
         .unwrap();
@@ -333,7 +335,7 @@ fn unknown_host_is_rejected() {
     let output = conch(home.path(), home.path(), &["setup", "vim"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("claude, codex, grok, cursor, gemini, opencode, antigravity"));
+        .contains("claude, codex, grok, cursor, gemini, opencode, antigravity, kimi"));
 }
 
 #[test]
@@ -370,5 +372,33 @@ fn antigravity_setup_fills_an_empty_mcp_config_and_accepts_the_agy_alias() {
 
     // A rerun with the full name changes nothing.
     let again = ok(&conch(home.path(), home.path(), &["setup", "antigravity"]));
+    assert!(again.contains("already configured"), "{again}");
+}
+
+#[test]
+fn kimi_setup_writes_mcp_json_and_the_shared_agents_skill() {
+    let home = TempDir::new().unwrap();
+    let out = ok(&conch(home.path(), home.path(), &["setup", "kimi"]));
+    let config = home.path().join(".kimi-code/mcp.json");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    let entry = &parsed["mcpServers"]["conch"];
+    assert_eq!(entry["command"], env!("CARGO_BIN_EXE_conch"));
+    assert_eq!(
+        entry["args"],
+        serde_json::json!(["--agent", "agent:kimi", "mcp"])
+    );
+    assert!(
+        entry.get("type").is_none(),
+        "Kimi entries carry no type field"
+    );
+    // Kimi reads ~/.agents/skills itself; a second copy under ~/.kimi-code would
+    // give it two join-room skills.
+    let skill = fs::read_to_string(home.path().join(".agents/skills/join-room/SKILL.md")).unwrap();
+    assert!(skill.starts_with("---\nname: join-room\n"));
+    assert!(!home.path().join(".kimi-code/skills").exists());
+    assert!(out.contains("kimi: wrote"), "{out}");
+
+    let again = ok(&conch(home.path(), home.path(), &["setup", "kimi"]));
     assert!(again.contains("already configured"), "{again}");
 }

@@ -123,6 +123,7 @@ fn doctor(home: &TempDir, data: &TempDir, tcp: SocketAddr) -> std::process::Outp
         .env_remove("CODEX_HOME")
         .env_remove("GROK_HOME")
         .env_remove("OPENCODE_CONFIG")
+        .env_remove("KIMI_CODE_HOME")
         .output()
         .unwrap()
 }
@@ -135,6 +136,7 @@ fn setup(home: &TempDir, host: &str) {
         .env_remove("CODEX_HOME")
         .env_remove("GROK_HOME")
         .env_remove("OPENCODE_CONFIG")
+        .env_remove("KIMI_CODE_HOME")
         .status()
         .unwrap()
         .success());
@@ -247,6 +249,7 @@ fn doctor_passes_with_daemon_and_reports_hosts() {
     assert!(out.contains("ok    cursor        agent:cursor"), "{out}");
     assert!(out.contains("--    claude        not configured"), "{out}");
     assert!(out.contains("--    antigravity   not configured"), "{out}");
+    assert!(out.contains("--    kimi          not configured"), "{out}");
 }
 
 #[test]
@@ -401,6 +404,7 @@ fn doctor_with_service_manager(
         .env_remove("CODEX_HOME")
         .env_remove("GROK_HOME")
         .env_remove("OPENCODE_CONFIG")
+        .env_remove("KIMI_CODE_HOME")
         .output()
         .unwrap();
     String::from_utf8_lossy(&output.stdout).into_owned()

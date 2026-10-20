@@ -13,6 +13,9 @@ pub enum Host {
     /// Google Antigravity (IDE and the `agy` CLI); MCP config and skills live under
     /// `~/.gemini/config/`, shared by both surfaces.
     Antigravity,
+    /// Kimi Code; MCP config in `$KIMI_CODE_HOME/mcp.json` (default `~/.kimi-code`), and
+    /// it already reads skills from the shared `~/.agents/skills`.
+    Kimi,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +34,7 @@ pub enum Format {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Env(pub Vec<(String, String)>);
 
-pub const ALL_HOSTS: [Host; 7] = [
+pub const ALL_HOSTS: [Host; 8] = [
     Host::Claude,
     Host::Codex,
     Host::Grok,
@@ -39,6 +42,7 @@ pub const ALL_HOSTS: [Host; 7] = [
     Host::Gemini,
     Host::Opencode,
     Host::Antigravity,
+    Host::Kimi,
 ];
 
 fn json_string(value: &str) -> String {
@@ -81,6 +85,7 @@ impl Host {
             Host::Gemini => "gemini",
             Host::Opencode => "opencode",
             Host::Antigravity => "antigravity",
+            Host::Kimi => "kimi",
         }
     }
 
@@ -92,7 +97,9 @@ impl Host {
         match self {
             Host::Codex | Host::Grok => Format::Toml,
             Host::Opencode => Format::Jsonc,
-            Host::Claude | Host::Cursor | Host::Gemini | Host::Antigravity => Format::Json,
+            Host::Claude | Host::Cursor | Host::Gemini | Host::Antigravity | Host::Kimi => {
+                Format::Json
+            }
         }
     }
 
@@ -100,7 +107,7 @@ impl Host {
         match self {
             Host::Codex | Host::Grok => &["mcp_servers", "conch"],
             Host::Opencode => &["mcp", "conch"],
-            Host::Claude | Host::Cursor | Host::Gemini | Host::Antigravity => {
+            Host::Claude | Host::Cursor | Host::Gemini | Host::Antigravity | Host::Kimi => {
                 &["mcpServers", "conch"]
             }
         }
@@ -127,6 +134,10 @@ impl Host {
             (Host::Gemini, Scope::Project) => cwd.join(".gemini/settings.json"),
             (Host::Antigravity, Scope::User) => home.join(".gemini/config/mcp_config.json"),
             (Host::Antigravity, Scope::Project) => cwd.join(".agents/mcp_config.json"),
+            (Host::Kimi, Scope::User) => {
+                env_dir("KIMI_CODE_HOME", home.join(".kimi-code")).join("mcp.json")
+            }
+            (Host::Kimi, Scope::Project) => cwd.join(".kimi-code/mcp.json"),
             (Host::Opencode, Scope::User) => {
                 if let Some(explicit) = std::env::var_os("OPENCODE_CONFIG") {
                     return PathBuf::from(explicit);
@@ -156,7 +167,7 @@ impl Host {
         let argv = json_array(args.iter().cloned());
         let mut out = match self {
             Host::Claude => format!(r#"{{"type":"stdio","command":{cmd},"args":{argv}"#),
-            Host::Cursor | Host::Gemini | Host::Antigravity => {
+            Host::Cursor | Host::Gemini | Host::Antigravity | Host::Kimi => {
                 format!(r#"{{"command":{cmd},"args":{argv}"#)
             }
             Host::Opencode => format!(
@@ -182,7 +193,7 @@ impl Host {
             Host::Claude => home.join(".claude/skills/join-room"),
             Host::Opencode => home.join(".config/opencode/skills/join-room"),
             Host::Antigravity => home.join(".gemini/config/skills/join-room"),
-            Host::Codex | Host::Grok | Host::Cursor | Host::Gemini => {
+            Host::Codex | Host::Grok | Host::Cursor | Host::Gemini | Host::Kimi => {
                 home.join(".agents/skills/join-room")
             }
         }
@@ -203,6 +214,7 @@ impl Host {
             Host::Antigravity => {
                 "Start a new agy session (or reload the Antigravity window); `/mcp` lists conch."
             }
+            Host::Kimi => "Start a new Kimi session (`/new`) or restart kimi to load conch.",
         }
     }
 
@@ -215,7 +227,7 @@ impl Host {
             Host::Grok => format!("grok mcp add conch -- {command} {argv}"),
             Host::Gemini => format!("gemini mcp add -s user conch {command} {argv}"),
             Host::Antigravity => format!("agy mcp add conch -- {command} {argv}"),
-            Host::Cursor | Host::Opencode => format!(
+            Host::Cursor | Host::Opencode | Host::Kimi => format!(
                 "add this to {}:\n{}",
                 self.config_path(Scope::User, Path::new("~"), Path::new("."))
                     .display(),
@@ -268,13 +280,19 @@ mod tests {
     }
 
     #[test]
-    fn skill_dirs_share_agents_for_four_hosts() {
+    fn skill_dirs_share_agents_for_five_hosts() {
         let home = Path::new("/h");
         assert_eq!(
             Host::Claude.skill_dir(home),
             Path::new("/h/.claude/skills/join-room")
         );
-        for host in [Host::Codex, Host::Grok, Host::Cursor, Host::Gemini] {
+        for host in [
+            Host::Codex,
+            Host::Grok,
+            Host::Cursor,
+            Host::Gemini,
+            Host::Kimi,
+        ] {
             assert_eq!(
                 host.skill_dir(home),
                 Path::new("/h/.agents/skills/join-room")
@@ -364,6 +382,39 @@ mod tests {
             "agy mcp add conch -- /b/conch --agent agent:x mcp"
         );
         assert!(Host::Antigravity.next_step().contains("/mcp"));
-        assert_eq!(ALL_HOSTS.len(), 7);
+    }
+
+    #[test]
+    fn kimi_writes_mcp_json_under_its_home_and_shares_agents_skills() {
+        let home = Path::new("/h");
+        let cwd = Path::new("/p");
+        assert_eq!(Host::parse("kimi"), Some(Host::Kimi));
+        assert_eq!(Host::Kimi.default_agent(), "agent:kimi");
+        if std::env::var_os("KIMI_CODE_HOME").is_none() {
+            assert_eq!(
+                Host::Kimi.config_path(Scope::User, home, cwd),
+                Path::new("/h/.kimi-code/mcp.json")
+            );
+        }
+        assert_eq!(
+            Host::Kimi.config_path(Scope::Project, home, cwd),
+            Path::new("/p/.kimi-code/mcp.json")
+        );
+        assert_eq!(Host::Kimi.format(), Format::Json);
+        assert_eq!(Host::Kimi.key_path(), &["mcpServers", "conch"]);
+        let args = vec![
+            "--agent".to_string(),
+            "agent:x".to_string(),
+            "mcp".to_string(),
+        ];
+        assert_eq!(
+            Host::Kimi.render_json_entry("/b/conch", &args, &Env(vec![])),
+            r#"{"command":"/b/conch","args":["--agent","agent:x","mcp"]}"#
+        );
+        // Kimi has no `mcp add` subcommand, so the fallback is the entry itself.
+        assert!(Host::Kimi
+            .fallback_command("/b/conch", &args)
+            .contains(r#"{"command":"/b/conch""#));
+        assert_eq!(ALL_HOSTS.len(), 8);
     }
 }

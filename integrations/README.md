@@ -10,6 +10,7 @@ conch setup cursor     # Cursor
 conch setup gemini     # Gemini CLI
 conch setup opencode   # OpenCode
 conch setup antigravity # Google Antigravity (IDE + agy CLI); `conch setup agy` works too
+conch setup kimi       # Kimi Code
 ```
 
 `setup` starts `conchd` if needed, writes the `join-room` skill, and merges a `conch` MCP server entry into the host's user config. It never rewrites a file: unrelated keys and comments are preserved, the first edit leaves a `.conch-bak` beside the file, and a file it cannot parse is left alone with the host's own `mcp add` command printed instead.
@@ -23,6 +24,7 @@ conch setup antigravity # Google Antigravity (IDE + agy CLI); `conch setup agy` 
 | gemini | `~/.gemini/settings.json` → `mcpServers.conch` | `~/.agents/skills/join-room/` |
 | opencode | `~/.config/opencode/opencode.json[c]` → `mcp.conch` | `~/.config/opencode/skills/join-room/` |
 | antigravity | `~/.gemini/config/mcp_config.json` → `mcpServers.conch` | `~/.gemini/config/skills/join-room/` |
+| kimi | `~/.kimi-code/mcp.json` (or `$KIMI_CODE_HOME/mcp.json`) → `mcpServers.conch` | `~/.agents/skills/join-room/` |
 
 Options: `--agent ID` (default `agent:<host>`), `--scope project` for the project-level file in the current directory, `--env K=V` to add environment (for example `CONCH_NODE`), `--dry-run` to print the diff. Set `CONCH_SETUP_SKIP_DAEMON=1` to write the config and skill without starting a local daemon, for a host that will point at a remote node.
 
