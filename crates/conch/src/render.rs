@@ -65,6 +65,12 @@ pub fn render(command: &str, data: &Value, ctx: &Context) -> Option<String> {
             str_of(data, "ticket_path"),
             str_of(data, "magnet")
         ),
+        "ticket" => format!(
+            "ticket for \"{}\" ({}): {}",
+            str_of(data, "name"),
+            short_of(data, "id"),
+            str_of(data, "ticket_path")
+        ),
         "join" => {
             let id = short_of(data, "id");
             let role = role_word(str_of(data, "role"));

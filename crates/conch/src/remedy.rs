@@ -18,7 +18,8 @@ pub fn for_code(code: &str, command: &str) -> Option<&'static str> {
             "your hand stays raised for 24 h; run `conch wait-for-floor` again"
         }
         ("unavailable", "join") => {
-            "no peer could provide the room; check the ticket still carries its token"
+            "no peer could provide the room; check the ticket still carries its token \
+             (a node in the room can export one with `conch ticket`)"
         }
         _ => return None,
     })

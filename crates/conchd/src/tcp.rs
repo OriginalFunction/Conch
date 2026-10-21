@@ -3429,6 +3429,7 @@ impl Daemon {
                 waited
             }
             ClientRequest::Status { room } => self.client_status(room),
+            ClientRequest::Ticket { room } => self.client_ticket(room),
             ClientRequest::Version => Ok(json!({ "version": env!("CARGO_PKG_VERSION") })),
             ClientRequest::Attach { .. } => Err(DaemonError::Protocol("duplicate attach")),
             ClientRequest::History { follow: true, .. } => {
@@ -5069,6 +5070,12 @@ impl Daemon {
             .collect::<Vec<_>>();
         queue.sort_by_key(|intent| (intent.ts, intent.id));
         Ok(queue)
+    }
+
+    fn client_ticket(&self, room: RoomId) -> Result<Value, DaemonError> {
+        let mut ticket = self.served_ticket(room)?;
+        ticket.token = self.room_token(room);
+        Ok(json!({ "ticket": ticket }))
     }
 
     fn client_status(&self, room: Option<RoomId>) -> Result<Value, DaemonError> {
@@ -7047,7 +7054,10 @@ impl Daemon {
 fn participates(request: &ClientRequest) -> bool {
     !matches!(
         request,
-        ClientRequest::Status { .. } | ClientRequest::History { .. } | ClientRequest::Version
+        ClientRequest::Status { .. }
+            | ClientRequest::History { .. }
+            | ClientRequest::Ticket { .. }
+            | ClientRequest::Version
     )
 }
 
@@ -7107,7 +7117,8 @@ fn request_room(request: &ClientRequest) -> Option<RoomId> {
         | ClientRequest::PutBlob { room, .. }
         | ClientRequest::Leave { room, .. }
         | ClientRequest::History { room, .. }
-        | ClientRequest::WaitForHistory { room, .. } => Some(*room),
+        | ClientRequest::WaitForHistory { room, .. }
+        | ClientRequest::Ticket { room } => Some(*room),
         ClientRequest::Status { room } => *room,
         ClientRequest::Version => None,
         ClientRequest::Attach { .. }
@@ -7728,6 +7739,12 @@ fn verify_ticket_replay(ticket: &Ticket, replay: &Replay) -> Result<(), DaemonEr
     let ticket_token_sha256 = ticket
         .token
         .map(|token| Hash32::from_bytes(Sha256::digest(token.as_bytes()).into()));
+    if token_sha256.is_some() && ticket_token_sha256.is_none() {
+        // Most often the token-less copy in ~/.conch/rooms/<id>/ticket.conch.
+        return Err(DaemonError::BadTicket(
+            "ticket has no token but the room is private; export a full one with `conch ticket`",
+        ));
+    }
     if token_sha256 != &ticket_token_sha256 {
         return Err(DaemonError::BadTicket(
             "ticket token does not match genesis",

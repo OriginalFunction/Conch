@@ -5,7 +5,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
 };
 
@@ -311,13 +311,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .cloned()
                     .ok_or("daemon create reply omitted ticket")?,
             )?;
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            options.mode(0o600);
-            let mut file = options.open(&ticket_path)?;
-            serde_json::to_writer(&mut file, &ticket)?;
-            file.sync_all()?;
+            write_ticket_file(&ticket_path, &ticket)?;
             let magnet = if show_secret {
                 ticket.to_magnet()
             } else {
@@ -332,9 +326,45 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "name": ticket.name,
             })
         }
+        Output::Ticket { path } => {
+            let ticket: Ticket = serde_json::from_value(
+                data.get("ticket")
+                    .cloned()
+                    .ok_or("daemon ticket reply omitted ticket")?,
+            )?;
+            if path.as_deref() == Some(Path::new("-")) {
+                println!("{}", serde_json::to_string(&ticket)?);
+                return Ok(());
+            }
+            let ticket_path =
+                path.unwrap_or_else(|| PathBuf::from(format!("./{}.conch", slug(&ticket.name))));
+            write_ticket_file(&ticket_path, &ticket).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    format!("ticket already exists: {}", ticket_path.display())
+                } else {
+                    error.to_string()
+                }
+            })?;
+            serde_json::json!({
+                "ticket_path": ticket_path.display().to_string(),
+                "id": ticket.id,
+                "name": ticket.name,
+            })
+        }
     };
     print_reply(&command, &output, json, &ctx)?;
     Ok(())
+}
+
+/// Write a ticket the way `create` does: mode 0600, never over an existing file.
+fn write_ticket_file(path: &Path, ticket: &Ticket) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path)?;
+    serde_json::to_writer(&mut file, ticket)?;
+    file.sync_all()
 }
 
 /// After a successful join, look up the room's name and current head so the reply
@@ -924,6 +954,10 @@ enum Output {
     Create {
         ticket_path: PathBuf,
         show_secret: bool,
+    },
+    /// `None` writes `./<slug>.conch`; `-` prints the ticket to stdout.
+    Ticket {
+        path: Option<PathBuf>,
     },
 }
 
@@ -1524,6 +1558,23 @@ impl Arguments {
             "withdraw" => ready(ClientRequest::Withdraw {
                 room: resolve_room()?,
             }),
+            "ticket" => {
+                let mut path = None;
+                while let Some(flag) = arguments.next() {
+                    match flag.as_str() {
+                        "-o" | "--output" => {
+                            path = Some(PathBuf::from(
+                                arguments.next().ok_or("--output requires a file")?,
+                            ));
+                        }
+                        other => return Err(format!("unknown ticket argument: {other}")),
+                    }
+                }
+                output = Output::Ticket { path };
+                ready(ClientRequest::Ticket {
+                    room: resolve_room()?,
+                })
+            }
             "depart" => ready(ClientRequest::Depart {
                 room: resolve_room()?,
             }),
@@ -1891,7 +1942,7 @@ fn print_help() {
            -V, --version         Print version\n\
            -h, --help            Print help\n\n\
          Commands:\n\
-           say, tail, listen, rooms, use, create, join, status, history\n\
+           say, tail, listen, rooms, use, create, join, ticket, status, history\n\
            wait-for-floor, speak, yield, raise-hand, withdraw, grant, yank, config, breakout, blob, depart, leave\n\
            mcp, setup, up, down, doctor\n\n\
          Run `conch help <command>` for command-specific usage.",
@@ -1914,6 +1965,12 @@ fn command_usage(command: &str) -> Option<&'static str> {
              Takes longer than --timeout (default 300 s) are closed by the leader."
         }
         "join" => "conch join TICKET|MAGNET|HTTPS_URL [--stake | --observe]",
+        "ticket" => {
+            "conch ticket [-o FILE]\n\
+             Writes the full ticket for a room this node has joined, token included, to\n\
+             ./<slug>.conch mode 0600 (or FILE; `-o -` prints it). The copy under\n\
+             ~/.conch/rooms/<id>/ticket.conch has no token and cannot join a private room."
+        }
         "status" => "conch status",
         "history" => "conch history [--from N] [--follow] [--oneline]\n\
              --oneline keeps the first line of each take, cut at the terminal width (or $COLUMNS, else 120 columns).",
@@ -2460,6 +2517,7 @@ mod tests {
     const COMMANDS: &[&str] = &[
         "create",
         "join",
+        "ticket",
         "status",
         "history",
         "tail",

@@ -98,6 +98,11 @@ pub enum ClientRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         room: Option<RoomId>,
     },
+    /// The full ticket for a room this node has joined, token included. The copy in
+    /// the room's store is written without its token, so it cannot join on its own.
+    Ticket {
+        room: RoomId,
+    },
     Version,
 }
 

@@ -66,6 +66,8 @@ conch join ./design-room.conch
 conch join 'conch:1:<room>?g=<genesis>&x.peer=tcp%3A%2F%2Fhost%3A7421'
 ```
 
+To hand out a room you did not create, or a breakout, run `conch ticket --room <id>` on a node that has joined it; it writes the same `0600` ticket, token included. The `ticket.conch` under `~/.conch/rooms/<id>/` has its token stripped and cannot join a private room.
+
 Use `--observe` for a non-voting reader. Plain `tcp://` and `ws://` are limited to loopback by default; `--mode lan` is an explicit trusted-network opt-in. Internet-facing nodes use `--mode public`, TLS 1.3, `tcps://`/`wss://` advertisements, and a certificate, private key, and optional custom CA:
 
 ```bash

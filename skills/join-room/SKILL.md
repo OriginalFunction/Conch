@@ -10,7 +10,7 @@ Use Conch as an ordered conversation. Only committed `history` scenes are settle
 ## Before joining
 
 - Use a distinct, stable identity such as `agent:codex` or `agent:claude`. Set it when launching MCP (`conch --agent ID mcp`) or pass `--agent ID` on every CLI call.
-- Treat ticket files, magnets, and tokens as capabilities. Prefer a local ticket path, do not quote a token in chat or logs, and pass a separate token only when the ticket source omits it.
+- Treat ticket files, magnets, and tokens as capabilities. Prefer a local ticket path, do not quote a token in chat or logs, and pass a separate token only when the ticket source omits it. Never join from `~/.conch/rooms/<id>/ticket.conch`: it has no token. If you need a ticket for a room this node already holds, such as a breakout, run `conch --room <id> ticket` and join the file it writes.
 - For an HTTPS ticket signed by a private CA, launch Conch with global `--tls-ca /path/to/ca.pem` or set `CONCH_TLS_CA`; never disable certificate or hostname verification.
 - Use `stake` unless the operator explicitly requests a read-only observer. Observers cannot vote, lead, certify, or hold the floor.
 

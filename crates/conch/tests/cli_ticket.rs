@@ -475,3 +475,102 @@ async fn create_and_config_set_the_floor_timeout() {
     assert_eq!(status["timeout_secs"], 300);
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ticket_exports_a_joinable_ticket_that_the_store_copy_is_not() {
+    let source_data = TempDir::new().unwrap();
+    let follower_data = TempDir::new().unwrap();
+    let created_dir = TempDir::new().unwrap();
+    let export_dir = TempDir::new().unwrap();
+    let source = Daemon::open(source_data.path()).unwrap();
+    let follower = Daemon::open(follower_data.path()).unwrap();
+    let source_server = source.start(loopback()).await.unwrap();
+    let follower_server = follower.start(loopback()).await.unwrap();
+    let source_node = format!("tcp://{}", source_server.addr());
+    let follower_node = format!("tcp://{}", follower_server.addr());
+    let binary = env!("CARGO_BIN_EXE_conch");
+    let sentinel = "b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6";
+
+    let created = Command::new(binary)
+        .args([
+            "--node",
+            &source_node,
+            "--token",
+            sentinel,
+            "create",
+            "--name",
+            "Export Me",
+            "--json",
+        ])
+        .current_dir(created_dir.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(created.status.success());
+    let created: Value = serde_json::from_slice(&created.stdout).unwrap();
+    let room = created["id"].as_str().unwrap().to_string();
+
+    // The daemon's own copy has no token, so a private room rejects it, even on the
+    // node that holds the room, and the error says what to do instead.
+    let stored = source_data
+        .path()
+        .join("rooms")
+        .join(&room)
+        .join("ticket.conch");
+    let refused = Command::new(binary)
+        .args(["--node", &source_node, "join"])
+        .arg(&stored)
+        .output()
+        .await
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("conch ticket"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    let export = || {
+        Command::new(binary)
+            .args(["--node", &source_node, "--room", &room, "ticket", "--json"])
+            .current_dir(export_dir.path())
+            .output()
+    };
+    let exported = export().await.unwrap();
+    assert!(
+        exported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&exported.stdout).contains(sentinel));
+    let reply: Value = serde_json::from_slice(&exported.stdout).unwrap();
+    assert_eq!(reply["ticket_path"], "./export-me.conch");
+    let path = export_dir.path().join("export-me.conch");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    let ticket = Ticket::from_json_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(ticket.token.unwrap().to_string(), sentinel);
+
+    // Like `create`, it never overwrites a ticket that is already there.
+    let again = export().await.unwrap();
+    assert!(!again.status.success());
+    assert!(String::from_utf8_lossy(&again.stderr).contains("ticket already exists"));
+
+    let joined = Command::new(binary)
+        .args(["--node", &follower_node, "join"])
+        .arg(&path)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        joined.status.success(),
+        "{}",
+        String::from_utf8_lossy(&joined.stderr)
+    );
+}
